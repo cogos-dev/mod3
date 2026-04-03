@@ -88,6 +88,7 @@ MODELS = {
 _models: dict = {}
 _model_lock = threading.Lock()
 _last_metrics: dict | None = None
+_output_device: int | str | None = None  # audio output device (None = system default)
 
 # Job tracking for non-blocking speech
 _jobs: dict[str, dict] = {}  # id -> {status, metrics, error, start_time}
@@ -125,7 +126,7 @@ def _start_speech(
     global _last_metrics
     engine, voice = _resolve_model(voice)
     model = _get_model(engine)
-    player = AdaptivePlayer(sample_rate=model.sample_rate)
+    player = AdaptivePlayer(sample_rate=model.sample_rate, device=_output_device)
 
     job_id = uuid.uuid4().hex[:8]
     _jobs[job_id] = {
@@ -326,6 +327,48 @@ def diagnostics() -> str:
         "last_metrics": _last_metrics,
     }
     return json.dumps(info, indent=2)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def set_output_device(device: str = "") -> str:
+    """List audio output devices, or set the active one.
+
+    Args:
+        device: Device index (e.g. "3") or name substring (e.g. "AirPods").
+                If empty, lists available devices without changing anything.
+    """
+    import sounddevice as sd
+    global _output_device
+
+    outputs = []
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_output_channels"] > 0:
+            is_default = i == sd.default.device[1]
+            is_active = (
+                (_output_device is None and is_default)
+                or _output_device == i
+                or (isinstance(_output_device, str) and _output_device in d["name"])
+            )
+            outputs.append({"index": i, "name": d["name"], "active": is_active})
+
+    if not device:
+        lines = [f"  [{'*' if d['active'] else ' '}] {d['index']}: {d['name']}" for d in outputs]
+        return "Audio output devices (* = active):\n" + "\n".join(lines)
+
+    # Set device
+    if device.isdigit():
+        _output_device = int(device)
+    else:
+        _output_device = device
+
+    return json.dumps({"status": "ok", "device": _output_device})
 
 
 # ---------------------------------------------------------------------------

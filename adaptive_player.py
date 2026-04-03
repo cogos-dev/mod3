@@ -92,9 +92,10 @@ class AdaptivePlayer:
     MEASURE_WINDOW = 0.25       # seconds between rate measurements
     MIN_BUFFER_SECONDS = 1.5    # startup threshold = arrival_rate * this
 
-    def __init__(self, sample_rate: int = 24_000, buffer_size: int = 2048):
+    def __init__(self, sample_rate: int = 24_000, buffer_size: int = 2048, device: int | str | None = None):
         self.sample_rate = sample_rate
         self.buffer_size = buffer_size
+        self.device = device  # sounddevice output device index or name
 
         # Buffer
         self._buffer: deque[np.ndarray] = deque()
@@ -256,6 +257,7 @@ class AdaptivePlayer:
             samplerate=self.sample_rate,
             channels=1,
             dtype="float32",
+            device=self.device,
             callback=self._callback,
             finished_callback=self._on_stream_finished,
             blocksize=self.buffer_size,
