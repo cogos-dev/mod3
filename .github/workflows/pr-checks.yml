@@ -1,0 +1,72 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  changelog-check:
+    name: Changelog Updated
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check CHANGELOG.md was modified
+        run: |
+          if git diff --name-only origin/main...HEAD | grep -q "CHANGELOG.md"; then
+            echo "CHANGELOG.md updated"
+          else
+            echo "::warning::CHANGELOG.md was not updated in this PR"
+            echo "If this PR contains user-facing changes, please update the changelog."
+            # Warn but don't fail — some PRs (CI, docs) don't need changelog entries
+          fi
+
+  version-consistency:
+    name: Version Consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check versions are in sync
+        run: |
+          PY_VERSION=$(python3 -c "
+          import re
+          with open('pyproject.toml') as f:
+              m = re.search(r'version\s*=\s*\"(.+?)\"', f.read())
+              print(m.group(1) if m else 'MISSING')
+          ")
+          OC_VERSION=$(node -e "console.log(JSON.parse(require('fs').readFileSync('integrations/openclaw/package.json')).version)")
+
+          echo "pyproject.toml:  $PY_VERSION"
+          echo "openclaw plugin: $OC_VERSION"
+
+          if [ "$PY_VERSION" != "$OC_VERSION" ]; then
+            echo "::error::Version mismatch — pyproject.toml ($PY_VERSION) != integrations/openclaw/package.json ($OC_VERSION)"
+            exit 1
+          fi
+          echo "Versions in sync: $PY_VERSION"
+
+  file-structure:
+    name: Required Files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required files exist
+        run: |
+          MISSING=0
+          for f in engine.py server.py adaptive_player.py http_api.py vad.py \
+                   requirements.txt pyproject.toml CHANGELOG.md README.md \
+                   integrations/openclaw/index.ts \
+                   integrations/openclaw/speech-provider.ts \
+                   integrations/openclaw/openclaw.plugin.json \
+                   integrations/openclaw/package.json; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Missing required file: $f"
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" = "1" ]; then exit 1; fi
+          echo "All required files present"

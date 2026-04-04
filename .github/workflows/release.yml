@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  validate-release:
+    name: Validate Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release version: $TAG"
+
+      - name: Check CHANGELOG mentions this version
+        run: |
+          VERSION="${{ steps.version.outputs.tag }}"
+          if ! grep -q "\[${VERSION}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md does not contain an entry for version ${VERSION}"
+            echo "Add a ## [${VERSION}] section to CHANGELOG.md before tagging"
+            exit 1
+          fi
+          echo "CHANGELOG entry found for ${VERSION}"
+
+      - name: Check pyproject.toml version matches
+        run: |
+          VERSION="${{ steps.version.outputs.tag }}"
+          PYPROJECT_VERSION=$(python3 -c "
+          import re
+          with open('pyproject.toml') as f:
+              m = re.search(r'version\s*=\s*\"(.+?)\"', f.read())
+              print(m.group(1) if m else '')
+          ")
+          if [ "$PYPROJECT_VERSION" != "$VERSION" ]; then
+            echo "::error::pyproject.toml version ($PYPROJECT_VERSION) does not match tag ($VERSION)"
+            exit 1
+          fi
+          echo "pyproject.toml version matches: ${VERSION}"
+
+      - name: Check OpenClaw plugin version matches
+        run: |
+          VERSION="${{ steps.version.outputs.tag }}"
+          PKG_VERSION=$(node -e "console.log(JSON.parse(require('fs').readFileSync('integrations/openclaw/package.json')).version)")
+          if [ "$PKG_VERSION" != "$VERSION" ]; then
+            echo "::error::integrations/openclaw/package.json version ($PKG_VERSION) does not match tag ($VERSION)"
+            exit 1
+          fi
+          echo "OpenClaw plugin version matches: ${VERSION}"
+
+  create-release:
+    name: Create GitHub Release
+    needs: validate-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          # Extract the section for this version from CHANGELOG.md
+          awk "/^## \[${VERSION}\]/{found=1; next} /^## \[/{if(found) exit} found{print}" CHANGELOG.md > /tmp/release-notes.md
+          cat /tmp/release-notes.md
+          echo "notes_file=/tmp/release-notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: ${{ steps.changelog.outputs.notes_file }}
+          generate_release_notes: false
