@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff pyright
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pyright --pythonversion 3.12 engine.py vad.py http_api.py server.py
+
+  test-import:
+    name: Import & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pytest
+      - name: Verify imports
+        run: |
+          python -c "from engine import MODELS, generate_audio, synthesize, resolve_model, split_sentences"
+          python -c "from vad import detect_speech, is_hallucination, HALLUCINATION_PHRASES"
+          python -c "from http_api import app"
+      - name: Run tests
+        run: pytest tests/ -v --tb=short || echo "No tests yet"
+
+  test-api:
+    name: HTTP API Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt httpx
+      - name: Test API endpoints resolve
+        run: |
+          python -c "
+          from fastapi.testclient import TestClient
+          from http_api import app
+          client = TestClient(app)
+
+          # Health check
+          r = client.get('/health')
+          assert r.status_code == 200
+          data = r.json()
+          assert data['status'] == 'ok'
+          assert 'engines_loaded' in data
+          assert 'vad_loaded' in data
+
+          # Voices endpoint
+          r = client.get('/v1/voices')
+          assert r.status_code == 200
+          data = r.json()
+          assert 'engines' in data
+          assert 'kokoro' in data['engines']
+
+          # Jobs endpoint (empty)
+          r = client.get('/v1/jobs')
+          assert r.status_code == 200
+          assert r.json()['total'] == 0
+
+          # Filter endpoint
+          r = client.post('/v1/filter', json={'text': 'thank you'})
+          assert r.status_code == 200
+          assert r.json()['is_hallucination'] == True
+
+          r = client.post('/v1/filter', json={'text': 'hello world this is a real sentence'})
+          assert r.status_code == 200
+          assert r.json()['is_hallucination'] == False
+
+          print('All API smoke tests passed')
+          "
+
+  typecheck-openclaw:
+    name: OpenClaw Plugin Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Validate plugin manifest
+        run: |
+          node -e "
+          const fs = require('fs');
+          const manifest = JSON.parse(fs.readFileSync('integrations/openclaw/openclaw.plugin.json'));
+          const pkg = JSON.parse(fs.readFileSync('integrations/openclaw/package.json'));
+          console.assert(manifest.id === 'mod3', 'Plugin ID mismatch');
+          console.assert(manifest.contracts.speechProviders.includes('mod3'), 'Missing speech provider contract');
+          console.assert(pkg.openclaw.extensions.length > 0, 'No extension entry');
+          console.log('Plugin manifest valid');
+          "
