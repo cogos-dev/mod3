@@ -60,9 +60,11 @@ def _update_job(job_id: str, updates: dict):
 # WAV encoding
 # ---------------------------------------------------------------------------
 
+
 def encode_wav(samples, sample_rate: int) -> bytes:
     """Encode float32 samples as 16-bit PCM WAV."""
     import numpy as np
+
     pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
     buf = io.BytesIO()
     num_samples = len(pcm)
@@ -72,13 +74,13 @@ def encode_wav(samples, sample_rate: int) -> bytes:
     buf.write(struct.pack("<I", 36 + data_size))
     buf.write(b"WAVE")
     buf.write(b"fmt ")
-    buf.write(struct.pack("<I", 16))           # chunk size
-    buf.write(struct.pack("<H", 1))            # PCM format
-    buf.write(struct.pack("<H", 1))            # mono
-    buf.write(struct.pack("<I", sample_rate))   # sample rate
+    buf.write(struct.pack("<I", 16))  # chunk size
+    buf.write(struct.pack("<H", 1))  # PCM format
+    buf.write(struct.pack("<H", 1))  # mono
+    buf.write(struct.pack("<I", sample_rate))  # sample rate
     buf.write(struct.pack("<I", sample_rate * 2))  # byte rate
-    buf.write(struct.pack("<H", 2))            # block align
-    buf.write(struct.pack("<H", 16))           # bits per sample
+    buf.write(struct.pack("<H", 2))  # block align
+    buf.write(struct.pack("<H", 16))  # bits per sample
     buf.write(b"data")
     buf.write(struct.pack("<I", data_size))
     buf.write(pcm.tobytes())
@@ -88,6 +90,7 @@ def encode_wav(samples, sample_rate: int) -> bytes:
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
+
 
 class SynthesizeRequest(BaseModel):
     text: str
@@ -99,6 +102,7 @@ class SynthesizeRequest(BaseModel):
 
 class SpeechRequest(BaseModel):
     """OpenAI-compatible TTS request."""
+
     model: str = Field(default="kokoro")
     input: str
     voice: str = Field(default="af_heart")
@@ -110,24 +114,27 @@ class SpeechRequest(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+
 @app.post("/v1/synthesize")
 def synthesize(req: SynthesizeRequest):
     """Synthesize text to audio. Returns raw audio bytes + full metrics in headers and job ledger."""
     import numpy as np
 
     t_request = time.perf_counter()
-    job_id = _record_job({
-        "type": "synthesize",
-        "status": "generating",
-        "requested_at": time.time(),
-        "text": req.text[:200],
-        "voice": req.voice,
-        "speed": req.speed,
-        "emotion": req.emotion,
-        "format": req.format,
-        "engine": None,
-        "timeline": [{"event": "request_received", "t": 0.0}],
-    })
+    job_id = _record_job(
+        {
+            "type": "synthesize",
+            "status": "generating",
+            "requested_at": time.time(),
+            "text": req.text[:200],
+            "voice": req.voice,
+            "speed": req.speed,
+            "emotion": req.emotion,
+            "format": req.format,
+            "engine": None,
+            "timeline": [{"event": "request_received", "t": 0.0}],
+        }
+    )
 
     try:
         resolve_model(req.voice)
@@ -139,13 +146,15 @@ def synthesize(req: SynthesizeRequest):
     _update_job(job_id, {"timeline_append": True})
     _append_timeline(job_id, "generation_start", t_gen_start - t_request)
 
-    chunks = list(generate_audio(
-        req.text,
-        voice=req.voice,
-        speed=req.speed,
-        emotion=req.emotion,
-        stream=False,
-    ))
+    chunks = list(
+        generate_audio(
+            req.text,
+            voice=req.voice,
+            speed=req.speed,
+            emotion=req.emotion,
+            stream=False,
+        )
+    )
     t_gen_end = time.perf_counter()
 
     if not chunks:
@@ -179,23 +188,26 @@ def synthesize(req: SynthesizeRequest):
     # Finalize job record
     _append_timeline(job_id, "generation_complete", t_gen_end - t_request)
     _append_timeline(job_id, "encoding_complete", t_encode_end - t_request)
-    _update_job(job_id, {
-        "status": "complete",
-        "engine": engine,
-        "metrics": {
-            "audio_duration_sec": round(duration, 3),
-            "total_samples": len(all_samples),
-            "sample_rate": sample_rate,
-            "generation_time_sec": round(gen_time, 3),
-            "encoding_time_sec": round(t_encode_end - t_encode_start, 4),
-            "total_time_sec": round(total_time, 3),
-            "rtf": round(duration / gen_time, 2) if gen_time > 0 else 0,
-            "chunks": len(chunk_metrics),
-            "per_chunk": chunk_metrics,
-            "output_bytes": len(audio_bytes),
-            "output_format": req.format,
+    _update_job(
+        job_id,
+        {
+            "status": "complete",
+            "engine": engine,
+            "metrics": {
+                "audio_duration_sec": round(duration, 3),
+                "total_samples": len(all_samples),
+                "sample_rate": sample_rate,
+                "generation_time_sec": round(gen_time, 3),
+                "encoding_time_sec": round(t_encode_end - t_encode_start, 4),
+                "total_time_sec": round(total_time, 3),
+                "rtf": round(duration / gen_time, 2) if gen_time > 0 else 0,
+                "chunks": len(chunk_metrics),
+                "per_chunk": chunk_metrics,
+                "output_bytes": len(audio_bytes),
+                "output_format": req.format,
+            },
         },
-    })
+    )
 
     headers = {
         "X-Mod3-Job-Id": job_id,
@@ -225,22 +237,26 @@ def audio_speech(req: SpeechRequest):
     except ValueError:
         voice = "af_heart"
 
-    job_id = _record_job({
-        "type": "audio_speech",
-        "status": "generating",
-        "requested_at": time.time(),
-        "text": req.input[:200],
-        "voice": voice,
-        "speed": req.speed,
-        "timeline": [{"event": "request_received", "t": 0.0}],
-    })
+    job_id = _record_job(
+        {
+            "type": "audio_speech",
+            "status": "generating",
+            "requested_at": time.time(),
+            "text": req.input[:200],
+            "voice": voice,
+            "speed": req.speed,
+            "timeline": [{"event": "request_received", "t": 0.0}],
+        }
+    )
 
-    chunks = list(generate_audio(
-        req.input,
-        voice=voice,
-        speed=req.speed,
-        stream=False,
-    ))
+    chunks = list(
+        generate_audio(
+            req.input,
+            voice=voice,
+            speed=req.speed,
+            stream=False,
+        )
+    )
     t_gen_end = time.perf_counter()
 
     if not chunks:
@@ -256,16 +272,19 @@ def audio_speech(req: SpeechRequest):
     total_time = time.perf_counter() - t_request
     engine = chunks[0].metadata.get("engine", "") if chunks[0].metadata else ""
 
-    _update_job(job_id, {
-        "status": "complete",
-        "engine": engine,
-        "metrics": {
-            "audio_duration_sec": round(duration, 3),
-            "generation_time_sec": round(gen_time, 3),
-            "total_time_sec": round(total_time, 3),
-            "rtf": round(duration / gen_time, 2) if gen_time > 0 else 0,
+    _update_job(
+        job_id,
+        {
+            "status": "complete",
+            "engine": engine,
+            "metrics": {
+                "audio_duration_sec": round(duration, 3),
+                "generation_time_sec": round(gen_time, 3),
+                "total_time_sec": round(total_time, 3),
+                "rtf": round(duration / gen_time, 2) if gen_time > 0 else 0,
+            },
         },
-    })
+    )
 
     headers = {
         "X-Mod3-Job-Id": job_id,
@@ -287,12 +306,14 @@ async def vad_check(file: UploadFile):
 
     t_start = time.perf_counter()
 
-    job_id = _record_job({
-        "type": "vad",
-        "status": "processing",
-        "requested_at": time.time(),
-        "timeline": [{"event": "request_received", "t": 0.0}],
-    })
+    job_id = _record_job(
+        {
+            "type": "vad",
+            "status": "processing",
+            "requested_at": time.time(),
+            "timeline": [{"event": "request_received", "t": 0.0}],
+        }
+    )
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
         content = await file.read()
@@ -304,20 +325,23 @@ async def vad_check(file: UploadFile):
     t_end = time.perf_counter()
     processing_time = t_end - t_start
 
-    _update_job(job_id, {
-        "status": "complete",
-        "metrics": {
-            "has_speech": result.has_speech,
-            "confidence": result.confidence,
-            "speech_ratio": result.speech_ratio,
-            "num_segments": result.num_segments,
-            "total_speech_sec": result.total_speech_sec,
-            "total_audio_sec": result.total_audio_sec,
-            "processing_time_sec": round(processing_time, 4),
-            "file_load_time_sec": round(t_load - t_start, 4),
-            "vad_time_sec": round(t_end - t_load, 4),
+    _update_job(
+        job_id,
+        {
+            "status": "complete",
+            "metrics": {
+                "has_speech": result.has_speech,
+                "confidence": result.confidence,
+                "speech_ratio": result.speech_ratio,
+                "num_segments": result.num_segments,
+                "total_speech_sec": result.total_speech_sec,
+                "total_audio_sec": result.total_audio_sec,
+                "processing_time_sec": round(processing_time, 4),
+                "file_load_time_sec": round(t_load - t_start, 4),
+                "vad_time_sec": round(t_end - t_load, 4),
+            },
         },
-    })
+    )
 
     return {
         "job_id": job_id,
@@ -349,6 +373,7 @@ async def filter_transcription(req: dict):
 # Job introspection
 # ---------------------------------------------------------------------------
 
+
 @app.get("/v1/jobs")
 def list_jobs(limit: int = 20, type: str = ""):
     """List recent generation jobs with metrics. Optionally filter by type."""
@@ -372,6 +397,7 @@ def get_job(job_id: str):
 # ---------------------------------------------------------------------------
 # Voices and health
 # ---------------------------------------------------------------------------
+
 
 @app.get("/v1/voices")
 def voices():
@@ -501,6 +527,7 @@ def get_bus() -> ModalityBus:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _append_timeline(job_id: str, event: str, t: float):
     with _jobs_lock:

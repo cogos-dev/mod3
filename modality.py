@@ -37,13 +37,15 @@ class ModuleStatus(str, Enum):
 # Cognitive primitives — what the agent sees
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class CognitiveEvent:
     """An input percept that crossed the sensorimotor boundary."""
+
     modality: ModalityType
-    content: str                          # The meaning (transcribed text, caption, etc.)
-    source_channel: str = ""              # Which channel it arrived on
-    confidence: float = 1.0               # How sure the decoder is
+    content: str  # The meaning (transcribed text, caption, etc.)
+    source_channel: str = ""  # Which channel it arrived on
+    confidence: float = 1.0  # How sure the decoder is
     timestamp: float = field(default_factory=time.time)
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -51,19 +53,21 @@ class CognitiveEvent:
 @dataclass
 class CognitiveIntent:
     """An output intent from the agent, not yet encoded."""
-    modality: ModalityType | None         # None = let the bus decide
-    content: str                          # What to communicate
-    target_channel: str = ""              # Specific channel, or "" for bus routing
-    priority: int = 0                     # Higher = more urgent
+
+    modality: ModalityType | None  # None = let the bus decide
+    content: str  # What to communicate
+    target_channel: str = ""  # Specific channel, or "" for bus routing
+    priority: int = 0  # Higher = more urgent
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class EncodedOutput:
     """Raw signal ready for channel delivery."""
+
     modality: ModalityType
-    data: bytes                           # The raw output (audio bytes, image bytes, etc.)
-    format: str = ""                      # "wav", "png", "json", etc.
+    data: bytes  # The raw output (audio bytes, image bytes, etc.)
+    format: str = ""  # "wav", "png", "json", etc.
     duration_sec: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -72,9 +76,11 @@ class EncodedOutput:
 # Gate result
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class GateResult:
     """Result of an input gate check."""
+
     passed: bool
     confidence: float = 0.0
     reason: str = ""
@@ -85,14 +91,16 @@ class GateResult:
 # Module state — what the agent can see in its HUD
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ModuleState:
     """Live operational state of a modality module."""
+
     status: ModuleStatus = ModuleStatus.IDLE
-    active_job: str | None = None         # Current job ID if encoding/decoding
-    queue_depth: int = 0                  # How many items waiting
-    current_text: str = ""                # What's being spoken/generated right now
-    progress: float = 0.0                 # 0.0 - 1.0 for current job
+    active_job: str | None = None  # Current job ID if encoding/decoding
+    queue_depth: int = 0  # How many items waiting
+    current_text: str = ""  # What's being spoken/generated right now
+    progress: float = 0.0  # 0.0 - 1.0 for current job
     last_input: CognitiveEvent | None = None
     last_output_text: str = ""
     last_activity: float = 0.0
@@ -102,6 +110,7 @@ class ModuleState:
 # ---------------------------------------------------------------------------
 # Abstract base classes
 # ---------------------------------------------------------------------------
+
 
 class Gate(ABC):
     """Input gate — decides if raw input contains signal worth decoding."""
@@ -135,8 +144,7 @@ class ModalityModule(ABC):
 
     @property
     @abstractmethod
-    def modality_type(self) -> ModalityType:
-        ...
+    def modality_type(self) -> ModalityType: ...
 
     @property
     @abstractmethod

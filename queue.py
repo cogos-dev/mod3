@@ -21,7 +21,7 @@ class QueuedJob:
     submitted_at: float
     started_at: float | None = None
     finished_at: float | None = None
-    status: str = "queued"          # queued, running, done, error
+    status: str = "queued"  # queued, running, done, error
     result: Any = None
     error: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)

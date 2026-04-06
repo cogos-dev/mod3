@@ -20,6 +20,7 @@ import sounddevice as sd
 # Device helpers
 # ---------------------------------------------------------------------------
 
+
 def list_input_devices() -> list[dict]:
     """List available audio input devices.
 
@@ -33,12 +34,14 @@ def list_input_devices() -> list[dict]:
     results: list[dict] = []
     for i, d in enumerate(sd.query_devices()):
         if d["max_input_channels"] > 0:
-            results.append({
-                "index": i,
-                "name": d["name"],
-                "channels": d["max_input_channels"],
-                "default": i == default_input,
-            })
+            results.append(
+                {
+                    "index": i,
+                    "name": d["name"],
+                    "channels": d["max_input_channels"],
+                    "default": i == default_input,
+                }
+            )
     return results
 
 
@@ -61,9 +64,7 @@ def _resolve_device(device: Union[int, str, None]) -> Union[int, None]:
     if isinstance(device, int):
         info = sd.query_devices(device)
         if info["max_input_channels"] < 1:
-            raise ValueError(
-                f"Device {device} ({info['name']}) has no input channels"
-            )
+            raise ValueError(f"Device {device} ({info['name']}) has no input channels")
         return device
 
     if isinstance(device, str):
@@ -71,10 +72,7 @@ def _resolve_device(device: Union[int, str, None]) -> Union[int, None]:
         for i, d in enumerate(sd.query_devices()):
             if d["max_input_channels"] > 0 and needle in d["name"].lower():
                 return i
-        raise ValueError(
-            f"No input device matching '{device}'. "
-            f"Available: {[d['name'] for d in list_input_devices()]}"
-        )
+        raise ValueError(f"No input device matching '{device}'. Available: {[d['name'] for d in list_input_devices()]}")
 
     raise TypeError(f"device must be int, str, or None — got {type(device)}")
 
@@ -82,6 +80,7 @@ def _resolve_device(device: Union[int, str, None]) -> Union[int, None]:
 # ---------------------------------------------------------------------------
 # Ring buffer
 # ---------------------------------------------------------------------------
+
 
 class _RingBuffer:
     """Fixed-capacity ring buffer for 1-D float32 audio samples.
@@ -93,7 +92,7 @@ class _RingBuffer:
     def __init__(self, capacity: int):
         self._buf = np.zeros(capacity, dtype=np.float32)
         self._capacity = capacity
-        self._write_pos = 0      # next write index (mod capacity)
+        self._write_pos = 0  # next write index (mod capacity)
         self._samples_written = 0  # total samples ever written
         self._lock = threading.Lock()
 
@@ -112,18 +111,18 @@ class _RingBuffer:
         with self._lock:
             if n >= self._capacity:
                 # More data than buffer can hold — keep the tail
-                self._buf[:] = data[-self._capacity:]
+                self._buf[:] = data[-self._capacity :]
                 self._write_pos = 0
                 self._samples_written += n
                 return
 
             end = self._write_pos + n
             if end <= self._capacity:
-                self._buf[self._write_pos:end] = data
+                self._buf[self._write_pos : end] = data
             else:
                 first = self._capacity - self._write_pos
-                self._buf[self._write_pos:] = data[:first]
-                self._buf[:n - first] = data[first:]
+                self._buf[self._write_pos :] = data[:first]
+                self._buf[: n - first] = data[first:]
 
             self._write_pos = end % self._capacity
             self._samples_written += n
@@ -140,18 +139,21 @@ class _RingBuffer:
 
             start = (self._write_pos - n_samples) % self._capacity
             if start + n_samples <= self._capacity:
-                return self._buf[start:start + n_samples].copy()
+                return self._buf[start : start + n_samples].copy()
             else:
                 first = self._capacity - start
-                return np.concatenate([
-                    self._buf[start:],
-                    self._buf[:n_samples - first],
-                ]).copy()
+                return np.concatenate(
+                    [
+                        self._buf[start:],
+                        self._buf[: n_samples - first],
+                    ]
+                ).copy()
 
 
 # ---------------------------------------------------------------------------
 # AudioCapture
 # ---------------------------------------------------------------------------
+
 
 class AudioCapture:
     """Continuous microphone capture with ring-buffer storage.

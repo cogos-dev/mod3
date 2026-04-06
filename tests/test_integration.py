@@ -14,12 +14,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class SkipTest(Exception):
     """Raised when a test cannot run due to missing dependencies."""
+
     pass
 
 
 # ---------------------------------------------------------------------------
 # Mock player — stands in for AdaptivePlayer without audio hardware
 # ---------------------------------------------------------------------------
+
 
 class MockPlayer:
     def __init__(self):
@@ -35,6 +37,7 @@ class MockPlayer:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 def test_voice_module_instantiates():
     """VoiceModule with WhisperDecoder instantiates without loading models."""
@@ -245,6 +248,7 @@ def test_bus_hud_with_voice_module():
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+
 
 def main():
     tests = [

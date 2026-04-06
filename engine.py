@@ -20,22 +20,43 @@ MODELS = {
     "voxtral": {
         "id": "mlx-community/Voxtral-4B-TTS-2603-mlx-4bit",
         "voices": [
-            "casual_male", "casual_female", "cheerful_female",
-            "neutral_male", "neutral_female",
-            "fr_male", "fr_female", "es_male", "es_female",
-            "de_male", "de_female", "it_male", "it_female",
-            "pt_male", "pt_female", "nl_male", "nl_female",
-            "ar_male", "hi_male", "hi_female",
+            "casual_male",
+            "casual_female",
+            "cheerful_female",
+            "neutral_male",
+            "neutral_female",
+            "fr_male",
+            "fr_female",
+            "es_male",
+            "es_female",
+            "de_male",
+            "de_female",
+            "it_male",
+            "it_female",
+            "pt_male",
+            "pt_female",
+            "nl_male",
+            "nl_female",
+            "ar_male",
+            "hi_male",
+            "hi_female",
         ],
         "default_voice": "casual_male",
     },
     "kokoro": {
         "id": "mlx-community/Kokoro-82M-bf16",
         "voices": [
-            "af_heart", "af_bella", "af_nicole", "af_sarah", "af_sky",
-            "am_adam", "am_michael",
-            "bf_emma", "bf_isabella",
-            "bm_george", "bm_lewis",
+            "af_heart",
+            "af_bella",
+            "af_nicole",
+            "af_sarah",
+            "af_sky",
+            "am_adam",
+            "am_michael",
+            "bf_emma",
+            "bf_isabella",
+            "bm_george",
+            "bm_lewis",
         ],
         "default_voice": "af_heart",
         "supports_speed": True,
@@ -79,6 +100,7 @@ def get_model(engine: str):
         with _model_lock:
             if engine not in _models:
                 from mlx_audio.tts import load
+
                 _models[engine] = load(MODELS[engine]["id"])
     return _models[engine]
 
@@ -92,6 +114,7 @@ def get_loaded_engines() -> list[str]:
 # Audio chunk
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class AudioChunk:
     samples: np.ndarray
@@ -102,6 +125,7 @@ class AudioChunk:
 # ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
+
 
 def generate_audio(
     text: str,

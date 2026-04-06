@@ -43,7 +43,7 @@ mcp = FastMCP(
     instructions=(
         "Mod³ voice channel with multi-model TTS (Voxtral, Kokoro, Chatterbox, Spark) "
         "running locally on Apple Silicon. "
-        "Voice messages arrive as <channel source=\"mod3\" speaker=\"...\" confidence=\"...\">. "
+        'Voice messages arrive as <channel source="mod3" speaker="..." confidence="...">. '
         "Use the speak tool to respond via voice. speak() is non-blocking. "
         "Use speech_status to check completion. Use stop to interrupt. "
         "Keep spoken text conversational and concise — this is voice, not a document. "
@@ -157,9 +157,7 @@ async def _patched_run_stdio():
         # These use a custom method that the MCP session cannot parse into a
         # typed ClientNotification, so we handle them here and forward
         # everything else to the MCP server unchanged.
-        send_inner, receive_inner = anyio.create_memory_object_stream[
-            SessionMessage | Exception
-        ](0)
+        send_inner, receive_inner = anyio.create_memory_object_stream[SessionMessage | Exception](0)
 
         async def _filter_read_stream():
             async with read_stream, send_inner:
@@ -169,10 +167,7 @@ async def _patched_run_stdio():
                         continue
 
                     root = message.message.root
-                    if (
-                        isinstance(root, JSONRPCNotification)
-                        and root.method == _PERMISSION_REQUEST_METHOD
-                    ):
+                    if isinstance(root, JSONRPCNotification) and root.method == _PERMISSION_REQUEST_METHOD:
                         # Handle permission request — speak it via TTS
                         _handle_permission_request(root.params or {})
                         continue
@@ -243,6 +238,7 @@ def _prune_jobs():
 # Adaptive playback (MCP speaker output)
 # ---------------------------------------------------------------------------
 
+
 def _start_speech(
     text: str,
     voice: str,
@@ -278,9 +274,12 @@ def _start_speech(
         pipeline_state.start_speaking(text, player)
         try:
             for chunk in generate_audio(
-                text, voice=voice, stream=stream,
+                text,
+                voice=voice,
+                stream=stream,
                 streaming_interval=streaming_interval,
-                speed=speed, emotion=emotion,
+                speed=speed,
+                emotion=emotion,
             ):
                 player.queue_audio(chunk.samples, chunk_meta=chunk.metadata if chunk.metadata else None)
                 # Update position after each chunk so PipelineState tracks progress
@@ -314,6 +313,7 @@ def _start_speech(
 # ---------------------------------------------------------------------------
 # MCP Tools
 # ---------------------------------------------------------------------------
+
 
 @mcp.tool(
     annotations={
@@ -388,11 +388,14 @@ def speech_status(job_id: str = "", verbose: bool = False) -> str:
         if not verbose and "chunks" in metrics:
             chunks = metrics["chunks"]["per_chunk"]
             rtfs = [c["rtf"] for c in chunks if c.get("rtf")]
-            metrics = {**metrics, "chunks": {
-                "count": metrics["chunks"]["count"],
-                "avg_rtf": round(sum(rtfs) / len(rtfs), 2) if rtfs else 0,
-                "min_rtf": round(min(rtfs), 2) if rtfs else 0,
-            }}
+            metrics = {
+                **metrics,
+                "chunks": {
+                    "count": metrics["chunks"]["count"],
+                    "avg_rtf": round(sum(rtfs) / len(rtfs), 2) if rtfs else 0,
+                    "min_rtf": round(min(rtfs), 2) if rtfs else 0,
+                },
+            }
         result["metrics"] = metrics
     if job["error"]:
         result["error"] = job["error"]
@@ -437,16 +440,19 @@ def vad_check(file_path: str, threshold: float = 0.5) -> str:
         threshold: Speech probability threshold 0-1 (default 0.5). Higher = stricter.
     """
     from vad import detect_speech_file
+
     try:
         result = detect_speech_file(file_path, threshold=threshold)
-        return json.dumps({
-            "has_speech": result.has_speech,
-            "confidence": result.confidence,
-            "speech_ratio": result.speech_ratio,
-            "num_segments": result.num_segments,
-            "total_speech_sec": result.total_speech_sec,
-            "total_audio_sec": result.total_audio_sec,
-        })
+        return json.dumps(
+            {
+                "has_speech": result.has_speech,
+                "confidence": result.confidence,
+                "speech_ratio": result.speech_ratio,
+                "num_segments": result.num_segments,
+                "total_speech_sec": result.total_speech_sec,
+                "total_audio_sec": result.total_audio_sec,
+            }
+        )
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)})
 
@@ -518,6 +524,7 @@ def set_output_device(device: str = "") -> str:
                 If empty, lists available devices without changing anything.
     """
     import sounddevice as sd
+
     global _output_device
 
     outputs = []
@@ -547,11 +554,13 @@ def set_output_device(device: str = "") -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
+
 def _run_http(host: str = "0.0.0.0", port: int = 7860):
     """Start the HTTP API server."""
     import uvicorn
 
     from http_api import app
+
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 

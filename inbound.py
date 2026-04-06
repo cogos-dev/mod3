@@ -31,9 +31,7 @@ from vad import VADResult, detect_speech
 
 # Matches verbal permission verdicts like "yes abcde", "n fghij" (case insensitive).
 # The request_id is 5 lowercase letters (a-z excluding 'l').
-PERMISSION_VERDICT_RE = re.compile(
-    r'^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$', re.IGNORECASE
-)
+PERMISSION_VERDICT_RE = re.compile(r"^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$", re.IGNORECASE)
 
 logger = logging.getLogger("mod3.inbound")
 
@@ -271,7 +269,9 @@ class InboundPipeline:
             behavior = "allow" if match.group(1).lower().startswith("y") else "deny"
             logger.info(
                 "permission verdict detected: %s %s (from: %r)",
-                behavior, request_id, event.content,
+                behavior,
+                request_id,
+                event.content,
             )
             try:
                 asyncio.run(emit_permission_verdict(request_id, behavior))

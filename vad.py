@@ -73,6 +73,7 @@ def detect_speech(
     # Silero VAD expects 16kHz mono
     if sample_rate != 16000:
         import torchaudio.functional as F
+
         tensor = torch.from_numpy(audio).float()
         tensor = F.resample(tensor, orig_freq=sample_rate, new_freq=16000)
     else:
@@ -144,29 +145,31 @@ def detect_speech_file(file_path: str, threshold: float = 0.5) -> VADResult:
 
 # Common Whisper phantom phrases generated from silence/noise
 # Source: arxiv:2501.11378 + community reports
-HALLUCINATION_PHRASES = frozenset({
-    "thank you",
-    "thanks",
-    "thanks for watching",
-    "thank you for watching",
-    "thanks for listening",
-    "thank you for listening",
-    "please subscribe",
-    "subscribe",
-    "like and subscribe",
-    "see you next time",
-    "bye",
-    "goodbye",
-    "you",
-    "the end",
-    "i'll see you in the next one",
-    "i'll see you in the next video",
-    "music",
-    "applause",
-    "laughter",
-    "...",
-    "",
-})
+HALLUCINATION_PHRASES = frozenset(
+    {
+        "thank you",
+        "thanks",
+        "thanks for watching",
+        "thank you for watching",
+        "thanks for listening",
+        "thank you for listening",
+        "please subscribe",
+        "subscribe",
+        "like and subscribe",
+        "see you next time",
+        "bye",
+        "goodbye",
+        "you",
+        "the end",
+        "i'll see you in the next one",
+        "i'll see you in the next video",
+        "music",
+        "applause",
+        "laughter",
+        "...",
+        "",
+    }
+)
 
 
 def is_hallucination(text: str) -> bool:

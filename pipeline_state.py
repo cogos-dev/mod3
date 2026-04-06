@@ -100,11 +100,7 @@ class PipelineState:
             # Snapshot state before we tear it down
             player = self._player
             text = self._text
-            pct = (
-                self._samples_played / self._total_samples
-                if self._total_samples > 0
-                else 0.0
-            )
+            pct = self._samples_played / self._total_samples if self._total_samples > 0 else 0.0
 
             # Clear speaking state immediately (inside lock)
             self._speaking = False
@@ -183,4 +179,4 @@ class PipelineState:
                 return full_text.split()[0]
             return ""
 
-        return full_text[: boundary].rstrip()
+        return full_text[:boundary].rstrip()

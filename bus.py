@@ -39,6 +39,7 @@ logger = logging.getLogger("mod3.bus")
 # Bus event — everything that crosses the boundary gets recorded
 # ---------------------------------------------------------------------------
 
+
 class BusEvent:
     """Record of a boundary crossing. Feeds the ledger."""
 
@@ -65,6 +66,7 @@ class BusEvent:
 # Channel descriptor
 # ---------------------------------------------------------------------------
 
+
 class ChannelDescriptor:
     """Declares what modalities a channel supports."""
 
@@ -78,6 +80,7 @@ class ChannelDescriptor:
 # ---------------------------------------------------------------------------
 # Modality Bus
 # ---------------------------------------------------------------------------
+
 
 class ModalityBus:
     """The sensorimotor boundary. Manages modules, routes signals, tracks state."""
@@ -97,8 +100,9 @@ class ModalityBus:
         self._modules[module.modality_type] = module
         logger.info(f"registered modality: {module.modality_type.value}")
 
-    def register_channel(self, channel_id: str, modalities: list[ModalityType],
-                          deliver: Callable | None = None) -> None:
+    def register_channel(
+        self, channel_id: str, modalities: list[ModalityType], deliver: Callable | None = None
+    ) -> None:
         """Register a channel with its supported modalities."""
         self._channels[channel_id] = ChannelDescriptor(channel_id, modalities, deliver)
         logger.info(f"registered channel: {channel_id} ({[m.value for m in modalities]})")
@@ -128,12 +132,14 @@ class ModalityBus:
         # Gate check
         if module.gate is not None:
             gate_result = module.gate.check(raw, **kwargs)
-            self._emit(BusEvent(
-                "modality.gate",
-                mod_type.value,
-                channel,
-                {"passed": gate_result.passed, "confidence": gate_result.confidence, "reason": gate_result.reason},
-            ))
+            self._emit(
+                BusEvent(
+                    "modality.gate",
+                    mod_type.value,
+                    channel,
+                    {"passed": gate_result.passed, "confidence": gate_result.confidence, "reason": gate_result.reason},
+                )
+            )
             if not gate_result.passed:
                 return None
 
@@ -145,21 +151,25 @@ class ModalityBus:
 
         # Empty content after decoding (e.g., hallucination filtered)
         if not event.content:
-            self._emit(BusEvent(
-                "modality.filtered",
-                mod_type.value,
-                channel,
-                event.metadata,
-            ))
+            self._emit(
+                BusEvent(
+                    "modality.filtered",
+                    mod_type.value,
+                    channel,
+                    event.metadata,
+                )
+            )
             return None
 
         event.source_channel = channel
-        self._emit(BusEvent(
-            "modality.input",
-            mod_type.value,
-            channel,
-            {"content": event.content[:200], "confidence": event.confidence},
-        ))
+        self._emit(
+            BusEvent(
+                "modality.input",
+                mod_type.value,
+                channel,
+                {"content": event.content[:200], "confidence": event.confidence},
+            )
+        )
         return event
 
     # -- Action (output) --
@@ -185,23 +195,27 @@ class ModalityBus:
         target = channel or intent.target_channel or "default"
 
         def _do_encode():
-            self._emit(BusEvent(
-                "modality.encode_start",
-                mod_type.value,
-                target,
-                {"content": intent.content[:200]},
-            ))
+            self._emit(
+                BusEvent(
+                    "modality.encode_start",
+                    mod_type.value,
+                    target,
+                    {"content": intent.content[:200]},
+                )
+            )
             output = module.encoder.encode(intent)
-            self._emit(BusEvent(
-                "modality.output",
-                mod_type.value,
-                target,
-                {
-                    "format": output.format,
-                    "duration_sec": output.duration_sec,
-                    "bytes": len(output.data),
-                },
-            ))
+            self._emit(
+                BusEvent(
+                    "modality.output",
+                    mod_type.value,
+                    target,
+                    {
+                        "format": output.format,
+                        "duration_sec": output.duration_sec,
+                        "bytes": len(output.data),
+                    },
+                )
+            )
             # Deliver if channel has a delivery callback
             ch = self._channels.get(target)
             if ch and ch.deliver:
@@ -250,7 +264,8 @@ class ModalityBus:
                 "status": state.status.value,
                 "active_job": state.active_job,
                 "queue_depth": self._queue_manager.get_queue(mod_type.value).depth
-                    if mod_type.value in self._queue_manager._queues else 0,
+                if mod_type.value in self._queue_manager._queues
+                else 0,
                 "current_text": state.current_text,
                 "progress": state.progress,
                 "last_output": state.last_output_text,
@@ -263,8 +278,7 @@ class ModalityBus:
             channels[cid] = {
                 "modalities": [m.value for m in ch.modalities],
                 "active": ch.active,
-                "queue_depth": self._queue_manager.get_queue(cid).depth
-                    if cid in self._queue_manager._queues else 0,
+                "queue_depth": self._queue_manager.get_queue(cid).depth if cid in self._queue_manager._queues else 0,
             }
 
         return {
@@ -281,8 +295,10 @@ class ModalityBus:
         """Full health report."""
         return {
             "modules": {mt.value: m.health() for mt, m in self._modules.items()},
-            "channels": {cid: {"modalities": [m.value for m in ch.modalities], "active": ch.active}
-                         for cid, ch in self._channels.items()},
+            "channels": {
+                cid: {"modalities": [m.value for m in ch.modalities], "active": ch.active}
+                for cid, ch in self._channels.items()
+            },
             "queues": self._queue_manager.status(),
             "event_count": len(self._event_log),
         }
@@ -293,7 +309,7 @@ class ModalityBus:
         """Record and broadcast a bus event."""
         self._event_log.append(event)
         if len(self._event_log) > self._max_events:
-            self._event_log = self._event_log[-self._max_events:]
+            self._event_log = self._event_log[-self._max_events :]
         for listener in self._listeners:
             try:
                 listener(event)

@@ -27,9 +27,9 @@ class PlaybackMetrics:
     sample_rate: int = 24_000
 
     # Timing
-    ttfa_sec: float = 0.0       # first queue_audio → first audible output
+    ttfa_sec: float = 0.0  # first queue_audio → first audible output
     total_wall_sec: float = 0.0
-    overall_rtf: float = 0.0    # duration_sec / total_wall_sec
+    overall_rtf: float = 0.0  # duration_sec / total_wall_sec
 
     # Chunks (from generator)
     chunk_count: int = 0
@@ -89,8 +89,8 @@ class AdaptivePlayer:
 
     # EMA parameters (same as mlx_audio AudioPlayer)
     EMA_ALPHA = 0.25
-    MEASURE_WINDOW = 0.25       # seconds between rate measurements
-    MIN_BUFFER_SECONDS = 1.5    # startup threshold = arrival_rate * this
+    MEASURE_WINDOW = 0.25  # seconds between rate measurements
+    MIN_BUFFER_SECONDS = 1.5  # startup threshold = arrival_rate * this
 
     def __init__(self, sample_rate: int = 24_000, buffer_size: int = 2048, device: int | str | None = None):
         self.sample_rate = sample_rate
@@ -142,7 +142,7 @@ class AdaptivePlayer:
             while filled < frames and self._buffer:
                 buf = self._buffer[0]
                 to_copy = min(frames - filled, len(buf))
-                outdata[filled:filled + to_copy, 0] = buf[:to_copy]
+                outdata[filled : filled + to_copy, 0] = buf[:to_copy]
                 filled += to_copy
 
                 if to_copy == len(buf):
@@ -199,10 +199,7 @@ class AdaptivePlayer:
         if now - self._window_start >= self.MEASURE_WINDOW:
             elapsed = now - self._window_start
             inst_rate = self._window_sample_count / elapsed
-            self._arrival_rate = (
-                self.EMA_ALPHA * inst_rate
-                + (1 - self.EMA_ALPHA) * self._arrival_rate
-            )
+            self._arrival_rate = self.EMA_ALPHA * inst_rate + (1 - self.EMA_ALPHA) * self._arrival_rate
             self._window_sample_count = 0
             self._window_start = now
 

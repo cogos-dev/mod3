@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 # Gate: Silero VAD
 # ---------------------------------------------------------------------------
 
+
 class VoiceGate(Gate):
     """Voice activity detection gate using Silero VAD."""
 
@@ -74,6 +75,7 @@ class VoiceGate(Gate):
 # Decoder: WhisperDecoder — mlx_whisper STT
 # ---------------------------------------------------------------------------
 
+
 class WhisperDecoder(Decoder):
     """Speech-to-text decoder using mlx_whisper on Apple Silicon.
 
@@ -92,6 +94,7 @@ class WhisperDecoder(Decoder):
         """Trigger model download/load on first use."""
         if not self._loaded:
             import mlx_whisper
+
             # A dry-run transcribe forces the model to download & cache.
             # mlx_whisper handles caching internally — subsequent calls
             # with the same path_or_hf_repo are fast.
@@ -155,6 +158,7 @@ class WhisperDecoder(Decoder):
 # Decoder: PlaceholderDecoder — legacy pre-transcribed text path
 # ---------------------------------------------------------------------------
 
+
 class PlaceholderDecoder(Decoder):
     """Accepts pre-transcribed text and wraps it as a CognitiveEvent.
 
@@ -167,6 +171,7 @@ class PlaceholderDecoder(Decoder):
             transcript = raw.decode("utf-8", errors="replace")
 
         from vad import is_hallucination
+
         if is_hallucination(transcript):
             return CognitiveEvent(
                 modality=ModalityType.VOICE,
@@ -186,6 +191,7 @@ class PlaceholderDecoder(Decoder):
 # ---------------------------------------------------------------------------
 # Encoder: Mod³ TTS
 # ---------------------------------------------------------------------------
+
 
 def _encode_wav(samples: np.ndarray, sample_rate: int) -> bytes:
     """Encode float32 samples as 16-bit PCM WAV."""
@@ -265,6 +271,7 @@ class VoiceEncoder(Encoder):
 # ---------------------------------------------------------------------------
 # Voice module
 # ---------------------------------------------------------------------------
+
 
 class VoiceModule(ModalityModule):
     """Voice modality — VAD gate, STT decoder, TTS encoder."""
