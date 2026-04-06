@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mod3-voice": {
+      "command": "python3",
+      "args": ["/Users/slowbro/workspaces/mod3/server.py", "--channel"]
+    }
+  }
+}

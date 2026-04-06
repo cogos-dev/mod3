@@ -27,9 +27,9 @@ class PlaybackMetrics:
     sample_rate: int = 24_000
 
     # Timing
-    ttfa_sec: float = 0.0       # first queue_audio → first audible output
+    ttfa_sec: float = 0.0  # first queue_audio → first audible output
     total_wall_sec: float = 0.0
-    overall_rtf: float = 0.0    # duration_sec / total_wall_sec
+    overall_rtf: float = 0.0  # duration_sec / total_wall_sec
 
     # Chunks (from generator)
     chunk_count: int = 0
@@ -89,8 +89,8 @@ class AdaptivePlayer:
 
     # EMA parameters (same as mlx_audio AudioPlayer)
     EMA_ALPHA = 0.25
-    MEASURE_WINDOW = 0.25       # seconds between rate measurements
-    MIN_BUFFER_SECONDS = 1.5    # startup threshold = arrival_rate * this
+    MEASURE_WINDOW = 0.25  # seconds between rate measurements
+    MIN_BUFFER_SECONDS = 1.5  # startup threshold = arrival_rate * this
 
     def __init__(self, sample_rate: int = 24_000, buffer_size: int = 2048, device: int | str | None = None):
         self.sample_rate = sample_rate
@@ -124,6 +124,9 @@ class AdaptivePlayer:
         self._startup_delay = 0.0
         self._peak_memory_gb = 0.0
 
+        # Progress tracking (for PipelineState position updates)
+        self._samples_played = 0
+
         # Synchronization: set when mark_done() is called
         self._done_event = Event()
 
@@ -139,7 +142,7 @@ class AdaptivePlayer:
             while filled < frames and self._buffer:
                 buf = self._buffer[0]
                 to_copy = min(frames - filled, len(buf))
-                outdata[filled:filled + to_copy, 0] = buf[:to_copy]
+                outdata[filled : filled + to_copy, 0] = buf[:to_copy]
                 filled += to_copy
 
                 if to_copy == len(buf):
@@ -148,6 +151,9 @@ class AdaptivePlayer:
                     self._buffer[0] = buf[to_copy:]
 
             current_buffer = sum(map(len, self._buffer))
+
+        # Progress tracking (lock-free; only written here in audio thread)
+        self._samples_played += filled
 
         # Metrics
         if filled > 0 and self._first_pull_time is None:
@@ -193,10 +199,7 @@ class AdaptivePlayer:
         if now - self._window_start >= self.MEASURE_WINDOW:
             elapsed = now - self._window_start
             inst_rate = self._window_sample_count / elapsed
-            self._arrival_rate = (
-                self.EMA_ALPHA * inst_rate
-                + (1 - self.EMA_ALPHA) * self._arrival_rate
-            )
+            self._arrival_rate = self.EMA_ALPHA * inst_rate + (1 - self.EMA_ALPHA) * self._arrival_rate
             self._window_sample_count = 0
             self._window_start = now
 
@@ -235,6 +238,15 @@ class AdaptivePlayer:
             if self._first_queue_time is not None:
                 self._startup_delay = time.perf_counter() - self._first_queue_time
             self._start_stream()
+
+    def get_progress(self) -> tuple[int, int]:
+        """Return (samples_played, total_samples_queued) for position tracking.
+
+        Called by PipelineState to compute spoken_pct. The samples_played
+        counter is updated in the audio callback; total_samples_queued is
+        updated in queue_audio(). Both are monotonically increasing.
+        """
+        return self._samples_played, self._total_queued_samples
 
     def wait(self, timeout: float = 120.0) -> PlaybackMetrics:
         """Block until playback finishes. Returns metrics."""

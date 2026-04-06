@@ -1,0 +1,18 @@
+[project]
+name = "mod3"
+version = "0.3.0"
+description = "Model Modality Modulator — multi-model TTS + VAD on Apple Silicon"
+requires-python = ">=3.12"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+reportMissingImports = false

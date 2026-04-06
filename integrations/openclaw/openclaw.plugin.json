@@ -1,0 +1,11 @@
+{
+  "id": "mod3",
+  "contracts": {
+    "speechProviders": ["mod3"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

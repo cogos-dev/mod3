@@ -1,0 +1,12 @@
+{
+  "name": "@mod3/openclaw-speech",
+  "version": "0.3.0",
+  "private": true,
+  "description": "OpenClaw speech provider for Mod³ local TTS on Apple Silicon",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

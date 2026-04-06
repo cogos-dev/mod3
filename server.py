@@ -1,10 +1,15 @@
 """
-Mod³ TTS MCP Server — gives Claude a voice via multiple TTS engines on Apple Silicon.
+Mod³ TTS Server — gives Claude a voice via multiple TTS engines on Apple Silicon.
 
 Multi-model support: Voxtral, Kokoro, Chatterbox, Spark.
 Voice presets are resolved to the correct engine automatically.
 
-Tools:
+Interfaces:
+  MCP (default):  stdio-based MCP tools for Claude Code
+  HTTP (--http):  REST API for OpenClaw and external consumers
+  Both (--all):   MCP on stdio + HTTP on a port, shared model cache
+
+Tools (MCP):
   speak(text, voice, speed, emotion) — non-blocking speech, returns job ID
   speech_status(job_id)              — check job or get latest metrics
   stop()                             — interrupt current speech
@@ -14,106 +19,213 @@ Tools:
 """
 
 import json
+import logging
 import threading
 import time
 import uuid
 from collections import OrderedDict
+from typing import Any
 
-import numpy as np
-import pysbd
+import anyio
 from mcp.server.fastmcp import FastMCP
+from mcp.server.stdio import stdio_server
+from mcp.shared.message import SessionMessage
+from mcp.types import JSONRPCMessage, JSONRPCNotification
 
 from adaptive_player import AdaptivePlayer
+from engine import MODELS, generate_audio, get_loaded_engines, get_model, resolve_model
+from pipeline_state import InterruptInfo, PipelineState
 
-_segmenter = pysbd.Segmenter(language="en", clean=False)
-
-
-def _split_sentences(text: str) -> list[str]:
-    """Split text into sentences using pysbd."""
-    sentences = _segmenter.segment(text.strip())
-    return [s.strip() for s in sentences if s.strip()]
+logger = logging.getLogger("mod3.server")
 
 mcp = FastMCP(
     "mod3",
     instructions=(
-        "Mod³ TTS server with multi-model support (Voxtral, Kokoro, Chatterbox, Spark) "
+        "Mod³ voice channel with multi-model TTS (Voxtral, Kokoro, Chatterbox, Spark) "
         "running locally on Apple Silicon. "
-        "Use the `speak` tool to say something out loud through the user's speakers. "
-        "speak() is non-blocking — it returns immediately while audio plays in the background. "
-        "Use `speech_status` to check completion and get metrics. "
-        "Use `stop` to interrupt current speech. "
-        "Keep spoken text conversational and concise — this is voice, not a document."
+        'Voice messages arrive as <channel source="mod3" speaker="..." confidence="...">. '
+        "Use the speak tool to respond via voice. speak() is non-blocking. "
+        "Use speech_status to check completion. Use stop to interrupt. "
+        "Keep spoken text conversational and concise — this is voice, not a document. "
+        "For permission prompts, reply verbally with 'yes [code]' or 'no [code]'."
     ),
 )
 
 # ---------------------------------------------------------------------------
-# Model registry
+# Claude Code channel capabilities
 # ---------------------------------------------------------------------------
 
-MODELS = {
-    "voxtral": {
-        "id": "mlx-community/Voxtral-4B-TTS-2603-mlx-4bit",
-        "voices": [
-            "casual_male", "casual_female", "cheerful_female",
-            "neutral_male", "neutral_female",
-            "fr_male", "fr_female", "es_male", "es_female",
-            "de_male", "de_female", "it_male", "it_female",
-            "pt_male", "pt_female", "nl_male", "nl_female",
-            "ar_male", "hi_male", "hi_female",
-        ],
-        "default_voice": "casual_male",
-    },
-    "kokoro": {
-        "id": "mlx-community/Kokoro-82M-bf16",
-        "voices": [
-            "af_heart", "af_bella", "af_nicole", "af_sarah", "af_sky",
-            "am_adam", "am_michael",
-            "bf_emma", "bf_isabella",
-            "bm_george", "bm_lewis",
-        ],
-        "default_voice": "af_heart",
-        "supports_speed": True,
-    },
-    "chatterbox": {
-        "id": "mlx-community/chatterbox-4bit",
-        "voices": ["chatterbox"],
-        "default_voice": "chatterbox",
-        "supports_exaggeration": True,
-    },
-    "spark": {
-        "id": "mlx-community/Spark-TTS-0.5B-bf16",
-        "voices": ["spark_male", "spark_female"],
-        "default_voice": "spark_male",
-        "supports_pitch": True,
-        "supports_speed": True,
-    },
+_CHANNEL_CAPABILITIES: dict[str, dict[str, Any]] = {
+    "claude/channel": {},
+    "claude/channel/permission": {},
 }
 
+# Store the write stream for emitting channel notifications outside request context
+_write_stream = None
+_write_stream_lock = threading.Lock()
+
+
+async def emit_channel_event(content: str, meta: dict[str, str] | None = None):
+    """Emit a channel notification to Claude Code.
+
+    Sends a ``notifications/claude/channel`` JSON-RPC notification over the
+    active MCP session.  Can be called from tool handlers or background tasks
+    while the server is running.
+
+    Args:
+        content: The textual content to relay (e.g. transcribed speech).
+        meta: Optional string-keyed metadata dict (speaker, confidence, etc.).
+    """
+    with _write_stream_lock:
+        ws = _write_stream
+    if ws is None:
+        raise RuntimeError("MCP session not active — cannot emit channel event")
+
+    notification = JSONRPCNotification(
+        jsonrpc="2.0",
+        method="notifications/claude/channel",
+        params={"content": content, "meta": meta or {}},
+    )
+    await ws.send(SessionMessage(message=JSONRPCMessage(notification)))
+
+
+async def emit_permission_verdict(request_id: str, behavior: str):
+    """Emit a permission verdict notification to Claude Code.
+
+    Sends a ``notifications/claude/channel/permission`` JSON-RPC notification
+    with a verdict (allow/deny) for a previously received permission request.
+
+    Args:
+        request_id: The 5-letter request ID from the original permission request.
+        behavior: ``"allow"`` or ``"deny"``.
+    """
+    with _write_stream_lock:
+        ws = _write_stream
+    if ws is None:
+        raise RuntimeError("MCP session not active — cannot emit permission verdict")
+
+    notification = JSONRPCNotification(
+        jsonrpc="2.0",
+        method="notifications/claude/channel/permission",
+        params={"request_id": request_id, "behavior": behavior},
+    )
+    await ws.send(SessionMessage(message=JSONRPCMessage(notification)))
+    logger.info("permission verdict sent: request_id=%s behavior=%s", request_id, behavior)
+
+
+def _handle_permission_request(params: dict[str, Any]) -> None:
+    """Handle an incoming permission request by speaking it aloud via TTS.
+
+    Called when the read-stream interceptor detects a
+    ``notifications/claude/channel/permission_request`` notification from
+    Claude Code.  Formats a spoken prompt and plays it through the default
+    voice so the user can respond verbally.
+
+    Args:
+        params: The notification params containing ``request_id``,
+                ``tool_name``, ``description``, and ``input_preview``.
+    """
+    request_id = params.get("request_id", "unknown")
+    tool_name = params.get("tool_name", "a tool")
+    description = params.get("description", "")
+
+    # Build a concise spoken prompt
+    prompt_parts = [f"Claude wants to run {tool_name}"]
+    if description:
+        prompt_parts.append(f": {description}")
+    prompt_parts.append(f". Say yes {request_id} or no {request_id}.")
+    prompt_text = "".join(prompt_parts)
+
+    logger.info("permission request received: id=%s tool=%s", request_id, tool_name)
+    _start_speech(prompt_text, voice="bm_lewis", speed=1.25)
+
+
+# Patch run_stdio_async to inject experimental capabilities and capture the
+# write stream so emit_channel_event can send notifications at any time.
+_original_run_stdio = mcp.run_stdio_async
+
+_PERMISSION_REQUEST_METHOD = "notifications/claude/channel/permission_request"
+
+
+async def _patched_run_stdio():
+    global _write_stream
+    async with stdio_server() as (read_stream, write_stream):
+        with _write_stream_lock:
+            _write_stream = write_stream
+
+        # Wrap the read stream to intercept permission_request notifications.
+        # These use a custom method that the MCP session cannot parse into a
+        # typed ClientNotification, so we handle them here and forward
+        # everything else to the MCP server unchanged.
+        send_inner, receive_inner = anyio.create_memory_object_stream[SessionMessage | Exception](0)
+
+        async def _filter_read_stream():
+            async with read_stream, send_inner:
+                async for message in read_stream:
+                    if isinstance(message, Exception):
+                        await send_inner.send(message)
+                        continue
+
+                    root = message.message.root
+                    if isinstance(root, JSONRPCNotification) and root.method == _PERMISSION_REQUEST_METHOD:
+                        # Handle permission request — speak it via TTS
+                        _handle_permission_request(root.params or {})
+                        continue
+
+                    # All other messages pass through to the MCP server
+                    await send_inner.send(message)
+
+        try:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(_filter_read_stream)
+                await mcp._mcp_server.run(
+                    receive_inner,
+                    write_stream,
+                    mcp._mcp_server.create_initialization_options(
+                        experimental_capabilities=_CHANNEL_CAPABILITIES,
+                    ),
+                )
+        finally:
+            with _write_stream_lock:
+                _write_stream = None
+
+
+mcp.run_stdio_async = _patched_run_stdio
+
+# ---------------------------------------------------------------------------
+# Reflex arc — shared pipeline state
+# ---------------------------------------------------------------------------
+
+pipeline_state = PipelineState()
+
+
+async def _emit_interruption(info: InterruptInfo):
+    """Emit a channel notification when playback is interrupted.
+
+    Called by the inbound pipeline (VAD reflex) after pipeline_state.interrupt()
+    returns an InterruptInfo.  Notifies Claude Code that speech was cut short.
+    """
+    await emit_channel_event(
+        content=f"[interrupted — speech halted at '{info.delivered_text}']",
+        meta={
+            "source": "mod3-voice",
+            "type": "interruption",
+            "spoken_pct": str(round(info.spoken_pct, 2)),
+            "reason": info.reason,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Job tracking (MCP only — local speaker playback)
+# ---------------------------------------------------------------------------
+
 MAX_JOBS = 20
-_models: dict = {}
-_model_lock = threading.Lock()
 _last_metrics: dict | None = None
 _output_device: int | str | None = None
 _jobs: OrderedDict[str, dict] = OrderedDict()
 _current_player: AdaptivePlayer | None = None
 _current_player_lock = threading.Lock()
-
-
-def _resolve_model(voice: str) -> tuple[str, str]:
-    """Given a voice name, return (engine_name, voice) or raise."""
-    for engine, cfg in MODELS.items():
-        if voice in cfg["voices"]:
-            return engine, voice
-    raise ValueError(f"Unknown voice '{voice}'. Use list_voices() to see options.")
-
-
-def _get_model(engine: str):
-    if engine not in _models:
-        with _model_lock:
-            if engine not in _models:
-                from mlx_audio.tts import load
-                _models[engine] = load(MODELS[engine]["id"])
-    return _models[engine]
 
 
 def _prune_jobs():
@@ -123,8 +235,9 @@ def _prune_jobs():
 
 
 # ---------------------------------------------------------------------------
-# Adaptive playback
+# Adaptive playback (MCP speaker output)
 # ---------------------------------------------------------------------------
+
 
 def _start_speech(
     text: str,
@@ -136,8 +249,8 @@ def _start_speech(
 ) -> str:
     """Start non-blocking speech generation. Returns job ID immediately."""
     global _last_metrics, _current_player
-    engine, voice = _resolve_model(voice)
-    model = _get_model(engine)
+    engine, voice = resolve_model(voice)
+    model = get_model(engine)
     player = AdaptivePlayer(sample_rate=model.sample_rate, device=_output_device)
 
     with _current_player_lock:
@@ -157,18 +270,30 @@ def _start_speech(
     _prune_jobs()
 
     def _run():
+        # Register with the reflex arc so inbound VAD can interrupt us
+        pipeline_state.start_speaking(text, player)
         try:
-            _generate_sentences(
-                model, engine, voice, text, player,
-                stream, streaming_interval, speed, emotion,
-                sample_rate=model.sample_rate,
-            )
+            for chunk in generate_audio(
+                text,
+                voice=voice,
+                stream=stream,
+                streaming_interval=streaming_interval,
+                speed=speed,
+                emotion=emotion,
+            ):
+                player.queue_audio(chunk.samples, chunk_meta=chunk.metadata if chunk.metadata else None)
+                # Update position after each chunk so PipelineState tracks progress
+                pipeline_state.update_position(*player.get_progress())
         except Exception as e:
             _jobs[job_id]["error"] = str(e)
         finally:
             player.mark_done()
 
         metrics = player.wait(timeout=120.0)
+        # Final position update and clear speaking state
+        pipeline_state.update_position(*player.get_progress())
+        pipeline_state.stop_speaking()
+
         result = metrics.to_dict()
         result["engine"] = engine
         result["voice"] = voice
@@ -185,59 +310,10 @@ def _start_speech(
     return job_id
 
 
-def _generate_sentences(model, engine, voice, text, player, stream, streaming_interval, speed, emotion, *, sample_rate: int):
-    """Generate audio sentence-by-sentence into the adaptive player."""
-    sentences = _split_sentences(text)
-    feather = int(sample_rate * 0.02)
-
-    for si, sentence in enumerate(sentences):
-        chunks_in_sentence = []
-        gen_kwargs = dict(text=sentence, verbose=False)
-        cfg = MODELS[engine]
-        if engine == "chatterbox":
-            gen_kwargs["exaggeration"] = emotion
-            gen_kwargs["stream"] = stream
-            gen_kwargs["streaming_interval"] = streaming_interval
-        elif engine == "spark":
-            gen_kwargs["gender"] = "female" if voice == "spark_female" else "male"
-            gen_kwargs["speed"] = speed
-        else:
-            gen_kwargs["voice"] = voice
-            if cfg.get("supports_speed"):
-                gen_kwargs["speed"] = speed
-            else:
-                gen_kwargs["stream"] = stream
-                gen_kwargs["streaming_interval"] = streaming_interval
-
-        for result in model.generate(**gen_kwargs):
-            audio = np.array(result.audio).flatten().astype(np.float32)
-            chunk_meta = {
-                "gen_time_sec": round(result.processing_time_seconds, 4),
-                "rtf": round(result.real_time_factor, 2),
-                "samples": int(result.samples),
-                "tokens": result.token_count,
-                "is_final": result.is_final_chunk,
-                "sentence": si,
-                "peak_memory_gb": round(result.peak_memory_usage, 2),
-            }
-
-            if result.is_final_chunk and len(audio) > feather:
-                audio = audio.copy()
-                audio[-feather:] *= np.linspace(1, 0, feather, dtype=np.float32)
-
-            player.queue_audio(audio, chunk_meta=chunk_meta)
-            chunks_in_sentence.append(True)
-
-        # Adaptive sentence gap: scale with sentence length
-        if si < len(sentences) - 1 and chunks_in_sentence:
-            gap_sec = min(0.2, 0.05 + len(sentence) * 0.001)
-            gap = np.zeros(int(sample_rate * gap_sec), dtype=np.float32)
-            player.queue_audio(gap)
-
-
 # ---------------------------------------------------------------------------
 # MCP Tools
 # ---------------------------------------------------------------------------
+
 
 @mcp.tool(
     annotations={
@@ -310,14 +386,16 @@ def speech_status(job_id: str = "", verbose: bool = False) -> str:
     if job["metrics"]:
         metrics = job["metrics"]
         if not verbose and "chunks" in metrics:
-            # Summarize chunks instead of returning all per-chunk data
             chunks = metrics["chunks"]["per_chunk"]
             rtfs = [c["rtf"] for c in chunks if c.get("rtf")]
-            metrics = {**metrics, "chunks": {
-                "count": metrics["chunks"]["count"],
-                "avg_rtf": round(sum(rtfs) / len(rtfs), 2) if rtfs else 0,
-                "min_rtf": round(min(rtfs), 2) if rtfs else 0,
-            }}
+            metrics = {
+                **metrics,
+                "chunks": {
+                    "count": metrics["chunks"]["count"],
+                    "avg_rtf": round(sum(rtfs) / len(rtfs), 2) if rtfs else 0,
+                    "min_rtf": round(min(rtfs), 2) if rtfs else 0,
+                },
+            }
         result["metrics"] = metrics
     if job["error"]:
         result["error"] = job["error"]
@@ -341,6 +419,42 @@ def stop() -> str:
 
     player.flush()
     return json.dumps({"status": "ok", "message": "Speech interrupted"})
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def vad_check(file_path: str, threshold: float = 0.5) -> str:
+    """Check if an audio file contains speech using Silero VAD.
+
+    Use this before transcription to avoid Whisper hallucinations on
+    silence or ambient noise.
+
+    Args:
+        file_path: Path to a WAV audio file.
+        threshold: Speech probability threshold 0-1 (default 0.5). Higher = stricter.
+    """
+    from vad import detect_speech_file
+
+    try:
+        result = detect_speech_file(file_path, threshold=threshold)
+        return json.dumps(
+            {
+                "has_speech": result.has_speech,
+                "confidence": result.confidence,
+                "speech_ratio": result.speech_ratio,
+                "num_segments": result.num_segments,
+                "total_speech_sec": result.total_speech_sec,
+                "total_audio_sec": result.total_audio_sec,
+            }
+        )
+    except Exception as e:
+        return json.dumps({"status": "error", "error": str(e)})
 
 
 @mcp.tool(
@@ -380,9 +494,8 @@ def diagnostics() -> str:
     engines = {}
     for name, cfg in MODELS.items():
         engines[name] = {
-            "loaded": name in _models,
+            "loaded": name in get_loaded_engines() or False,
             "model_id": cfg["id"],
-            "sample_rate": _models[name].sample_rate if name in _models else None,
             "voices": len(cfg["voices"]),
         }
     info = {
@@ -411,6 +524,7 @@ def set_output_device(device: str = "") -> str:
                 If empty, lists available devices without changing anything.
     """
     import sounddevice as sd
+
     global _output_device
 
     outputs = []
@@ -440,5 +554,51 @@ def set_output_device(device: str = "") -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
+
+def _run_http(host: str = "0.0.0.0", port: int = 7860):
+    """Start the HTTP API server."""
+    import uvicorn
+
+    from http_api import app
+
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
 if __name__ == "__main__":
-    mcp.run()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Mod³ TTS Server")
+    parser.add_argument("--http", action="store_true", help="Run HTTP API only")
+    parser.add_argument("--all", action="store_true", help="Run both MCP (stdio) and HTTP")
+    parser.add_argument("--channel", action="store_true", help="Run as channel server with voice input")
+    parser.add_argument("--port", type=int, default=7860, help="HTTP port (default: 7860)")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="HTTP bind address")
+    args = parser.parse_args()
+
+    if args.http:
+        _run_http(host=args.host, port=args.port)
+    elif args.all:
+        # HTTP in background thread, MCP on stdio
+        http_thread = threading.Thread(
+            target=_run_http,
+            kwargs={"host": args.host, "port": args.port},
+            daemon=True,
+        )
+        http_thread.start()
+        mcp.run()
+    elif args.channel:
+        # Channel mode: MCP on stdio + inbound voice pipeline
+        from bus import ModalityBus
+        from inbound import InboundPipeline
+        from modules.voice import VoiceModule
+
+        bus = ModalityBus()
+        bus.register(VoiceModule())
+        inbound = InboundPipeline(bus=bus, pipeline_state=pipeline_state)
+        inbound.start()
+        try:
+            mcp.run()  # MCP on stdio with channel capabilities
+        finally:
+            inbound.stop()
+    else:
+        mcp.run()

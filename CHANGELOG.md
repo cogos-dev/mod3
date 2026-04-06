@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.0] - 2026-04-04
+
+### Added
+- **HTTP API** — FastAPI server alongside MCP, shared model cache
+  - `POST /v1/synthesize` — text → WAV/PCM audio bytes with full generation metrics
+  - `POST /v1/audio/speech` — OpenAI-compatible TTS endpoint
+  - `POST /v1/vad` — Silero VAD speech detection on audio files
+  - `POST /v1/filter` — Whisper hallucination check (Bag of Hallucinations)
+  - `GET /v1/voices` — list engines and voice presets
+  - `GET /v1/jobs` — job ledger with lifecycle tracking and per-chunk metrics
+  - `GET /v1/jobs/{id}` — specific job details
+  - `GET /health` — server health with engine/VAD status
+- **Silero VAD** — voice activity detection input gate, prevents Whisper hallucinations on silence/noise
+- **Bag of Hallucinations (BoH)** — post-filter for known Whisper phantom phrases ("thank you", "subscribe", etc.)
+- **`vad_check` MCP tool** — run VAD on a local audio file from Claude Code
+- **Job ledger** — every HTTP request (synthesize, VAD, filter) gets a job ID with full lifecycle timeline
+- **Server startup modes** — `--http` (HTTP only), `--all` (MCP + HTTP), default MCP only
+- **OpenClaw speech provider plugin** (`integrations/openclaw/`) — drop-in local TTS for Discord voice channels
+
+### Changed
+- **Engine extraction** — inference core moved to `engine.py`, shared by MCP and HTTP interfaces
+- **Server refactored** — `server.py` imports from `engine.py` instead of defining models inline
+
 ## [0.2.0] - 2026-04-04
 
 ### Added
