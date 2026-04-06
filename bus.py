@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import logging
 import time
-from output_queue import OutputQueueManager, QueuedJob
 from typing import Any, Callable
 
 from modality import (
@@ -31,6 +30,7 @@ from modality import (
     ModalityModule,
     ModalityType,
 )
+from output_queue import OutputQueueManager, QueuedJob
 
 logger = logging.getLogger("mod3.bus")
 
