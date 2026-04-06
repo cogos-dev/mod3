@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from bus import ModalityBus
 from engine import MODELS, generate_audio, get_loaded_engines, resolve_model
+from modality import EncodedOutput
 from modules.text import TextModule
 from modules.voice import VoiceModule
 from vad import detect_speech_file, is_hallucination
@@ -507,15 +508,16 @@ def bus_act(req: dict):
         metadata=metadata,
     )
 
-    result = _bus.act(intent, channel=channel, blocking=True)
+    output = _bus.act(intent, channel=channel, blocking=True)
+    assert isinstance(output, EncodedOutput), "Expected blocking act() to return EncodedOutput"
 
     return {
         "status": "ok",
-        "modality": result.modality.value,
-        "format": result.format,
-        "duration_sec": result.duration_sec,
-        "bytes": len(result.data),
-        "metadata": result.metadata,
+        "modality": output.modality.value,
+        "format": output.format,
+        "duration_sec": output.duration_sec,
+        "bytes": len(output.data),
+        "metadata": output.metadata,
     }
 
 
