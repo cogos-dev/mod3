@@ -22,7 +22,10 @@ from fastapi import FastAPI, Response, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from bus import ModalityBus
 from engine import MODELS, generate_audio, get_loaded_engines, resolve_model
+from modules.text import TextModule
+from modules.voice import VoiceModule
 from vad import detect_speech_file, is_hallucination
 from vad import is_model_loaded as vad_loaded
 
@@ -416,10 +419,6 @@ def health():
 # ---------------------------------------------------------------------------
 # Modality Bus endpoints
 # ---------------------------------------------------------------------------
-
-from bus import ModalityBus
-from modules.text import TextModule
-from modules.voice import VoiceModule
 
 _bus = ModalityBus()
 _bus.register(TextModule())
