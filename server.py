@@ -335,6 +335,11 @@ def speak(
     Non-blocking: returns immediately with a job ID while audio plays in the
     background. Use speech_status(id) to check completion and get metrics.
 
+    If speech is already playing, the current output is interrupted and the
+    new text starts immediately. The response includes an "interrupted" field
+    with details about what was playing, so the agent is always aware of the
+    output channel's state without needing a separate status check.
+
     Args:
         text: The text to speak aloud. Keep it conversational.
         voice: Voice preset. Use list_voices() to see options.
@@ -347,9 +352,34 @@ def speak(
     if not text.strip():
         return json.dumps({"status": "error", "error": "Nothing to say"})
 
+    # Check if something is currently playing and include awareness in response.
+    current_info = None
+    with _current_player_lock:
+        if _current_player is not None:
+            # Find the active job
+            for jid, jdata in reversed(_jobs.items()):
+                if jdata["status"] == "speaking":
+                    elapsed = round(time.time() - jdata["start_time"], 1)
+                    current_info = {
+                        "job_id": jid,
+                        "elapsed_sec": elapsed,
+                        "text_preview": jdata.get("text", "")[:80],
+                    }
+                    break
+
     try:
+        # If something is playing, interrupt it (default: barge-in on self).
+        # This prevents double-output on the same device.
+        if current_info is not None:
+            with _current_player_lock:
+                if _current_player is not None:
+                    _current_player.flush()
+
         job_id = _start_speech(text, voice, stream=stream, speed=speed, emotion=emotion)
-        return json.dumps({"status": "speaking", "job_id": job_id})
+        result = {"status": "speaking", "job_id": job_id}
+        if current_info is not None:
+            result["interrupted"] = current_info
+        return json.dumps(result)
     except ValueError as e:
         return json.dumps({"status": "error", "error": str(e)})
     except Exception as e:
