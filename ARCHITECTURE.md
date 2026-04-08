@@ -80,7 +80,7 @@ class ModalityModule(ABC):
     health() -> dict                # Diagnostics
 ```
 
-`Gate` is optional. Text has no gate (all text passes). Voice uses VAD to reject silence.
+`Gate` is optional. Text has no gate (all text passes). Voice uses VAD (Voice Activity Detection) to reject silence.
 
 ## The Bus (bus.py)
 
