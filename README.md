@@ -1,18 +1,18 @@
 # Mod³ — Model Modality Modulator
 
-> Part of the [CogOS ecosystem](https://github.com/cogos-dev) — **how it ACTS**
+Give your AI agent a voice.
 
-Mod³ translates between thinking and acting. It's the modality bus for CogOS — the layer where cognitive intents become physical signals and physical signals become cognitive events. Voice is the first modality. The architecture supports any modality.
-
-Currently: an MCP server that runs local TTS models on Apple Silicon, with adaptive buffering, multi-model routing, non-blocking speech, voice activity detection, and structured metrics. Built for [Claude Code](https://claude.ai/claude-code), works with any MCP-compatible client.
+Mod³ is a Python MCP server that provides text-to-speech for Claude Code, Cursor, and other MCP-compatible AI tools. It runs four TTS engines locally on Apple Silicon, generates speech faster than realtime, and returns immediately so the agent keeps working while audio plays.
 
 ## What it does
 
-- **Non-blocking speech** — `speak()` returns immediately. Audio plays in the background while the agent keeps working. Two output channels: voice for the ephemeral, text for the persistent.
-- **Multi-model routing** — Four TTS engines, one interface. Voice name auto-routes to the right model.
-- **Adaptive buffering** — EMA-based arrival rate tracking with dynamic startup threshold. Gapless playback under normal conditions, graceful degradation under GPU contention.
-- **Structured metrics** — Every call returns TTFA, RTF, per-chunk timing, buffer health, underrun counts, memory usage. The agent can diagnose its own audio quality.
-- **Sentence chunking** — Text is split at sentence boundaries for natural prosody. Feathered edges (fade-out + breath gap) between sentences.
+- **Non-blocking speech** -- `speak()` returns immediately with a job ID. Audio plays in the background. The agent writes code while it talks.
+- **Queue-aware output** -- Every `speak()` return includes queue position, estimated wait time, and active job state. The agent knows what's playing without making a separate status call.
+- **Barge-in detection** -- VAD (voice activity detection) monitors the microphone. If the user starts talking, playback stops and the agent is notified. No talking over people.
+- **Turn-taking** -- Bidirectional awareness of who's speaking. The agent can check user state before deciding to speak or wait.
+- **Multi-model routing** -- Four TTS engines behind one interface. Voice name determines which engine handles the request.
+- **Adaptive buffering** -- EMA-based arrival rate tracking with dynamic startup threshold. Gapless playback under normal load, graceful degradation under GPU contention.
+- **Structured metrics** -- Every call returns TTFA, RTF, per-chunk timing, buffer health, underrun counts, and memory usage. The agent can diagnose its own audio quality.
 
 ## Engines
 
@@ -50,7 +50,7 @@ Then add to your project's `.mcp.json`:
 
 ### `speak(text, voice?, stream?, speed?, emotion?)`
 
-Synthesize text and play through speakers. Returns immediately with a job ID.
+Synthesize text and play through speakers. Returns immediately with a job ID, queue state, and estimated wait time.
 
 ```
 speak("Hello world")                                        → default voice (bm_lewis @ 1.25x)
@@ -66,6 +66,10 @@ Check if speech is still playing, or get metrics from the last completed job. Pa
 ### `stop()`
 
 Interrupt current speech immediately.
+
+### `vad_check()`
+
+Check microphone for voice activity. Returns whether the user is currently speaking, enabling the agent to wait for a natural pause before responding.
 
 ### `list_voices()`
 
@@ -83,8 +87,8 @@ Show loaded engines, active jobs, output device, and last generation metrics.
 
 Two files:
 
-- **`server.py`** — MCP tool definitions, multi-model registry, sentence chunking, non-blocking job management
-- **`adaptive_player.py`** — Callback-based audio playback with EMA arrival rate tracking, adaptive startup threshold, and structured metrics collection
+- **`server.py`** -- MCP tool definitions, multi-model registry, sentence chunking, non-blocking job management, queue-aware returns
+- **`adaptive_player.py`** -- Callback-based audio playback with EMA arrival rate tracking, adaptive startup threshold, and structured metrics collection
 
 The adaptive player is model-agnostic. Any TTS engine that produces audio chunks feeds the same pipeline.
 
@@ -92,13 +96,26 @@ The adaptive player is model-agnostic. Any TTS engine that produces audio chunks
 
 - macOS with Apple Silicon (M1/M2/M3/M4)
 - Python 3.10+
-- espeak-ng (`brew install espeak-ng`) — required for Kokoro's phonemizer
+- espeak-ng (`brew install espeak-ng`) -- required for Kokoro's phonemizer
 
 ## Using Voice as a Modality
 
-See [`skills/voice/SKILL.md`](skills/voice/SKILL.md) for the full guide on dual-modal communication — when to speak vs write, non-blocking patterns, reading metrics, and anti-patterns.
+See [`skills/voice/SKILL.md`](skills/voice/SKILL.md) for the full guide on dual-modal communication -- when to speak vs write, non-blocking patterns, reading metrics, and anti-patterns.
 
-The short version: voice carries the ephemeral (context, intent, tone). Text carries the persistent (code, data, decisions). Both channels active simultaneously. That's the point.
+Voice carries the ephemeral (context, intent, tone). Text carries the persistent (code, data, decisions). Both channels active simultaneously.
+
+## Ecosystem
+
+Mod³ is the voice layer in the [CogOS](https://github.com/cogos-dev/cogos) ecosystem. It integrates as a modality channel -- the kernel routes intents to Mod³ when voice output is appropriate. Works standalone without CogOS.
+
+| Repo | Purpose |
+|------|---------|
+| [cogos](https://github.com/cogos-dev/cogos) | The daemon |
+| **mod3** | **Voice -- this repo** |
+| [constellation](https://github.com/cogos-dev/constellation) | Distributed identity and trust |
+| [skills](https://github.com/cogos-dev/skills) | Agent skill library |
+| [charts](https://github.com/cogos-dev/charts) | Helm charts for deployment |
+| [desktop](https://github.com/cogos-dev/desktop) | macOS dashboard app |
 
 ## License
 
