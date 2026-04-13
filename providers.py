@@ -443,7 +443,7 @@ def auto_detect_provider() -> InferenceProvider:
         return MlxProvider()
 
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(auto_detect_provider_async())
 

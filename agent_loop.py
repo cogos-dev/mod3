@@ -11,7 +11,7 @@ import json as _json
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import httpx
 
@@ -82,7 +82,6 @@ def _fetch_kernel_context() -> str:
                 interrupted = signal.get("interrupted")
                 if interrupted:
                     delivered = interrupted.get("delivered_text", "")
-                    full = interrupted.get("full_text", "")
                     pct = interrupted.get("spoken_pct", 0)
                     parts.append(
                         f"[barge-in] Claude's speech was interrupted at {pct*100:.0f}%. "
