@@ -372,9 +372,11 @@ def _bargein_watcher():
     """Background thread that watches for barge-in signal file changes."""
     global _bargein_last_mtime
     import json as _json
+
     while True:
         try:
             import os
+
             if os.path.exists(_BARGEIN_SIGNAL):
                 mtime = os.path.getmtime(_BARGEIN_SIGNAL)
                 if mtime > _bargein_last_mtime:
@@ -393,7 +395,9 @@ def _bargein_watcher():
                                 }
                                 with open(_BARGEIN_SIGNAL, "w") as f:
                                     _json.dump(signal, f, indent=2)
-                            logging.info("Barge-in: paused playback (%.0f%% delivered)", info.spoken_pct * 100 if info else 0)
+                            logging.info(
+                                "Barge-in: paused playback (%.0f%% delivered)", info.spoken_pct * 100 if info else 0
+                            )
         except Exception as e:
             logging.debug("Barge-in watcher error: %s", e)
         time.sleep(0.1)  # 100ms poll
@@ -765,12 +769,14 @@ def speak(
     # can't be cleared by stop().
     if user_state == "recording":
         est_duration = _estimate_duration_sec(text, speed)
-        return json.dumps({
-            "status": "held",
-            "reason": "User is currently speaking — re-send this speak() call after user finishes.",
-            "user_state": "recording",
-            "estimated_duration_sec": round(est_duration, 1),
-        })
+        return json.dumps(
+            {
+                "status": "held",
+                "reason": "User is currently speaking — re-send this speak() call after user finishes.",
+                "user_state": "recording",
+                "estimated_duration_sec": round(est_duration, 1),
+            }
+        )
 
     try:
         job_id, position = _start_speech(text, voice, stream=stream, speed=speed, emotion=emotion)

@@ -65,9 +65,7 @@ class BrowserChannel:
         if not self._active:
             return
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._deliver_async(output), self._loop
-            )
+            future = asyncio.run_coroutine_threadsafe(self._deliver_async(output), self._loop)
             future.result(timeout=10.0)
         except (WebSocketDisconnect, RuntimeError, TimeoutError):
             logger.debug("deliver failed (client disconnected?), deactivating channel")
@@ -89,13 +87,15 @@ class BrowserChannel:
             # Send audio as base64 JSON (avoids binary frame issues)
             audio_b64 = base64.b64encode(output.data).decode("ascii")
             logger.info("deliver: sending base64 audio JSON (%d chars)", len(audio_b64))
-            await self.ws.send_json({
-                "type": "audio",
-                "data": audio_b64,
-                "format": output.format or "wav",
-                "duration_sec": round(output.duration_sec, 2),
-                "sample_rate": output.metadata.get("sample_rate", 24000),
-            })
+            await self.ws.send_json(
+                {
+                    "type": "audio",
+                    "data": audio_b64,
+                    "format": output.format or "wav",
+                    "duration_sec": round(output.duration_sec, 2),
+                    "sample_rate": output.metadata.get("sample_rate", 24000),
+                }
+            )
             logger.info("deliver: audio sent OK")
         elif output.modality == ModalityType.TEXT:
             text = output.data.decode("utf-8") if isinstance(output.data, bytes) else str(output.data)
@@ -185,7 +185,7 @@ class BrowserChannel:
             # Skip silence
             if len(audio) < 16000 * 0.3:
                 return None
-            rms = float(np.sqrt(np.mean(audio ** 2)))
+            rms = float(np.sqrt(np.mean(audio**2)))
             if rms < 0.005:
                 return None
 
@@ -234,12 +234,14 @@ class BrowserChannel:
 
         if event and event.content:
             # Send transcript to browser
-            await self.ws.send_json({
-                "type": "transcript",
-                "text": event.content,
-                "stt_ms": round(stt_ms, 1),
-                "source": "voice",
-            })
+            await self.ws.send_json(
+                {
+                    "type": "transcript",
+                    "text": event.content,
+                    "stt_ms": round(stt_ms, 1),
+                    "source": "voice",
+                }
+            )
             # Forward to agent loop
             event.metadata["stt_ms"] = stt_ms
             if self._on_event:
@@ -253,11 +255,13 @@ class BrowserChannel:
             source_channel=self.channel_id,
             confidence=1.0,
         )
-        await self.ws.send_json({
-            "type": "transcript",
-            "text": text,
-            "source": "text",
-        })
+        await self.ws.send_json(
+            {
+                "type": "transcript",
+                "text": text,
+                "source": "text",
+            }
+        )
         if self._on_event:
             await self._on_event(event)
 
@@ -284,10 +288,12 @@ class BrowserChannel:
         """Signal response is complete."""
         if self._active:
             try:
-                await self.ws.send_json({
-                    "type": "response_complete",
-                    "metrics": metrics or {},
-                })
+                await self.ws.send_json(
+                    {
+                        "type": "response_complete",
+                        "metrics": metrics or {},
+                    }
+                )
             except Exception:
                 self._active = False
 

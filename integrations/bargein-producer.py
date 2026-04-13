@@ -41,9 +41,7 @@ SIGNAL_FILE = os.environ.get("BARGEIN_SIGNAL", "/tmp/mod3-barge-in.json")
 POLL_INTERVAL = int(os.environ.get("BARGEIN_POLL_MS", "150")) / 1000.0
 
 # SuperWhisper recordings directory
-_default_rec_dir = os.path.expanduser(
-    "~/Documents/superwhisper/recordings"
-)
+_default_rec_dir = os.path.expanduser("~/Documents/superwhisper/recordings")
 RECORDINGS_DIR = os.environ.get("SW_RECORDINGS_DIR", _default_rec_dir)
 
 # ---------------------------------------------------------------------------

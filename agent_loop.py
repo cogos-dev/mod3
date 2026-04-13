@@ -84,8 +84,8 @@ def _fetch_kernel_context() -> str:
                     delivered = interrupted.get("delivered_text", "")
                     pct = interrupted.get("spoken_pct", 0)
                     parts.append(
-                        f"[barge-in] Claude's speech was interrupted at {pct*100:.0f}%. "
-                        f"Delivered: \"{delivered}\". "
+                        f"[barge-in] Claude's speech was interrupted at {pct * 100:.0f}%. "
+                        f'Delivered: "{delivered}". '
                         f"The user interrupted to say something — acknowledge and respond to them."
                     )
         except Exception:
@@ -121,6 +121,7 @@ def _log_exchange_to_bus(user_text: str, assistant_text: str, provider_name: str
         )
     except Exception as e:
         logger.debug("Failed to log exchange to bus: %s", e)
+
 
 MAX_HISTORY = 50
 
@@ -202,7 +203,9 @@ class AgentLoop:
                         content=text,
                         target_channel=self.channel_id,
                         metadata={
-                            "voice": self._channel_ref.config.get("voice", "bm_lewis") if self._channel_ref else "bm_lewis",
+                            "voice": self._channel_ref.config.get("voice", "bm_lewis")
+                            if self._channel_ref
+                            else "bm_lewis",
                             "speed": self._channel_ref.config.get("speed", 1.25) if self._channel_ref else 1.25,
                         },
                     )
@@ -237,10 +240,12 @@ class AgentLoop:
         # Update conversation history
         if assistant_parts:
             assistant_text = " ".join(assistant_parts)
-            self.conversation.append({
-                "role": "assistant",
-                "content": assistant_text,
-            })
+            self.conversation.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_text,
+                }
+            )
 
             # Log exchange to CogOS bus (observation channel — Claude can see this)
             _log_exchange_to_bus(event.content, assistant_text, self.provider.name)
