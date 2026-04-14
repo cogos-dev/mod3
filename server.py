@@ -20,6 +20,7 @@ Tools (MCP):
 
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -357,6 +358,53 @@ mcp.run_stdio_async = _patched_run_stdio
 # ---------------------------------------------------------------------------
 
 pipeline_state = PipelineState()
+
+
+# ---------------------------------------------------------------------------
+# Barge-in file watcher — monitors /tmp/mod3-barge-in.json for pause signals
+# ---------------------------------------------------------------------------
+
+_BARGEIN_SIGNAL = "/tmp/mod3-barge-in.json"
+_bargein_last_mtime: float = 0.0
+
+
+def _bargein_watcher():
+    """Background thread that watches for barge-in signal file changes."""
+    global _bargein_last_mtime
+    import json as _json
+
+    while True:
+        try:
+            import os
+
+            if os.path.exists(_BARGEIN_SIGNAL):
+                mtime = os.path.getmtime(_BARGEIN_SIGNAL)
+                if mtime > _bargein_last_mtime:
+                    _bargein_last_mtime = mtime
+                    with open(_BARGEIN_SIGNAL) as f:
+                        signal = _json.load(f)
+                    if signal.get("event") == "user_speaking_start":
+                        if pipeline_state.is_speaking:
+                            info = pipeline_state.interrupt(reason="barge_in")
+                            if info:
+                                # Write interrupt context back to signal file
+                                signal["interrupted"] = {
+                                    "spoken_pct": info.spoken_pct,
+                                    "delivered_text": info.delivered_text,
+                                    "full_text": info.full_text,
+                                }
+                                with open(_BARGEIN_SIGNAL, "w") as f:
+                                    _json.dump(signal, f, indent=2)
+                            logging.info(
+                                "Barge-in: paused playback (%.0f%% delivered)", info.spoken_pct * 100 if info else 0
+                            )
+        except Exception as e:
+            logging.debug("Barge-in watcher error: %s", e)
+        time.sleep(0.1)  # 100ms poll
+
+
+_bargein_thread = threading.Thread(target=_bargein_watcher, daemon=True)
+_bargein_thread.start()
 
 
 async def _emit_interruption(info: InterruptInfo):
@@ -702,6 +750,34 @@ def speak(
     if not text.strip():
         return json.dumps({"status": "error", "error": "Nothing to say"})
 
+    # Check if user is currently speaking (barge-in signal file)
+    user_state = "idle"
+    try:
+        if os.path.exists(_BARGEIN_SIGNAL):
+            with open(_BARGEIN_SIGNAL) as _bf:
+                _bsig = json.load(_bf)
+            if _bsig.get("event") == "user_speaking_start":
+                user_state = "recording"
+    except Exception:
+        pass  # signal file missing or corrupt — assume idle
+
+    # If user is currently recording, don't play — just inform the agent.
+    # The agent is responsible for re-calling speak() after the user finishes.
+    # We intentionally do NOT enqueue the job or create a _jobs entry, because
+    # a "held" job in the queue becomes a zombie: the drain thread tries to play
+    # it immediately (ignoring the hold), and if anything goes wrong the job
+    # can't be cleared by stop().
+    if user_state == "recording":
+        est_duration = _estimate_duration_sec(text, speed)
+        return json.dumps(
+            {
+                "status": "held",
+                "reason": "User is currently speaking — re-send this speak() call after user finishes.",
+                "user_state": "recording",
+                "estimated_duration_sec": round(est_duration, 1),
+            }
+        )
+
     try:
         job_id, position = _start_speech(text, voice, stream=stream, speed=speed, emotion=emotion)
     except ValueError as e:
@@ -714,7 +790,8 @@ def speak(
 
     if currently_playing is None or currently_playing["job_id"] == job_id:
         # Playing immediately (no queue ahead)
-        return json.dumps({"status": "speaking", "job_id": job_id})
+        result = {"status": "speaking", "job_id": job_id}
+        return json.dumps(result)
 
     # Something is already playing — return enriched queue status
     queue_snapshot = _speech_queue.get_queue_snapshot()
@@ -756,6 +833,8 @@ def speak(
             "To cancel all and speak immediately, call stop() then speak()."
         ),
     }
+    if user_state != "idle":
+        result["user_state"] = user_state
     return json.dumps(result)
 
 
@@ -797,7 +876,7 @@ def speech_status(job_id: str = "", verbose: bool = False) -> str:
             if entry["job_id"] == job_id:
                 result["queue_position"] = i + 1
                 break
-    if job["metrics"]:
+    if job.get("metrics"):
         metrics = job["metrics"]
         if not verbose and "chunks" in metrics:
             chunks = metrics["chunks"]["per_chunk"]
@@ -811,7 +890,7 @@ def speech_status(job_id: str = "", verbose: bool = False) -> str:
                 },
             }
         result["metrics"] = metrics
-    if job["error"]:
+    if job.get("error"):
         result["error"] = job["error"]
 
     # Always include queue state
@@ -882,9 +961,9 @@ def stop(job_id: str = "") -> str:
 
     # No job_id: stop everything — interrupt current + clear queue
     cleared = _speech_queue.cancel_all_queued()
-    # Mark all cleared queued jobs
+    # Mark all cleared queued and held jobs as cancelled
     for jid, jdata in _jobs.items():
-        if jdata["status"] == "queued":
+        if jdata["status"] in ("queued", "held"):
             jdata["status"] = "cancelled"
 
     with _current_player_lock:
@@ -1097,6 +1176,7 @@ if __name__ == "__main__":
     parser.add_argument("--http", action="store_true", help="Run HTTP API only")
     parser.add_argument("--all", action="store_true", help="Run both MCP (stdio) and HTTP")
     parser.add_argument("--channel", action="store_true", help="Run as channel server with voice input")
+    parser.add_argument("--dashboard", action="store_true", help="Run HTTP API with voice/text dashboard (no MCP)")
     parser.add_argument("--port", type=int, default=7860, help="HTTP port (default: 7860)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="HTTP bind address")
     args = parser.parse_args()
@@ -1112,6 +1192,18 @@ if __name__ == "__main__":
         )
         http_thread.start()
         mcp.run()
+    elif args.dashboard:
+        # Dashboard mode: HTTP server with WebSocket voice/text chat
+        # Swap PlaceholderDecoder → WhisperDecoder for real STT
+        from modules.text import TextModule
+        from modules.voice import VoiceModule, WhisperDecoder
+
+        _bus._modules.clear()
+        _bus.register(VoiceModule(decoder=WhisperDecoder()))
+        _bus.register(TextModule())
+        logging.basicConfig(level=logging.INFO)
+        logger.info("Starting dashboard mode (WhisperDecoder enabled)")
+        _run_http(host=args.host, port=args.port)
     elif args.channel:
         # Channel mode: MCP on stdio + inbound voice pipeline
         from bus import ModalityBus

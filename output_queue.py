@@ -102,6 +102,16 @@ class OutputQueueManager:
         """Submit a job to a channel's queue. Non-blocking."""
         return self.get_queue(channel_id).submit(fn, **metadata)
 
+    def cancel_channel(self, channel_id: str) -> int:
+        """Cancel all pending jobs for a channel. Returns number of jobs cancelled."""
+        queue = self._queues.get(channel_id)
+        if not queue:
+            return 0
+        with queue._lock:
+            cancelled = len(queue._queue)
+            queue._queue.clear()
+        return cancelled
+
     def status(self) -> dict[str, Any]:
         """Snapshot of all channel queues."""
         return {

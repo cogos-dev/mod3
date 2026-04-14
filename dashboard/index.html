@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mod³ Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --orange: #d29922; --red: #f85149;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; height: 100vh; display: flex; flex-direction: column; }
+
+  /* Header bar */
+  .header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 12px 24px; border-bottom: 1px solid var(--border);
+    background: var(--surface); flex-shrink: 0;
+  }
+  .header h1 { font-size: 1.2rem; margin-right: auto; }
+  .status-pill {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 0.75rem; color: var(--muted);
+    padding: 4px 10px; border-radius: 12px;
+    background: var(--bg); border: 1px solid var(--border);
+  }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted); flex-shrink: 0;
+  }
+  .status-dot.ok { background: var(--green); }
+  .status-dot.warn { background: var(--orange); }
+  .status-dot.err { background: var(--red); }
+
+  /* Main layout */
+  .main { flex: 1; display: flex; flex-direction: column; max-width: 900px; width: 100%; margin: 0 auto; padding: 16px 24px; overflow: hidden; }
+
+  /* Voice controls bar */
+  .voice-controls {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 0; flex-shrink: 0;
+  }
+  .voice-controls .form-group { display: flex; flex-direction: column; gap: 2px; }
+  .voice-controls .form-group label { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .voice-controls select {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    padding: 6px 8px; color: var(--text); font-size: 0.85rem; font-family: inherit;
+  }
+  .voice-controls select:focus { outline: none; border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #000; border: none; border-radius: 6px; padding: 8px 20px; font-weight: 600; cursor: pointer; font-size: 0.9rem; }
+  button.primary:hover { opacity: 0.9; }
+  button.primary:disabled { opacity: 0.4; cursor: not-allowed; }
+  #voice-connect-btn.active { background: var(--red); color: var(--text); border-color: var(--red) !important; }
+  #voice-status { font-size: 0.85rem; color: var(--muted); }
+
+  /* Mic level bar */
+  .level-bar { height: 3px; background: var(--surface); border-radius: 2px; overflow: hidden; flex-shrink: 0; }
+  .level-bar-inner { height: 100%; width: 0%; background: var(--green); transition: width 50ms; border-radius: 2px; }
+
+  /* Chat area — scrollable, takes remaining space */
+  .chat-area {
+    flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;
+    padding: 12px 0; min-height: 0;
+  }
+
+  /* Message bubbles */
+  .msg { max-width: 80%; padding: 10px 14px; border-radius: 12px; font-size: 0.9rem; line-height: 1.5; word-wrap: break-word; }
+  .msg-user { align-self: flex-end; background: #1c3a5f; border: 1px solid #264d7a; border-bottom-right-radius: 4px; }
+  .msg-assistant { align-self: flex-start; background: var(--surface); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+  .msg-role { font-size: 0.7rem; color: var(--muted); margin-bottom: 2px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .msg-user .msg-role { color: var(--accent); }
+  .msg-assistant .msg-role { color: var(--green); }
+  .msg-source { font-size: 0.65rem; color: var(--muted); margin-top: 4px; font-style: italic; }
+
+  /* Voice transcript section */
+  .voice-transcript-label {
+    font-size: 0.75rem; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.5px; padding: 8px 0 4px; flex-shrink: 0;
+  }
+
+  /* Metrics bar */
+  .metrics-bar { font-size: 0.7rem; color: var(--muted); font-variant-numeric: tabular-nums; flex-shrink: 0; padding: 4px 0; }
+
+  /* Text input area */
+  .chat-input-area {
+    display: flex; gap: 8px; padding: 12px 0 8px;
+    border-top: 1px solid var(--border); flex-shrink: 0;
+  }
+  .chat-input {
+    flex: 1; background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 14px; color: var(--text); font-size: 0.9rem; font-family: inherit;
+    resize: none; outline: none; min-height: 40px; max-height: 120px;
+  }
+  .chat-input:focus { border-color: var(--accent); }
+  .chat-input::placeholder { color: var(--muted); }
+  .send-btn {
+    background: var(--accent); color: #000; border: none; border-radius: 8px;
+    padding: 0 20px; font-weight: 600; cursor: pointer; font-size: 0.9rem;
+    align-self: flex-end; height: 40px;
+  }
+  .send-btn:hover { opacity: 0.9; }
+  .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Headphone hint */
+  .hint { font-size: 0.7rem; color: var(--muted); padding: 4px 0; flex-shrink: 0; }
+
+  /* Responsive */
+  @media (max-width: 700px) {
+    .main { padding: 12px 16px; }
+    .voice-controls { flex-wrap: wrap; }
+    .msg { max-width: 90%; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Header with connection status -->
+<div class="header">
+  <h1>Mod&#179;</h1>
+  <div class="status-pill">
+    <span class="status-dot" id="status-server"></span>
+    <span>Server</span>
+  </div>
+  <div class="status-pill">
+    <span class="status-dot" id="status-mic"></span>
+    <span>Mic</span>
+  </div>
+</div>
+
+<!-- Main content -->
+<div class="main">
+
+  <!-- Controls — compact bar -->
+  <div class="voice-controls">
+    <span id="voice-status" style="font-size:0.8rem;">Connecting...</span>
+    <div style="flex:1;"></div>
+    <button style="background:none; border:1px solid var(--border); border-radius:4px; padding:4px 10px; color:var(--muted); cursor:pointer; font-size:0.75rem;" id="voice-connect-btn" title="Enable microphone for voice input">&#127908; Mic</button>
+    <div class="level-bar" id="level-bar-wrap" style="flex:0 0 80px; margin:0 8px; display:none;">
+      <div class="level-bar-inner" id="voice-level"></div>
+    </div>
+    <span style="font-size:0.6rem; color:var(--muted);" id="mic-debug"></span>
+    <button style="background:none; border:1px solid var(--border); border-radius:4px; padding:4px 10px; color:var(--muted); cursor:pointer; font-size:0.85rem;" id="settings-toggle" title="Settings">&#9881;</button>
+  </div>
+
+  <!-- Settings panel (collapsed by default) -->
+  <div id="settings-panel" style="display:none; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:12px 16px; margin-bottom:8px;">
+    <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:end;">
+      <div class="form-group">
+        <label>TTS Model</label>
+        <select id="voice-model">
+          <option value="kokoro" selected>Kokoro 82M (fast)</option>
+          <option value="voxtral">Voxtral 4B (quality)</option>
+          <option value="chatterbox">Chatterbox (clone)</option>
+          <option value="spark">Spark 0.5B</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Voice</label>
+        <select id="voice-voice">
+          <option value="">Default</option>
+          <optgroup label="Kokoro">
+            <option value="bm_lewis" selected>bm_lewis</option>
+            <option value="af_heart">af_heart</option>
+            <option value="af_bella">af_bella</option>
+            <option value="af_nicole">af_nicole</option>
+            <option value="af_sarah">af_sarah</option>
+            <option value="af_sky">af_sky</option>
+            <option value="am_adam">am_adam</option>
+            <option value="am_michael">am_michael</option>
+            <option value="bf_emma">bf_emma</option>
+            <option value="bf_isabella">bf_isabella</option>
+            <option value="bm_george">bm_george</option>
+          </optgroup>
+          <optgroup label="Voxtral">
+            <option value="casual_female">casual_female</option>
+            <option value="casual_male">casual_male</option>
+            <option value="neutral_female">neutral_female</option>
+            <option value="neutral_male">neutral_male</option>
+          </optgroup>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Output Device</label>
+        <select id="audio-output">
+          <option value="">Default</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Input Device</label>
+        <select id="audio-input">
+          <option value="">Default</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>VAD Sensitivity</label>
+        <select id="vad-mode">
+          <option value="0.3">Very Sensitive</option>
+          <option value="0.5" selected>Normal</option>
+          <option value="0.7">Low (noisy room)</option>
+          <option value="0.85">Very Low</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Speed</label>
+        <select id="tts-speed">
+          <option value="1.0">1.0x</option>
+          <option value="1.25" selected>1.25x</option>
+          <option value="1.5">1.5x</option>
+          <option value="2.0">2.0x</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <!-- Unified chat / transcript area -->
+  <div class="chat-area" id="chat-area"></div>
+
+  <!-- Metrics -->
+  <div class="metrics-bar" id="voice-metrics"></div>
+
+  <!-- Text input -->
+  <div class="chat-input-area">
+    <textarea class="chat-input" id="chat-input" placeholder="Type a message..." rows="1"></textarea>
+    <button class="send-btn" id="send-btn">Send</button>
+  </div>
+
+  <div class="hint">For voice, use headphones. Speak naturally — the system detects when you start and stop. Speak during playback to interrupt.</div>
+</div>
+
+<script>
+// --- Settings panel toggle ---
+document.getElementById('settings-toggle').addEventListener('click', () => {
+  const panel = document.getElementById('settings-panel');
+  panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+});
+
+// --- Connection status indicators ---
+const statusDots = {
+  server: document.getElementById('status-server'),
+  mic: document.getElementById('status-mic'),
+};
+
+function setStatusDot(name, state) {
+  const dot = statusDots[name];
+  if (!dot) return;
+  dot.className = 'status-dot';
+  if (state === 'ok') dot.classList.add('ok');
+  else if (state === 'warn') dot.classList.add('warn');
+  else if (state === 'err') dot.classList.add('err');
+}
+
+// Check backend connectivity
+async function checkServices() {
+  try {
+    const r = await fetch('/health');
+    const data = await r.json();
+    setStatusDot('server', data.status === 'ok' ? 'ok' : 'err');
+  } catch {
+    setStatusDot('server', 'err');
+  }
+}
+checkServices();
+setInterval(checkServices, 30000);
+
+// --- Audio output device selector ---
+const audioOutputSelect = document.getElementById('audio-output');
+// _playback declared below with _ws and _transport
+
+async function populateOutputDevices() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const outputs = devices.filter(d => d.kind === 'audiooutput');
+    if (outputs.length === 0) return;
+    audioOutputSelect.innerHTML = '';
+    let selectedIdx = 0;
+    outputs.forEach((d, i) => {
+      const opt = document.createElement('option');
+      opt.value = d.deviceId;
+      opt.textContent = d.label || `Speaker ${i + 1}`;
+      audioOutputSelect.appendChild(opt);
+      const label = (d.label || '').toLowerCase();
+      // Prefer device starting with "Default -"
+      if (label.startsWith('default -') || label.startsWith('default —')) {
+        selectedIdx = i;
+      }
+    });
+    audioOutputSelect.selectedIndex = selectedIdx;
+  } catch (err) {
+    console.warn('Could not enumerate output devices:', err);
+  }
+}
+populateOutputDevices();
+
+const audioInputSelect = document.getElementById('audio-input');
+async function populateInputDevices() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const inputs = devices.filter(d => d.kind === 'audioinput');
+    if (inputs.length === 0) return;
+    audioInputSelect.innerHTML = '';
+    let selectedIdx = 0;
+    inputs.forEach((d, i) => {
+      const opt = document.createElement('option');
+      opt.value = d.deviceId;
+      opt.textContent = d.label || `Mic ${i + 1}`;
+      audioInputSelect.appendChild(opt);
+      const label = (d.label || '').toLowerCase();
+      // Prefer device starting with "Default -"
+      if (label.startsWith('default -') || label.startsWith('default —')) {
+        selectedIdx = i;
+      }
+    });
+    audioInputSelect.selectedIndex = selectedIdx;
+  } catch (err) {
+    console.warn('Could not enumerate input devices:', err);
+  }
+}
+populateInputDevices();
+
+// Request mic permission early to get labeled device names
+// This fires once on page load — if already granted, it's instant
+(async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach(t => t.stop()); // release immediately
+    await populateOutputDevices();
+    await populateInputDevices();
+    setStatusDot('mic', 'warn'); // mic available but not active
+  } catch {
+    // Permission denied or no mic — lists stay unlabeled
+  }
+})();
+
+// Re-populate on device changes
+navigator.mediaDevices.addEventListener('devicechange', () => {
+  populateOutputDevices();
+  populateInputDevices();
+});
+
+audioOutputSelect.addEventListener('change', async () => {
+  if (_playback) {
+    await _playback.setOutputDevice(audioOutputSelect.value);
+    console.log('[Output] Switched to:', audioOutputSelect.options[audioOutputSelect.selectedIndex].text);
+  }
+});
+
+// --- WebSocket transport reference (shared between voice and text) ---
+var _ws = null;
+var _transport = null;
+var _playback = null;
+
+function getWs() { return _ws; }
+
+// Auto-connect WebSocket — called after all scripts load (see bottom of page)
+
+// --- Text chat ---
+const chatArea = document.getElementById('chat-area');
+const chatInput = document.getElementById('chat-input');
+const sendBtn = document.getElementById('send-btn');
+
+function escapeHtml(text) {
+  const d = document.createElement('div');
+  d.textContent = text;
+  return d.innerHTML;
+}
+
+function appendMessage(role, text, source) {
+  const div = document.createElement('div');
+  div.className = `msg msg-${role}`;
+  let html = `<div class="msg-role">${role === 'user' ? 'You' : 'AI'}</div>`;
+  html += `<div class="msg-text">${escapeHtml(text)}</div>`;
+  if (source) html += `<div class="msg-source">${escapeHtml(source)}</div>`;
+  div.innerHTML = html;
+  chatArea.appendChild(div);
+  chatArea.scrollTop = chatArea.scrollHeight;
+  return div;
+}
+
+let _currentAssistantMsg = null;
+
+function appendAssistantStart(source) {
+  const div = document.createElement('div');
+  div.className = 'msg msg-assistant';
+  div.innerHTML = `<div class="msg-role">AI</div><div class="msg-text"></div>`;
+  if (source) {
+    const srcEl = document.createElement('div');
+    srcEl.className = 'msg-source';
+    srcEl.textContent = source;
+    div.appendChild(srcEl);
+  }
+  chatArea.appendChild(div);
+  chatArea.scrollTop = chatArea.scrollHeight;
+  _currentAssistantMsg = div.querySelector('.msg-text');
+  return div;
+}
+
+function appendAssistantChunk(text) {
+  // Lazy-create the assistant bubble on first chunk
+  if (!_currentAssistantMsg) {
+    appendAssistantStart();
+  }
+  _currentAssistantMsg.innerHTML += escapeHtml(text);
+  chatArea.scrollTop = chatArea.scrollHeight;
+}
+
+function finalizeAssistant(suffix) {
+  if (_currentAssistantMsg && suffix) {
+    _currentAssistantMsg.innerHTML += ` <em style="color:var(--muted)">${escapeHtml(suffix)}</em>`;
+  }
+  _currentAssistantMsg = null;
+}
+
+async function sendTextMessage(text) {
+  if (_transport && _transport.connected) {
+    _transport.sendControl({ type: "text_message", text: text });
+    appendMessage('user', text, 'text');
+  } else {
+    appendMessage('user', text, 'text');
+    appendMessage('assistant', 'Not connected to server. Reconnecting...', 'system');
+  }
+}
+
+sendBtn.addEventListener('click', () => {
+  const text = chatInput.value.trim();
+  if (!text) return;
+  sendTextMessage(text);
+  chatInput.value = '';
+  chatInput.style.height = 'auto';
+});
+
+chatInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendBtn.click();
+  }
+});
+
+// Auto-resize textarea
+chatInput.addEventListener('input', () => {
+  chatInput.style.height = 'auto';
+  chatInput.style.height = Math.min(chatInput.scrollHeight, 120) + 'px';
+});
+</script>
+
+<!-- Voice chat dependencies (self-hosted) -->
+<script src="/dashboard/vad/ort.js"></script>
+<script>
+  ort.env.wasm.wasmPaths = "/dashboard/vad/";
+  ort.env.wasm.numThreads = 1;
+</script>
+<script src="/dashboard/vad/bundle.min.js"></script>
+<script src="/dashboard/playback.js?v=2"></script>
+<script src="/dashboard/transport.js?v=2"></script>
+
+<script>
+// Auto-connect WebSocket on page load (text chat works without mic)
+(function autoConnectWs() {
+  const wsUrl = `ws://${window.location.host}/ws/chat`;
+  const pb = new AudioPlayback(24000);
+  _playback = pb;
+
+  const outSel = document.getElementById('audio-output');
+  if (outSel && outSel.value) pb.setOutputDevice(outSel.value);
+  pb.onPlaybackEnd = () => {
+    const el = document.getElementById('voice-status');
+    if (el && el.textContent.includes('Speaking')) {
+      el.textContent = 'Ready';
+      el.style.color = 'var(--green)';
+    }
+  };
+
+  const t = new VoiceTransport(wsUrl, {
+    onAudio: (data) => {
+      pb.enqueueWav(data);
+      const el = document.getElementById('voice-status');
+      if (el) { el.textContent = 'Speaking...'; el.style.color = 'var(--accent)'; }
+    },
+    onTranscript: (msg) => {
+      if (msg.source !== 'text') appendMessage('user', msg.text, 'voice');
+      // Don't create assistant bubble here — appendAssistantChunk lazy-creates it
+      const el = document.getElementById('voice-status');
+      if (el) { el.textContent = 'Thinking...'; el.style.color = 'var(--orange)'; }
+    },
+    onResponseText: (msg) => appendAssistantChunk(msg.text),
+    onResponseComplete: (msg) => {
+      finalizeAssistant();
+      if (msg.metrics) {
+        const mel = document.getElementById('voice-metrics');
+        if (mel) {
+          const parts = [];
+          if (msg.metrics.llm_ms != null) parts.push(`LLM: ${Math.round(msg.metrics.llm_ms)}ms`);
+          if (msg.metrics.provider) parts.push(msg.metrics.provider);
+          mel.textContent = parts.join(' \u00b7 ');
+        }
+      }
+    },
+    onInterrupted: () => {
+      pb.flush();
+      finalizeAssistant('[interrupted]');
+    },
+    onMetrics: (msg) => {
+      if (msg.sample_rate && msg.sample_rate !== pb.sampleRate) pb.setSampleRate(msg.sample_rate);
+    },
+    onError: (msg) => console.error('[WS] Error:', msg),
+    onOpen: () => {
+      _ws = t.ws;
+      _transport = t;
+      setStatusDot('server', 'ok');
+      const sEl = document.getElementById('voice-status');
+      if (sEl) { sEl.textContent = 'Ready'; sEl.style.color = 'var(--green)'; }
+      console.log('[WS] Auto-connected');
+      const ms = document.getElementById('voice-model');
+      const vs = document.getElementById('voice-voice');
+      t.setConfig({ model: ms ? ms.value : 'kokoro', voice: vs ? vs.value : 'bm_lewis' });
+    },
+    onClose: () => {
+      _ws = null;
+      _transport = null;
+      setStatusDot('server', 'warn');
+      const sEl = document.getElementById('voice-status');
+      if (sEl) { sEl.textContent = 'Reconnecting...'; sEl.style.color = 'var(--orange)'; }
+      console.log('[WS] Disconnected, reconnecting in 3s...');
+      setTimeout(autoConnectWs, 3000);
+    },
+  });
+  t.connect();
+})();
+</script>
+
+<script>
+/**
+ * Voice chat integration — uses the global chat area for messages,
+ * keeps AudioCapture + VoiceTransport + AudioPlayback modules intact.
+ */
+(function() {
+  let capture = null;
+  let micActive = false;
+
+  const connectBtn = document.getElementById('voice-connect-btn');
+  const statusEl = document.getElementById('voice-status');
+  const levelBar = document.getElementById('voice-level');
+  const metricsEl = document.getElementById('voice-metrics');
+  const modelSelect = document.getElementById('voice-model');
+  const voiceSelect = document.getElementById('voice-voice');
+
+  connectBtn.addEventListener('click', toggleMic);
+
+  if (modelSelect) {
+    modelSelect.addEventListener('change', () => {
+      if (_transport && _transport.connected) _transport.setConfig({ model: modelSelect.value });
+    });
+  }
+  if (voiceSelect) {
+    voiceSelect.addEventListener('change', () => {
+      if (_transport && _transport.connected) _transport.setConfig({ voice: voiceSelect.value });
+    });
+  }
+
+  function toggleMic() {
+    if (micActive) stopMic();
+    else startMic();
+  }
+
+  const statusColors = {
+    disconnected: 'var(--muted)', connecting: 'var(--orange)',
+    listening: 'var(--green)', recording: 'var(--red)',
+    processing: 'var(--orange)', speaking: 'var(--accent)', error: 'var(--red)',
+  };
+
+  function setStatus(state, text) {
+    if (statusEl) {
+      statusEl.textContent = text;
+      statusEl.style.color = statusColors[state] || 'var(--muted)';
+    }
+    // Update mic status dot
+    if (state === 'listening' || state === 'recording' || state === 'speaking') {
+      setStatusDot('mic', 'ok');
+    } else if (state === 'error') {
+      setStatusDot('mic', 'err');
+    } else if (state === 'disconnected') {
+      setStatusDot('mic', '');
+    } else {
+      setStatusDot('mic', 'warn');
+    }
+  }
+
+  async function startMic() {
+    if (!_transport || !_transport.connected) {
+      setStatus('error', 'Server not connected yet...');
+      return;
+    }
+
+    setStatus('connecting', 'Starting mic...');
+
+    // Re-populate device lists (needs mic permission)
+    populateOutputDevices();
+    populateInputDevices();
+
+    const micDebug = document.getElementById('mic-debug');
+    const vadSelect = document.getElementById('vad-mode');
+
+    try {
+      const vadThreshold = parseFloat(vadSelect ? vadSelect.value : '0.5');
+      const inputSelect = document.getElementById('audio-input');
+      const selectedDeviceId = inputSelect ? inputSelect.value : '';
+
+      capture = await vad.MicVAD.new({
+        baseAssetPath: "/dashboard/vad/",
+        onnxWASMBasePath: "/dashboard/vad/",
+        model: "v5",
+        getStream: async () => {
+          const constraints = {
+            audio: {
+              channelCount: 1,
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            }
+          };
+          if (selectedDeviceId) {
+            constraints.audio.deviceId = { exact: selectedDeviceId };
+          }
+          console.log('[MicVAD] Requesting mic:', selectedDeviceId || 'default');
+          return await navigator.mediaDevices.getUserMedia(constraints);
+        },
+        positiveSpeechThreshold: vadThreshold,
+        negativeSpeechThreshold: Math.max(0.1, vadThreshold - 0.2),
+        redemptionFrames: 20,
+        minSpeechFrames: 4,
+        preSpeechPadFrames: 8,
+        onSpeechStart: () => {
+          console.log('[Silero VAD] Speech START');
+          if (_playback && _playback.isPlaying) {
+            _playback.flush();
+            if (_transport) _transport.interrupt();
+          }
+          setStatus('recording', 'Recording...');
+        },
+        onSpeechEnd: (audio) => {
+          console.log(`[Silero VAD] Speech END — ${audio.length} samples`);
+          setStatus('processing', 'Processing...');
+          const int16 = new Int16Array(audio.length);
+          for (let i = 0; i < audio.length; i++) {
+            int16[i] = Math.max(-32768, Math.min(32767, audio[i] * 32768));
+          }
+          if (_transport) {
+            _transport.sendAudio(int16.buffer);
+            _transport.endSpeech();
+          }
+        },
+        onVADMisfire: () => {
+          if (micDebug) micDebug.textContent = 'VAD: misfire (too short)';
+        },
+        onFrameProcessed: (probs) => {
+          if (levelBar) levelBar.style.width = Math.min(100, probs.isSpeech * 100) + '%';
+          if (micDebug) micDebug.textContent = `silero: ${probs.isSpeech.toFixed(3)} thr=${vadThreshold}`;
+        },
+      });
+      capture.start();
+      micActive = true;
+      connectBtn.textContent = '\u{1F534} Mic On';
+      connectBtn.classList.add('active');
+      const lbw = document.getElementById('level-bar-wrap');
+      if (lbw) lbw.style.display = '';
+      setStatus('listening', 'Listening...');
+    } catch (err) {
+      console.error('[Silero VAD] Failed:', err);
+      setStatus('error', `VAD error: ${err.message}`);
+    }
+  }
+
+  function stopMic() {
+    if (capture) { try { capture.destroy ? capture.destroy() : capture.stop(); } catch {} capture = null; }
+    micActive = false;
+    connectBtn.textContent = '\u{1F3A4} Mic';
+    connectBtn.classList.remove('active');
+    const lbw = document.getElementById('level-bar-wrap');
+    if (lbw) lbw.style.display = 'none';
+    setStatus('listening', 'Ready');
+    if (levelBar) levelBar.style.width = '0%';
+  }
+
+  function showMetrics(data) {
+    if (!metricsEl) return;
+    const parts = [];
+    if (data.stt_ms != null) parts.push(`STT: ${data.stt_ms}ms`);
+    if (data.llm_ttft_ms != null) parts.push(`LLM TTFT: ${data.llm_ttft_ms}ms`);
+    if (data.tts_ttfa_ms != null) parts.push(`TTS TTFA: ${data.tts_ttfa_ms}ms`);
+    metricsEl.textContent = parts.join(' \u00b7 ');
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,5 +1,9 @@
 # Mod³ — Model Modality Modulator
 
+[![CI](https://github.com/cogos-dev/mod3/actions/workflows/ci.yml/badge.svg)](https://github.com/cogos-dev/mod3/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+
 Give your AI agent a voice.
 
 Mod³ is a Python MCP server that provides text-to-speech for Claude Code, Cursor, and other MCP-compatible AI tools. It runs four TTS engines locally on Apple Silicon, generates speech faster than realtime, and returns immediately so the agent keeps working while audio plays.

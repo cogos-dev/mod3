@@ -8,3 +8,9 @@ __pycache__/
 *.pem
 *.key
 credentials*
+
+# ONNX Runtime WASM binaries (large, download via setup.sh)
+dashboard/vad/*.wasm
+dashboard/vad/*.mjs
+dashboard/vad/ort.js
+dashboard/vad/ort.min.mjs

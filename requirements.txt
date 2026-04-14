@@ -11,3 +11,4 @@ espeakng-loader>=0.2.0
 setuptools
 fastapi>=0.115.0
 uvicorn>=0.30.0
+httpx>=0.24.0

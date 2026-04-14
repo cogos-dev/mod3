@@ -1,4 +1,4 @@
-"""Mod³ HTTP API — REST interface for TTS synthesis and VAD.
+"""Mod³ HTTP API — REST interface for TTS synthesis, VAD, and dashboard.
 
 Endpoints:
   POST /v1/synthesize  — text → audio bytes (WAV/PCM) + structured metrics
@@ -9,18 +9,29 @@ Endpoints:
   GET  /v1/jobs        — list recent generation jobs with full metrics
   GET  /v1/jobs/{id}   — get a specific job's metrics
   GET  /health         — server health check
+  POST /shutdown       — graceful server shutdown (kernel lifecycle)
+  GET  /capabilities   — machine-readable capability manifest
+  WS   /ws/chat        — dashboard voice/text chat
+  GET  /dashboard      — dashboard UI
 """
 
+import asyncio
 import io
+import logging
+import os
+import signal
 import struct
 import time
 import uuid
 import wave
 from collections import OrderedDict
+from pathlib import Path
 from threading import Lock
+from typing import Optional
 
-from fastapi import FastAPI, Response, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, Response, UploadFile, WebSocket
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from bus import ModalityBus
@@ -32,6 +43,29 @@ from vad import detect_speech_file, is_hallucination
 from vad import is_model_loaded as vad_loaded
 
 app = FastAPI(title="Mod³", description="Local multi-model TTS on Apple Silicon")
+
+logger = logging.getLogger("mod3.http")
+
+_server_start_time = time.time()
+_shutting_down = False
+
+
+@app.on_event("startup")
+async def _warmup_kokoro():
+    """Pre-load Kokoro TTS engine in background to avoid ~60s cold start on first request."""
+    import threading
+
+    def _do_warmup():
+        try:
+            from engine import get_model
+
+            get_model("kokoro")
+            logger.info("Kokoro TTS engine pre-warmed successfully")
+        except Exception as e:
+            logger.warning("Kokoro pre-warm failed (will lazy-load on first request): %s", e)
+
+    threading.Thread(target=_do_warmup, daemon=True, name="kokoro-warmup").start()
+
 
 try:
     from server import _bus as _shared_bus
@@ -168,6 +202,29 @@ class SpeechRequest(BaseModel):
     voice: str = Field(default="af_heart")
     response_format: str = Field(default="mp3")
     speed: float = Field(default=1.0)
+
+
+class ShutdownRequest(BaseModel):
+    """Graceful shutdown request from the kernel."""
+
+    timeout_sec: float = Field(default=5.0, ge=0, le=60)
+    reason: str = Field(default="shutdown-requested")
+
+
+# ---------------------------------------------------------------------------
+# Shutdown middleware — reject new requests once shutdown is initiated
+# ---------------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def _reject_during_shutdown(request: Request, call_next):
+    """Return 503 for new requests once graceful shutdown has been initiated."""
+    if _shutting_down and request.url.path != "/health":
+        return JSONResponse(
+            status_code=503,
+            content={"error": "server is shutting down"},
+        )
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -505,24 +562,190 @@ def voices():
     return {"engines": engines}
 
 
+@app.post("/v1/stop")
+def stop_speech(job_id: str = ""):
+    """Stop current speech and/or cancel queued items.
+
+    If job_id is provided, cancels that specific job.
+    If empty, interrupts current playback and clears the queue.
+    Returns interruption context for barge-in support.
+    """
+    try:
+        from server import _speech_queue, pipeline_state
+
+        if job_id:
+            cancelled = _speech_queue.cancel(job_id)
+            return {"status": "ok", "message": f"Cancelled {job_id}" if cancelled else f"Job {job_id} not found"}
+        else:
+            # Get interrupt info before stopping
+            interrupt_info = None
+            if pipeline_state.is_speaking:
+                info = pipeline_state.interrupt(reason="http_barge_in")
+                if info:
+                    interrupt_info = {
+                        "spoken_pct": info.spoken_pct,
+                        "delivered_text": info.delivered_text,
+                        "full_text": info.full_text,
+                        "reason": info.reason,
+                    }
+            cancelled_count = _speech_queue.cancel_all_queued()
+            return {
+                "status": "ok",
+                "message": f"Interrupted playback; cancelled {cancelled_count} queued items",
+                "interrupted": interrupt_info,
+            }
+    except ImportError:
+        return JSONResponse(status_code=503, content={"error": "Speech queue not available in HTTP-only mode"})
+
+
 @app.get("/health")
 def health():
-    """Health check with summary stats."""
-    with _jobs_lock:
-        total = len(_jobs)
-        active = sum(1 for j in _jobs.values() if j.get("status") in ("generating", "processing"))
-        by_type = {}
-        for j in _jobs.values():
-            t = j.get("type", "unknown")
-            by_type[t] = by_type.get(t, 0) + 1
+    """Health check — standardized CogOS service format."""
+    try:
+        loaded = get_loaded_engines()
+
+        # Engine status: loaded/unloaded for each registered engine
+        engines = {}
+        for engine_name in MODELS:
+            engines[engine_name] = "loaded" if engine_name in loaded else "unloaded"
+
+        # Modality availability
+        modalities = {
+            "tts": len(loaded) > 0,
+            "stt": False,  # STT not yet implemented as a server modality
+            "vad": vad_loaded(),
+        }
+
+        # Queue state from job ledger
+        with _jobs_lock:
+            total = len(_jobs)
+            active = sum(1 for j in _jobs.values() if j.get("status") in ("generating", "processing"))
+
+        # Overall status: ok if at least one TTS engine loaded, degraded if none
+        status = "ok" if loaded else "degraded"
+
+        return {
+            "status": status,
+            "service": "mod3",
+            "version": "0.3.0",
+            "uptime_sec": round(time.time() - _server_start_time, 1),
+            "engines": engines,
+            "modalities": modalities,
+            "queue": {
+                "depth": total,
+                "active_jobs": active,
+            },
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "service": "mod3",
+                "version": "0.3.0",
+                "error": str(e),
+            },
+        )
+
+
+@app.post("/shutdown")
+async def shutdown(req: Optional[ShutdownRequest] = None):
+    """Initiate graceful server shutdown.
+
+    Called by the CogOS kernel for lifecycle management. Returns immediately
+    with confirmation, then drains active jobs and exits.
+
+    Body (optional): {"timeout_sec": 5, "reason": "kernel-restart"}
+    """
+    global _shutting_down
+
+    if _shutting_down:
+        return JSONResponse(
+            status_code=409,
+            content={"status": "already_shutting_down"},
+        )
+
+    if req is None:
+        req = ShutdownRequest()
+
+    timeout_sec = req.timeout_sec
+    reason = req.reason
+
+    _shutting_down = True
+    logger.info("Shutdown requested: reason=%s timeout=%.1fs", reason, timeout_sec)
+
+    async def _graceful_exit():
+        """Wait for active jobs to drain, then signal the process to stop."""
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            with _jobs_lock:
+                active = sum(1 for j in _jobs.values() if j.get("status") in ("generating", "processing"))
+            if active == 0:
+                break
+            await asyncio.sleep(0.25)
+
+        with _jobs_lock:
+            remaining = sum(1 for j in _jobs.values() if j.get("status") in ("generating", "processing"))
+
+        if remaining:
+            logger.warning("Shutdown timeout reached with %d active jobs — forcing exit", remaining)
+        else:
+            logger.info("All jobs drained — exiting cleanly")
+
+        # Send SIGINT to our own process, which uvicorn handles gracefully
+        os.kill(os.getpid(), signal.SIGINT)
+
+    # Fire-and-forget: schedule the shutdown coroutine on the running loop
+    asyncio.ensure_future(_graceful_exit())
+
     return {
-        "status": "ok",
-        "engines_loaded": get_loaded_engines(),
-        "vad_loaded": vad_loaded(),
-        "jobs": {
-            "total": total,
-            "active": active,
-            "by_type": by_type,
+        "status": "shutting_down",
+        "reason": reason,
+        "timeout_sec": timeout_sec,
+    }
+
+
+@app.get("/capabilities")
+def capabilities():
+    """Machine-readable capability manifest for service discovery."""
+    voices = {name: cfg["voices"] for name, cfg in MODELS.items()}
+    return {
+        "service": "mod3",
+        "version": "0.3.0",
+        "description": "Model Modality Modulator — local TTS, STT, and VAD on Apple Silicon",
+        "modalities": ["voice"],
+        "capabilities": {
+            "tts": {
+                "engines": list(MODELS.keys()),
+                "default_voice": "bm_lewis",
+                "default_speed": 1.25,
+                "endpoint": "/v1/synthesize",
+            },
+            "stt": {
+                "engine": "mlx_whisper",
+                "model": "mlx-community/whisper-large-v3-turbo",
+                "languages": ["en"],
+                "endpoint": None,
+            },
+            "vad": {
+                "engine": "silero_v5",
+                "endpoint": "/v1/vad",
+            },
+        },
+        "voices": voices,
+        "endpoints": {
+            "synthesize": "POST /v1/synthesize",
+            "speech": "POST /v1/audio/speech",
+            "vad": "POST /v1/vad",
+            "voices": "GET /v1/voices",
+            "health": "GET /health",
+            "shutdown": "POST /shutdown",
+            "capabilities": "GET /capabilities",
+        },
+        "protocols": {
+            "mcp": True,
+            "http": True,
+            "websocket": True,
         },
     }
 
@@ -624,6 +847,91 @@ def bus_act(req: dict):
 def get_bus() -> ModalityBus:
     """Get the global bus instance (for server.py integration)."""
     return _bus
+
+
+# ---------------------------------------------------------------------------
+# Dashboard — voice/text chat via WebSocket
+# ---------------------------------------------------------------------------
+
+_logger = logging.getLogger("mod3.dashboard")
+
+_dashboard_dir = Path(__file__).parent / "dashboard"
+
+
+@app.get("/dashboard")
+async def dashboard_page():
+    """Serve the dashboard UI."""
+    index = _dashboard_dir / "index.html"
+    if index.exists():
+        return FileResponse(str(index))
+    return JSONResponse({"error": "dashboard not found"}, status_code=404)
+
+
+@app.websocket("/ws/chat")
+async def ws_chat(websocket: WebSocket):
+    """Dashboard voice/text chat — one session per connection."""
+    await websocket.accept()
+
+    loop = asyncio.get_running_loop()
+
+    from agent_loop import AgentLoop
+    from channels import BrowserChannel
+    from pipeline_state import PipelineState
+    from providers import auto_detect_provider
+
+    provider = auto_detect_provider()
+    ps = PipelineState()
+
+    agent = AgentLoop(
+        bus=_bus,
+        provider=provider,
+        pipeline_state=ps,
+    )
+
+    channel = BrowserChannel(
+        ws=websocket,
+        bus=_bus,
+        pipeline_state=ps,
+        loop=loop,
+        on_event=agent.handle_event,
+    )
+
+    agent.channel_id = channel.channel_id
+    agent._channel_ref = channel
+
+    _logger.info("Dashboard session started: %s (provider: %s)", channel.channel_id, provider.name)
+
+    try:
+        await channel.run()
+    finally:
+        _logger.info("Dashboard session ended: %s", channel.channel_id)
+
+
+# Mount dashboard static files (after explicit routes so they don't shadow /v1/*)
+if _dashboard_dir.exists():
+    # VAD assets need their own mount (ONNX workers request from this path)
+    _vad_dir = _dashboard_dir / "vad"
+    if _vad_dir.exists():
+        app.mount("/dashboard/vad", StaticFiles(directory=str(_vad_dir)), name="dashboard_vad")
+    app.mount("/dashboard", StaticFiles(directory=str(_dashboard_dir)), name="dashboard_static")
+
+
+# ONNX Runtime WASM workers request .wasm and .onnx files at the root path.
+# These catch-all routes serve them from dashboard/vad/.
+@app.get("/{filename:path}.wasm")
+async def serve_wasm(filename: str):
+    wasm_path = _dashboard_dir / "vad" / f"{filename}.wasm"
+    if wasm_path.exists():
+        return FileResponse(str(wasm_path), media_type="application/wasm")
+    return JSONResponse({"detail": "Not Found"}, status_code=404)
+
+
+@app.get("/{filename:path}.onnx")
+async def serve_onnx(filename: str):
+    onnx_path = _dashboard_dir / "vad" / f"{filename}.onnx"
+    if onnx_path.exists():
+        return FileResponse(str(onnx_path), media_type="application/octet-stream")
+    return JSONResponse({"detail": "Not Found"}, status_code=404)
 
 
 # ---------------------------------------------------------------------------

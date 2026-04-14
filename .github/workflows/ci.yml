@@ -57,9 +57,9 @@ jobs:
           r = client.get('/health')
           assert r.status_code == 200
           data = r.json()
-          assert data['status'] == 'ok'
-          assert 'engines_loaded' in data
-          assert 'vad_loaded' in data
+          assert data['status'] in ('ok', 'degraded')
+          assert 'engines' in data
+          assert 'modalities' in data
 
           # Voices endpoint
           r = client.get('/v1/voices')
