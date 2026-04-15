@@ -7,11 +7,12 @@ and routes tool calls through the bus.
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import httpx
 
@@ -83,7 +84,7 @@ def _fetch_kernel_context() -> str:
                 interrupted = signal.get("interrupted")
                 if interrupted:
                     delivered = interrupted.get("delivered_text", "")
-                    full = interrupted.get("full_text", "")
+                    _full = interrupted.get("full_text", "")
                     pct = interrupted.get("spoken_pct", 0)
                     parts.append(
                         f"[barge-in] Claude's speech was interrupted at {pct*100:.0f}%. "
@@ -412,7 +413,7 @@ class AgentLoop:
         Generates audio immediately and attaches it to the block.
         Ready for instant playback when the human stops speaking.
         """
-        from modules.voice import VoiceEncoder, _encode_wav
+        from modules.voice import _encode_wav
 
         try:
             voice = "bm_lewis"
@@ -462,7 +463,7 @@ class AgentLoop:
             return
 
         # Build context with latest human input
-        check_messages = list(self.conversation) + [
+        _check_messages = list(self.conversation) + [
             {"role": "user", "content": latest_user_text},
         ]
 

@@ -20,7 +20,6 @@ import io
 import json
 import logging
 import os
-import struct
 import sys
 import threading
 import time
@@ -410,7 +409,6 @@ def tool_vad_check(file_path: str, threshold: float = 0.5) -> str:
         return json.dumps({"status": "error", "error": str(e)})
 
     # The HTTP API expects multipart file upload, use urllib
-    import mimetypes
     boundary = "----Mod3ShimBoundary"
     body = (
         f"--{boundary}\r\n"
