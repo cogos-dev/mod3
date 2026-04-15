@@ -667,7 +667,7 @@ def _run_speech_job(entry: dict) -> None:
             # Check if barge-in cleared our speaking lock (cross-process interrupt)
             if not os.path.exists(_SPEAKING_LOCK):
                 logging.info("Speaking lock cleared by barge-in watcher — stopping generation")
-                player.stop()
+                player.flush()
                 break
             player.queue_audio(chunk.samples, chunk_meta=chunk.metadata if chunk.metadata else None)
             _set_bus_voice_state(
