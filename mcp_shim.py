@@ -51,8 +51,7 @@ _MAX_JOBS = 50
 _BARGEIN_SIGNAL = os.path.expanduser("~/.mod3_bargein_signal.json")
 
 
-def _http_request(method: str, path: str, body: dict | None = None,
-                  timeout: float = 30.0) -> tuple[int, dict | bytes]:
+def _http_request(method: str, path: str, body: dict | None = None, timeout: float = 30.0) -> tuple[int, dict | bytes]:
     """Make an HTTP request to the Mod3 service. Returns (status_code, parsed_json_or_bytes)."""
     url = f"{MOD3_BASE}{path}"
     headers = {"Content-Type": "application/json"} if body is not None else {}
@@ -161,8 +160,10 @@ def _estimate_duration(text: str, speed: float) -> float:
 # Tool implementations
 # ---------------------------------------------------------------------------
 
-def tool_speak(text: str, voice: str = "bm_lewis", stream: bool = True,
-               speed: float = 1.25, emotion: float = 0.5) -> str:
+
+def tool_speak(
+    text: str, voice: str = "bm_lewis", stream: bool = True, speed: float = 1.25, emotion: float = 0.5
+) -> str:
     """Synthesize via HTTP, play locally."""
     if not text.strip():
         return json.dumps({"status": "error", "error": "Nothing to say"})
@@ -173,20 +174,30 @@ def tool_speak(text: str, voice: str = "bm_lewis", stream: bool = True,
             with open(_BARGEIN_SIGNAL) as f:
                 sig = json.load(f)
             if sig.get("event") == "user_speaking_start":
-                return json.dumps({
-                    "status": "held",
-                    "reason": "User is currently speaking — re-send after user finishes.",
-                    "user_state": "recording",
-                    "estimated_duration_sec": round(_estimate_duration(text, speed), 1),
-                })
+                return json.dumps(
+                    {
+                        "status": "held",
+                        "reason": "User is currently speaking — re-send after user finishes.",
+                        "user_state": "recording",
+                        "estimated_duration_sec": round(_estimate_duration(text, speed), 1),
+                    }
+                )
     except Exception:
         pass
 
     # Request synthesis from HTTP service
-    status, resp = _http_request("POST", "/v1/synthesize", {
-        "text": text, "voice": voice, "speed": speed, "emotion": emotion,
-        "format": "wav",
-    }, timeout=60.0)
+    status, resp = _http_request(
+        "POST",
+        "/v1/synthesize",
+        {
+            "text": text,
+            "voice": voice,
+            "speed": speed,
+            "emotion": emotion,
+            "format": "wav",
+        },
+        timeout=60.0,
+    )
 
     if status == 0:
         return json.dumps({"status": "error", "error": resp.get("error", "Service unreachable")})
@@ -197,7 +208,7 @@ def tool_speak(text: str, voice: str = "bm_lewis", stream: bool = True,
         return json.dumps({"status": "error", "error": "Expected audio bytes from synthesize"})
 
     # Create job and play in background
-    job_id = f"shim-{int(time.time()*1000)}"
+    job_id = f"shim-{int(time.time() * 1000)}"
     with _jobs_lock:
         _jobs[job_id] = {
             "status": "generating",
@@ -230,6 +241,7 @@ def tool_stop(job_id: str = "") -> str:
             _playback_interrupt.set()
             try:
                 import sounddevice as sd
+
                 sd.stop()
             except Exception:
                 pass
@@ -242,6 +254,7 @@ def tool_stop(job_id: str = "") -> str:
     _playback_interrupt.set()
     try:
         import sounddevice as sd
+
         sd.stop()
     except Exception:
         pass
@@ -372,7 +385,8 @@ def tool_await_voice_input(timeout_sec: float = 180.0) -> str:
     try:
         folders = sorted(
             [d for d in os.listdir(_rec_dir) if d.isdigit()],
-            key=int, reverse=True,
+            key=int,
+            reverse=True,
         )
         if folders:
             meta_path = os.path.join(_rec_dir, folders[0], "meta.json")
@@ -382,14 +396,16 @@ def tool_await_voice_input(timeout_sec: float = 180.0) -> str:
                 raw = meta.get("rawResult", "").strip()
                 result = meta.get("result", raw).strip()
                 duration_ms = meta.get("duration", 0)
-                return json.dumps({
-                    "status": "ok",
-                    "transcript": result if result else raw,
-                    "raw_transcript": raw,
-                    "duration_sec": round(duration_ms / 1000, 1),
-                    "folder": folders[0],
-                    "source": "superwhisper",
-                })
+                return json.dumps(
+                    {
+                        "status": "ok",
+                        "transcript": result if result else raw,
+                        "raw_transcript": raw,
+                        "duration_sec": round(duration_ms / 1000, 1),
+                        "folder": folders[0],
+                        "source": "superwhisper",
+                    }
+                )
     except Exception as e:
         logger.warning("await_voice_input error: %s", e)
 
@@ -411,16 +427,22 @@ def tool_vad_check(file_path: str, threshold: float = 0.5) -> str:
     # The HTTP API expects multipart file upload, use urllib
     boundary = "----Mod3ShimBoundary"
     body = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file"; filename="{os.path.basename(file_path)}"\r\n'
-        f"Content-Type: audio/wav\r\n\r\n"
-    ).encode() + wav_data + f"\r\n--{boundary}--\r\n".encode()
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{os.path.basename(file_path)}"\r\n'
+            f"Content-Type: audio/wav\r\n\r\n"
+        ).encode()
+        + wav_data
+        + f"\r\n--{boundary}--\r\n".encode()
+    )
 
     url = f"{MOD3_BASE}/v1/vad"
     if threshold != 0.5:
         url += f"?threshold={threshold}"
     req = urllib.request.Request(
-        url, data=body, method="POST",
+        url,
+        data=body,
+        method="POST",
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
     try:
@@ -458,10 +480,26 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "The text to speak aloud. Keep it conversational."},
-                "voice": {"type": "string", "default": "bm_lewis", "description": "Voice preset. Use list_voices() to see options. Defaults to \"bm_lewis\" (Kokoro)."},
-                "stream": {"type": "boolean", "default": True, "description": "If True, plays audio chunks as they generate (lower latency)."},
-                "speed": {"type": "number", "default": 1.25, "description": "Speed multiplier (engines with speed support). Default 1.25."},
-                "emotion": {"type": "number", "default": 0.5, "description": "Emotion/exaggeration intensity 0.0-1.0 (Chatterbox only). Default 0.5."},
+                "voice": {
+                    "type": "string",
+                    "default": "bm_lewis",
+                    "description": 'Voice preset. Use list_voices() to see options. Defaults to "bm_lewis" (Kokoro).',
+                },
+                "stream": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "If True, plays audio chunks as they generate (lower latency).",
+                },
+                "speed": {
+                    "type": "number",
+                    "default": 1.25,
+                    "description": "Speed multiplier (engines with speed support). Default 1.25.",
+                },
+                "emotion": {
+                    "type": "number",
+                    "default": 0.5,
+                    "description": "Emotion/exaggeration intensity 0.0-1.0 (Chatterbox only). Default 0.5.",
+                },
             },
             "required": ["text"],
         },
@@ -478,8 +516,16 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "job_id": {"type": "string", "default": "", "description": "The job ID returned by speak(). If empty, returns the latest job."},
-                "verbose": {"type": "boolean", "default": False, "description": "If True, include per-chunk metrics. Default False (summary only)."},
+                "job_id": {
+                    "type": "string",
+                    "default": "",
+                    "description": "The job ID returned by speak(). If empty, returns the latest job.",
+                },
+                "verbose": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "If True, include per-chunk metrics. Default False (summary only).",
+                },
             },
         },
     },
@@ -495,7 +541,11 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "job_id": {"type": "string", "default": "", "description": "If provided, cancels that specific job. If empty, stops everything."},
+                "job_id": {
+                    "type": "string",
+                    "default": "",
+                    "description": "If provided, cancels that specific job. If empty, stops everything.",
+                },
             },
         },
     },
@@ -510,7 +560,7 @@ TOOLS = [
             "Block until the user finishes a SuperWhisper recording, then return the transcript.\n\n"
             "This closes the voice input loop: instead of waiting for the user to paste\n"
             "their transcribed text, you can directly receive what they said. Use this\n"
-            "when speak() returns \"held\" (user is recording) or when you want to listen\n"
+            'when speak() returns "held" (user is recording) or when you want to listen\n'
             "for the next voice input.\n\n"
             "Polls the barge-in signal file for user_speaking_end, then reads the\n"
             "transcript from SuperWhisper's recordings directory.\n\n"
@@ -520,7 +570,11 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "timeout_sec": {"type": "number", "default": 180, "description": "Maximum seconds to wait for recording to finish. Default 180 (3 minutes)."},
+                "timeout_sec": {
+                    "type": "number",
+                    "default": 180,
+                    "description": "Maximum seconds to wait for recording to finish. Default 180 (3 minutes).",
+                },
             },
         },
     },
@@ -534,14 +588,18 @@ TOOLS = [
         "description": (
             "List audio output devices, or set the active one.\n\n"
             "Args:\n"
-            "    device: Device index (e.g. \"3\"), name substring (e.g. \"AirPods\"),\n"
-            "            or \"default\" to track the system default automatically.\n"
+            '    device: Device index (e.g. "3"), name substring (e.g. "AirPods"),\n'
+            '            or "default" to track the system default automatically.\n'
             "            If empty, lists available devices without changing anything."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "device": {"type": "string", "default": "", "description": "Device index, name substring, or 'default'. If empty, lists devices."},
+                "device": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Device index, name substring, or 'default'. If empty, lists devices.",
+                },
             },
         },
     },
@@ -559,7 +617,11 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "Path to a WAV audio file."},
-                "threshold": {"type": "number", "default": 0.5, "description": "Speech probability threshold 0-1 (default 0.5). Higher = stricter."},
+                "threshold": {
+                    "type": "number",
+                    "default": 0.5,
+                    "description": "Speech probability threshold 0-1 (default 0.5). Higher = stricter.",
+                },
             },
             "required": ["file_path"],
         },
@@ -634,11 +696,14 @@ def _jsonrpc_error(id: Any, code: int, message: str) -> dict:
 
 
 def handle_initialize(msg: dict) -> dict:
-    return _jsonrpc_response(msg["id"], {
-        "protocolVersion": "2024-11-05",
-        "serverInfo": SERVER_INFO,
-        "capabilities": CAPABILITIES,
-    })
+    return _jsonrpc_response(
+        msg["id"],
+        {
+            "protocolVersion": "2024-11-05",
+            "serverInfo": SERVER_INFO,
+            "capabilities": CAPABILITIES,
+        },
+    )
 
 
 def handle_tools_list(msg: dict) -> dict:
@@ -659,9 +724,12 @@ def handle_tools_call(msg: dict) -> dict:
     except Exception as e:
         result_text = json.dumps({"status": "error", "error": str(e)})
 
-    return _jsonrpc_response(msg["id"], {
-        "content": [{"type": "text", "text": result_text}],
-    })
+    return _jsonrpc_response(
+        msg["id"],
+        {
+            "content": [{"type": "text", "text": result_text}],
+        },
+    )
 
 
 def handle_notifications_initialized(msg: dict):
@@ -705,6 +773,7 @@ def run_stdio():
 # Self-test
 # ---------------------------------------------------------------------------
 
+
 def self_test():
     """Quick connectivity check."""
     print(f"Mod3 shim — testing connection to {MOD3_BASE}")
@@ -723,6 +792,7 @@ def self_test():
     # Check sounddevice
     try:
         import sounddevice as sd
+
         default_out = sd.query_devices(sd.default.device[1])
         print(f"  OK: sounddevice available — default output: {default_out['name']}")
     except ImportError:

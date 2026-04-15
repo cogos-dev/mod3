@@ -201,7 +201,7 @@ class WhisperDecoder(Decoder):
                 confirmed = confirmed[:last_space]
 
         # Tentative = remainder after confirmed prefix
-        tentative = transcript[len(confirmed):].strip()
+        tentative = transcript[len(confirmed) :].strip()
 
         # T3 = end-of-utterance, everything is confirmed
         if tier == "t3":

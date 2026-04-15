@@ -416,9 +416,11 @@ def _bargein_watcher():
     """Background thread that watches for barge-in signal file changes."""
     global _bargein_last_mtime
     import json as _json
+
     while True:
         try:
             import os
+
             if os.path.exists(_BARGEIN_SIGNAL):
                 mtime = os.path.getmtime(_BARGEIN_SIGNAL)
                 if mtime > _bargein_last_mtime:
@@ -437,7 +439,10 @@ def _bargein_watcher():
                                 }
                                 with open(_BARGEIN_SIGNAL, "w") as f:
                                     _json.dump(signal, f, indent=2)
-                            logging.info("Barge-in: paused local playback (%.0f%% delivered)", info.spoken_pct * 100 if info else 0)
+                            logging.info(
+                                "Barge-in: paused local playback (%.0f%% delivered)",
+                                info.spoken_pct * 100 if info else 0,
+                            )
                         else:
                             # Check cross-process lock (another Mod³ process may be speaking)
                             lock = _is_any_process_speaking()
@@ -834,12 +839,14 @@ def speak(
     # can't be cleared by stop().
     if user_state == "recording":
         est_duration = _estimate_duration_sec(text, speed)
-        return json.dumps({
-            "status": "held",
-            "reason": "User is currently speaking — re-send this speak() call after user finishes.",
-            "user_state": "recording",
-            "estimated_duration_sec": round(est_duration, 1),
-        })
+        return json.dumps(
+            {
+                "status": "held",
+                "reason": "User is currently speaking — re-send this speak() call after user finishes.",
+                "user_state": "recording",
+                "estimated_duration_sec": round(est_duration, 1),
+            }
+        )
 
     try:
         job_id, position = _start_speech(text, voice, stream=stream, speed=speed, emotion=emotion)
@@ -1162,9 +1169,7 @@ def await_voice_input(timeout_sec: float = 180.0) -> str:
     """
     import sqlite3 as _sqlite3
 
-    _sw_db = os.path.expanduser(
-        "~/Library/Application Support/SuperWhisper/database/superwhisper.sqlite"
-    )
+    _sw_db = os.path.expanduser("~/Library/Application Support/SuperWhisper/database/superwhisper.sqlite")
     _rec_dir = os.path.expanduser("~/Documents/superwhisper/recordings")
 
     start = time.time()
@@ -1198,23 +1203,23 @@ def await_voice_input(timeout_sec: float = 180.0) -> str:
                 raw = meta.get("rawResult", "").strip()
                 result = meta.get("result", raw).strip()
                 duration_ms = meta.get("duration", 0)
-                return json.dumps({
-                    "status": "ok",
-                    "transcript": result if result else raw,
-                    "raw_transcript": raw,
-                    "duration_sec": round(duration_ms / 1000, 1),
-                    "folder": folders[0],
-                    "source": "superwhisper",
-                })
+                return json.dumps(
+                    {
+                        "status": "ok",
+                        "transcript": result if result else raw,
+                        "raw_transcript": raw,
+                        "duration_sec": round(duration_ms / 1000, 1),
+                        "folder": folders[0],
+                        "source": "superwhisper",
+                    }
+                )
     except Exception as e:
         logger.warning("await_voice_input meta.json fallback failed: %s", e)
 
     # Method 2: Query SuperWhisper SQLite DB
     try:
         conn = _sqlite3.connect(f"file:{_sw_db}?mode=ro", uri=True, timeout=2.0)
-        row = conn.execute(
-            "SELECT folderName, duration FROM recording ORDER BY datetime DESC LIMIT 1"
-        ).fetchone()
+        row = conn.execute("SELECT folderName, duration FROM recording ORDER BY datetime DESC LIMIT 1").fetchone()
         conn.close()
         if row:
             folder_name, duration = row
@@ -1224,14 +1229,16 @@ def await_voice_input(timeout_sec: float = 180.0) -> str:
                     meta = json.load(f)
                 raw = meta.get("rawResult", "").strip()
                 result = meta.get("result", raw).strip()
-                return json.dumps({
-                    "status": "ok",
-                    "transcript": result if result else raw,
-                    "raw_transcript": raw,
-                    "duration_sec": round(duration / 1000, 1),
-                    "folder": folder_name,
-                    "source": "superwhisper_db",
-                })
+                return json.dumps(
+                    {
+                        "status": "ok",
+                        "transcript": result if result else raw,
+                        "raw_transcript": raw,
+                        "duration_sec": round(duration / 1000, 1),
+                        "folder": folder_name,
+                        "source": "superwhisper_db",
+                    }
+                )
     except Exception as e:
         logger.warning("await_voice_input DB fallback failed: %s", e)
 
@@ -1308,12 +1315,17 @@ def set_output_device(device: str = "") -> str:
             outputs.append({"index": i, "name": d["name"], "active": is_active, "default": is_default})
 
     if not device:
-        lines = [f"  [{'*' if d['active'] else ' '}] {d['index']}: {d['name']}{' (system default)' if d['default'] else ''}" for d in outputs]
+        lines = [
+            f"  [{'*' if d['active'] else ' '}] {d['index']}: {d['name']}{' (system default)' if d['default'] else ''}"
+            for d in outputs
+        ]
         return "Audio output devices (* = active):\n" + "\n".join(lines)
 
     if device.lower() == "default":
         _output_device = None
-        return json.dumps({"status": "ok", "device": "system_default", "note": "Now tracking system default output device"})
+        return json.dumps(
+            {"status": "ok", "device": "system_default", "note": "Now tracking system default output device"}
+        )
 
     if device.isdigit():
         _output_device = int(device)

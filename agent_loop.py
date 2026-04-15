@@ -87,8 +87,8 @@ def _fetch_kernel_context() -> str:
                     _full = interrupted.get("full_text", "")
                     pct = interrupted.get("spoken_pct", 0)
                     parts.append(
-                        f"[barge-in] Claude's speech was interrupted at {pct*100:.0f}%. "
-                        f"Delivered: \"{delivered}\". "
+                        f"[barge-in] Claude's speech was interrupted at {pct * 100:.0f}%. "
+                        f'Delivered: "{delivered}". '
                         f"The user interrupted to say something — acknowledge and respond to them."
                     )
         except Exception:
@@ -124,6 +124,7 @@ def _log_exchange_to_bus(user_text: str, assistant_text: str, provider_name: str
         )
     except Exception as e:
         logger.debug("Failed to log exchange to bus: %s", e)
+
 
 MAX_HISTORY = 50
 
@@ -215,7 +216,9 @@ class AgentLoop:
                         content=text,
                         target_channel=self.channel_id,
                         metadata={
-                            "voice": self._channel_ref.config.get("voice", "bm_lewis") if self._channel_ref else "bm_lewis",
+                            "voice": self._channel_ref.config.get("voice", "bm_lewis")
+                            if self._channel_ref
+                            else "bm_lewis",
                             "speed": self._channel_ref.config.get("speed", 1.25) if self._channel_ref else 1.25,
                         },
                     )
@@ -250,10 +253,12 @@ class AgentLoop:
         # Update conversation history
         if assistant_parts:
             assistant_text = " ".join(assistant_parts)
-            self.conversation.append({
-                "role": "assistant",
-                "content": assistant_text,
-            })
+            self.conversation.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_text,
+                }
+            )
 
             # Log exchange to CogOS bus (observation channel — Claude can see this)
             _log_exchange_to_bus(event.content, assistant_text, self.provider.name)
@@ -308,6 +313,7 @@ class AgentLoop:
 
             # Add to draft queue
             import hashlib
+
             ctx_hash = hashlib.md5(committed_text.encode()).hexdigest()[:8]
             block = self.draft_queue.add_block(
                 text=response_text,
@@ -317,7 +323,9 @@ class AgentLoop:
 
             logger.info(
                 "speculative block %s: '%s' (%.0fms)",
-                block.id, response_text[:60], t_ms,
+                block.id,
+                response_text[:60],
+                t_ms,
             )
 
             # F2: Speculative TTS pre-synthesis
@@ -326,10 +334,12 @@ class AgentLoop:
 
             # Notify dashboard of draft queue state
             if self._channel_ref:
-                await self._channel_ref.ws.send_json({
-                    "type": "draft_queue",
-                    "blocks": [b.to_dict() for b in self.draft_queue.get_pending()],
-                })
+                await self._channel_ref.ws.send_json(
+                    {
+                        "type": "draft_queue",
+                        "blocks": [b.to_dict() for b in self.draft_queue.get_pending()],
+                    }
+                )
 
         except Exception as e:
             logger.debug("speculative_infer failed: %s", e)
@@ -367,10 +377,12 @@ class AgentLoop:
         """Push current draft queue state to the dashboard."""
         if self._channel_ref:
             try:
-                await self._channel_ref.ws.send_json({
-                    "type": "draft_queue",
-                    "blocks": [b.to_dict() for b in self.draft_queue.all_blocks],
-                })
+                await self._channel_ref.ws.send_json(
+                    {
+                        "type": "draft_queue",
+                        "blocks": [b.to_dict() for b in self.draft_queue.all_blocks],
+                    }
+                )
             except Exception:
                 pass
 
@@ -398,10 +410,12 @@ class AgentLoop:
 
         if invalidated > 0 and self._channel_ref:
             try:
-                await self._channel_ref.ws.send_json({
-                    "type": "draft_queue",
-                    "blocks": [b.to_dict() for b in self.draft_queue.all_blocks],
-                })
+                await self._channel_ref.ws.send_json(
+                    {
+                        "type": "draft_queue",
+                        "blocks": [b.to_dict() for b in self.draft_queue.all_blocks],
+                    }
+                )
             except Exception:
                 pass
 
@@ -424,6 +438,7 @@ class AgentLoop:
 
             def _synth():
                 from engine import synthesize
+
                 samples, sample_rate = synthesize(
                     block.text,
                     voice=voice,
@@ -471,9 +486,9 @@ class AgentLoop:
             try:
                 # Quick relevance check: ask the model if this block is still appropriate
                 check_prompt = (
-                    f"Given the user just said: \"{latest_user_text}\"\n"
+                    f'Given the user just said: "{latest_user_text}"\n'
                     f"Is this planned response still appropriate? "
-                    f"Response: \"{block.text}\"\n"
+                    f'Response: "{block.text}"\n'
                     f"Answer KEEP or REVISE in one word."
                 )
 
@@ -520,18 +535,18 @@ class AgentLoop:
         unspoken = ""
         if info.full_text and info.delivered_text:
             if info.full_text.startswith(info.delivered_text):
-                unspoken = info.full_text[len(info.delivered_text):].strip()
+                unspoken = info.full_text[len(info.delivered_text) :].strip()
             else:
                 # Fallback: everything after the delivered percentage
-                unspoken = info.full_text[len(info.delivered_text):].strip()
+                unspoken = info.full_text[len(info.delivered_text) :].strip()
 
         parts = []
         parts.append("[Barge-in context — your previous response was interrupted]")
-        parts.append(f"spoken (user heard this): \"{info.delivered_text}\"")
+        parts.append(f'spoken (user heard this): "{info.delivered_text}"')
         if unspoken:
-            parts.append(f"unspoken (user did NOT hear this): \"{unspoken}\"")
-        parts.append(f"interrupted_at: {info.spoken_pct*100:.0f}%")
-        parts.append(f"user_said: \"{user_text}\"")
+            parts.append(f'unspoken (user did NOT hear this): "{unspoken}"')
+        parts.append(f"interrupted_at: {info.spoken_pct * 100:.0f}%")
+        parts.append(f'user_said: "{user_text}"')
         parts.append("Acknowledge what was interrupted and respond to the user's new input.")
 
         return "\n".join(parts)

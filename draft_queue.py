@@ -23,10 +23,11 @@ from typing import Any
 
 class BlockStatus(Enum):
     """Lifecycle states for a draft block."""
-    VALID = "valid"        # Generated, awaiting playback
-    STALE = "stale"        # Invalidated by new context
-    SPOKEN = "spoken"      # Successfully played aloud
-    SNIPPED = "snipped"    # Removed by self-barge
+
+    VALID = "valid"  # Generated, awaiting playback
+    STALE = "stale"  # Invalidated by new context
+    SPOKEN = "spoken"  # Successfully played aloud
+    SNIPPED = "snipped"  # Removed by self-barge
     SPEAKING = "speaking"  # Currently being spoken
 
 
@@ -38,8 +39,8 @@ class DraftBlock:
     text: str
     status: BlockStatus = BlockStatus.VALID
     created_at: float = field(default_factory=time.time)
-    context_hash: str = ""        # Hash of context at generation time
-    generation_ms: float = 0.0    # How long inference took
+    context_hash: str = ""  # Hash of context at generation time
+    generation_ms: float = 0.0  # How long inference took
     tts_audio: bytes | None = None  # Pre-synthesized audio (if available)
     tts_duration_sec: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
