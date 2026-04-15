@@ -3,6 +3,11 @@
 Wraps a FastAPI WebSocket connection as a ChannelDescriptor on the bus.
 Knows the WebSocket protocol (binary PCM / JSON control frames),
 knows nothing about LLMs or agent logic.
+
+Includes three-tier adaptive STT scheduler:
+  T1 (Whisper Base, ~31ms): per-chunk during speech
+  T2 (Whisper Large, ~470ms): on natural pause
+  T3 (Whisper Large, ~470ms): on end-of-utterance (final)
 """
 
 from __future__ import annotations
@@ -14,10 +19,12 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable
 
+import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 
 from bus import ModalityBus
 from modality import CognitiveEvent, EncodedOutput, ModalityType
+from modules.voice import WhisperDecoder
 from pipeline_state import PipelineState
 
 logger = logging.getLogger("mod3.channels")
@@ -48,6 +55,16 @@ class BrowserChannel:
         self._audio_buffer = bytearray()
         self._active = True
 
+        # Three-tier STT state
+        self._streaming_decoder = WhisperDecoder(load_base=True)
+        self._streaming_audio = bytearray()  # Growing buffer for streaming STT
+        self._last_t1_time = 0.0  # Last T1 transcription time
+        self._last_speech_time = 0.0  # Last time we received speech audio
+        self._t1_interval = 0.3  # Run T1 every 300ms
+        self._t2_pause_threshold = 0.6  # Run T2 after 600ms pause
+        self._is_speaking = False  # Whether user is currently speaking
+        self._t2_scheduled = False  # Whether T2 is already scheduled
+
         # Register on the bus with a delivery callback
         bus.register_channel(
             self.channel_id,
@@ -65,7 +82,9 @@ class BrowserChannel:
         if not self._active:
             return
         try:
-            future = asyncio.run_coroutine_threadsafe(self._deliver_async(output), self._loop)
+            future = asyncio.run_coroutine_threadsafe(
+                self._deliver_async(output), self._loop
+            )
             future.result(timeout=10.0)
         except (WebSocketDisconnect, RuntimeError, TimeoutError):
             logger.debug("deliver failed (client disconnected?), deactivating channel")
@@ -87,15 +106,13 @@ class BrowserChannel:
             # Send audio as base64 JSON (avoids binary frame issues)
             audio_b64 = base64.b64encode(output.data).decode("ascii")
             logger.info("deliver: sending base64 audio JSON (%d chars)", len(audio_b64))
-            await self.ws.send_json(
-                {
-                    "type": "audio",
-                    "data": audio_b64,
-                    "format": output.format or "wav",
-                    "duration_sec": round(output.duration_sec, 2),
-                    "sample_rate": output.metadata.get("sample_rate", 24000),
-                }
-            )
+            await self.ws.send_json({
+                "type": "audio",
+                "data": audio_b64,
+                "format": output.format or "wav",
+                "duration_sec": round(output.duration_sec, 2),
+                "sample_rate": output.metadata.get("sample_rate", 24000),
+            })
             logger.info("deliver: audio sent OK")
         elif output.modality == ModalityType.TEXT:
             text = output.data.decode("utf-8") if isinstance(output.data, bytes) else str(output.data)
@@ -128,8 +145,29 @@ class BrowserChannel:
             self._cleanup()
 
     def _handle_audio(self, pcm_bytes: bytes) -> None:
-        """Binary frame: raw Int16 PCM at 16kHz from browser Silero VAD."""
+        """Binary frame: raw Int16 PCM at 16kHz from browser Silero VAD.
+
+        A5: Receives streaming audio during speech (from onFrameProcessed)
+        AND the final complete buffer (from onSpeechEnd). Both accumulate
+        for the final T3 utterance processing.
+
+        During speech, audio also accumulates in _streaming_audio for T1/T2
+        partial transcription.
+        """
         self._audio_buffer.extend(pcm_bytes)
+        self._streaming_audio.extend(pcm_bytes)
+        self._last_speech_time = time.monotonic()
+        self._is_speaking = True
+
+        # T1: Fast Whisper Base transcription every _t1_interval
+        now = time.monotonic()
+        if now - self._last_t1_time >= self._t1_interval and len(self._streaming_audio) > 6400:
+            self._last_t1_time = now
+            asyncio.ensure_future(self._run_t1())
+
+        # Schedule T2 check on pause detection
+        if not self._t2_scheduled:
+            asyncio.ensure_future(self._schedule_t2_on_pause())
 
     async def _handle_json(self, msg: dict) -> None:
         """JSON frame: control message dispatch."""
@@ -150,11 +188,91 @@ class BrowserChannel:
                     self.config[key] = msg[key]
 
     # ------------------------------------------------------------------
+    # Three-Tier STT
+    # ------------------------------------------------------------------
+
+    async def _run_t1(self) -> None:
+        """T1: Fast Whisper Base transcription on growing audio buffer (~31ms).
+
+        Runs every ~300ms during speech. Emits partial_transcript with
+        confirmed/tentative text at 30% opacity.
+        """
+        if not self._streaming_audio:
+            return
+
+        pcm_data = bytes(self._streaming_audio)
+
+        def _transcribe_t1():
+            audio = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
+            if len(audio) < 4800:  # <300ms
+                return None
+            return self._streaming_decoder.decode_streaming(audio, tier="t1")
+
+        try:
+            result = await asyncio.to_thread(_transcribe_t1)
+            if result and result.get("changed") and not result.get("filtered"):
+                await self.ws.send_json({
+                    "type": "partial_transcript",
+                    "confirmed": result["confirmed"],
+                    "tentative": result["tentative"],
+                    "tier": "t1",
+                    "elapsed_ms": result["elapsed_ms"],
+                })
+        except Exception as e:
+            logger.debug("T1 error: %s", e)
+
+    async def _run_t2(self) -> None:
+        """T2: Large model transcription on natural pause (~470ms).
+
+        Runs when speech pauses for >600ms but hasn't ended. Emits
+        partial_transcript with higher confidence (60% opacity).
+        """
+        if not self._streaming_audio:
+            return
+
+        pcm_data = bytes(self._streaming_audio)
+
+        def _transcribe_t2():
+            audio = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
+            if len(audio) < 8000:  # <500ms
+                return None
+            return self._streaming_decoder.decode_streaming(audio, tier="t2")
+
+        try:
+            result = await asyncio.to_thread(_transcribe_t2)
+            if result and not result.get("filtered"):
+                await self.ws.send_json({
+                    "type": "partial_transcript",
+                    "confirmed": result["confirmed"],
+                    "tentative": result["tentative"],
+                    "tier": "t2",
+                    "elapsed_ms": result["elapsed_ms"],
+                })
+        except Exception as e:
+            logger.debug("T2 error: %s", e)
+        finally:
+            self._t2_scheduled = False
+
+    async def _schedule_t2_on_pause(self) -> None:
+        """Check if speech has paused long enough for T2."""
+        await asyncio.sleep(self._t2_pause_threshold)
+        if not self._is_speaking:
+            return
+        # Check if there's been a pause since last audio
+        silence = time.monotonic() - self._last_speech_time
+        if silence >= self._t2_pause_threshold and not self._t2_scheduled:
+            self._t2_scheduled = True
+            await self._run_t2()
+
+    # ------------------------------------------------------------------
     # Processing
     # ------------------------------------------------------------------
 
     async def _process_utterance(self) -> None:
-        """PCM audio buffer → WhisperDecoder STT → CognitiveEvent → agent loop.
+        """T3: PCM audio buffer → WhisperDecoder STT → CognitiveEvent → agent loop.
+
+        This is the final tier — end-of-utterance. Uses the Large model for
+        maximum accuracy. Everything is confirmed (100% opacity).
 
         Skips the server-side VoiceGate (Silero VAD) because the browser
         already ran Silero VAD client-side — no need to validate again,
@@ -162,6 +280,11 @@ class BrowserChannel:
         """
         pcm_data = bytes(self._audio_buffer)
         self._audio_buffer.clear()
+
+        # Reset streaming state
+        self._streaming_audio.clear()
+        self._streaming_decoder.reset_streaming()
+        self._is_speaking = False
 
         if len(pcm_data) < 6400:  # <200ms at 16kHz Int16
             return
@@ -185,7 +308,7 @@ class BrowserChannel:
             # Skip silence
             if len(audio) < 16000 * 0.3:
                 return None
-            rms = float(np.sqrt(np.mean(audio**2)))
+            rms = float(np.sqrt(np.mean(audio ** 2)))
             if rms < 0.005:
                 return None
 
@@ -234,14 +357,12 @@ class BrowserChannel:
 
         if event and event.content:
             # Send transcript to browser
-            await self.ws.send_json(
-                {
-                    "type": "transcript",
-                    "text": event.content,
-                    "stt_ms": round(stt_ms, 1),
-                    "source": "voice",
-                }
-            )
+            await self.ws.send_json({
+                "type": "transcript",
+                "text": event.content,
+                "stt_ms": round(stt_ms, 1),
+                "source": "voice",
+            })
             # Forward to agent loop
             event.metadata["stt_ms"] = stt_ms
             if self._on_event:
@@ -255,13 +376,11 @@ class BrowserChannel:
             source_channel=self.channel_id,
             confidence=1.0,
         )
-        await self.ws.send_json(
-            {
-                "type": "transcript",
-                "text": text,
-                "source": "text",
-            }
-        )
+        await self.ws.send_json({
+            "type": "transcript",
+            "text": text,
+            "source": "text",
+        })
         if self._on_event:
             await self._on_event(event)
 
@@ -288,12 +407,10 @@ class BrowserChannel:
         """Signal response is complete."""
         if self._active:
             try:
-                await self.ws.send_json(
-                    {
-                        "type": "response_complete",
-                        "metrics": metrics or {},
-                    }
-                )
+                await self.ws.send_json({
+                    "type": "response_complete",
+                    "metrics": metrics or {},
+                })
             except Exception:
                 self._active = False
 

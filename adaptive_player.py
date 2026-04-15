@@ -263,13 +263,36 @@ class AdaptivePlayer:
     # Internal
     # ------------------------------------------------------------------
 
+    def _resolve_device(self):
+        """Resolve the output device, falling back to system default if unavailable."""
+        if self.device is None:
+            return None  # sounddevice uses system default
+
+        try:
+            devices = sd.query_devices()
+            if isinstance(self.device, int):
+                if self.device < len(devices):
+                    info = devices[self.device]
+                    if info["max_output_channels"] > 0:
+                        return self.device
+            elif isinstance(self.device, str):
+                for i, d in enumerate(devices):
+                    if self.device in d["name"] and d["max_output_channels"] > 0:
+                        return i
+        except Exception:
+            pass
+
+        # Device unavailable — fall back to system default.
+        return None
+
     def _start_stream(self):
         self._stream_finished.clear()
+        resolved = self._resolve_device()
         self._stream = sd.OutputStream(
             samplerate=self.sample_rate,
             channels=1,
             dtype="float32",
-            device=self.device,
+            device=resolved,
             callback=self._callback,
             finished_callback=self._on_stream_finished,
             blocksize=self.buffer_size,

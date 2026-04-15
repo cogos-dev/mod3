@@ -29,7 +29,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Optional
 
-from fastapi import FastAPI, Request, Response, UploadFile, WebSocket
+from fastapi import FastAPI, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -58,7 +58,6 @@ async def _warmup_kokoro():
     def _do_warmup():
         try:
             from engine import get_model
-
             get_model("kokoro")
             logger.info("Kokoro TTS engine pre-warmed successfully")
         except Exception as e:
@@ -572,7 +571,6 @@ def stop_speech(job_id: str = ""):
     """
     try:
         from server import _speech_queue, pipeline_state
-
         if job_id:
             cancelled = _speech_queue.cancel(job_id)
             return {"status": "ok", "message": f"Cancelled {job_id}" if cancelled else f"Job {job_id} not found"}
@@ -679,16 +677,24 @@ async def shutdown(req: Optional[ShutdownRequest] = None):
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
             with _jobs_lock:
-                active = sum(1 for j in _jobs.values() if j.get("status") in ("generating", "processing"))
+                active = sum(
+                    1 for j in _jobs.values()
+                    if j.get("status") in ("generating", "processing")
+                )
             if active == 0:
                 break
             await asyncio.sleep(0.25)
 
         with _jobs_lock:
-            remaining = sum(1 for j in _jobs.values() if j.get("status") in ("generating", "processing"))
+            remaining = sum(
+                1 for j in _jobs.values()
+                if j.get("status") in ("generating", "processing")
+            )
 
         if remaining:
-            logger.warning("Shutdown timeout reached with %d active jobs — forcing exit", remaining)
+            logger.warning(
+                "Shutdown timeout reached with %d active jobs — forcing exit", remaining
+            )
         else:
             logger.info("All jobs drained — exiting cleanly")
 

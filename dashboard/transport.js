@@ -63,9 +63,12 @@ class VoiceTransport {
 
     const handlerMap = {
       transcript: "onTranscript",
+      partial_transcript: "onPartialTranscript",
       response_text: "onResponseText",
       response_complete: "onResponseComplete",
       interrupted: "onInterrupted",
+      tts_progress: "onTtsProgress",
+      draft_queue: "onDraftQueue",
       metrics: "onMetrics",
       error: "onError",
     };

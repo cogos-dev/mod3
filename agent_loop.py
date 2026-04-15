@@ -11,11 +11,12 @@ import json as _json
 import logging
 import os
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from bus import ModalityBus
+from draft_queue import DraftQueue
 from modality import CognitiveEvent, CognitiveIntent, ModalityType
 from pipeline_state import PipelineState
 from providers import AGENT_TOOLS, InferenceProvider
@@ -82,10 +83,11 @@ def _fetch_kernel_context() -> str:
                 interrupted = signal.get("interrupted")
                 if interrupted:
                     delivered = interrupted.get("delivered_text", "")
+                    full = interrupted.get("full_text", "")
                     pct = interrupted.get("spoken_pct", 0)
                     parts.append(
-                        f"[barge-in] Claude's speech was interrupted at {pct * 100:.0f}%. "
-                        f'Delivered: "{delivered}". '
+                        f"[barge-in] Claude's speech was interrupted at {pct*100:.0f}%. "
+                        f"Delivered: \"{delivered}\". "
                         f"The user interrupted to say something — acknowledge and respond to them."
                     )
         except Exception:
@@ -122,7 +124,6 @@ def _log_exchange_to_bus(user_text: str, assistant_text: str, provider_name: str
     except Exception as e:
         logger.debug("Failed to log exchange to bus: %s", e)
 
-
 MAX_HISTORY = 50
 
 
@@ -143,6 +144,9 @@ class AgentLoop:
         self.conversation: list[dict[str, str]] = []
         self._channel_ref: BrowserChannel | None = None
         self._processing = False
+        self.draft_queue = DraftQueue()
+        self._speculative_context: list[dict[str, str]] = []  # Context for speculative inference
+        self._human_speaking = False  # Whether human is currently speaking
 
     async def handle_event(self, event: CognitiveEvent) -> None:
         """Called when a CognitiveEvent arrives from the channel."""
@@ -169,6 +173,13 @@ class AgentLoop:
 
     async def _process(self, event: CognitiveEvent) -> None:
         """Core: event → provider → tool dispatch."""
+        # Context stitching: inject interrupt context from dashboard path
+        # This closes the barge-in loop — the agent knows what was spoken,
+        # what was unsaid, and what the user interrupted with.
+        interrupt_context = self._build_interrupt_context(event.content)
+        if interrupt_context:
+            self.conversation.append({"role": "system", "content": interrupt_context})
+
         self.conversation.append({"role": "user", "content": event.content})
         self._trim_history()
 
@@ -203,9 +214,7 @@ class AgentLoop:
                         content=text,
                         target_channel=self.channel_id,
                         metadata={
-                            "voice": self._channel_ref.config.get("voice", "bm_lewis")
-                            if self._channel_ref
-                            else "bm_lewis",
+                            "voice": self._channel_ref.config.get("voice", "bm_lewis") if self._channel_ref else "bm_lewis",
                             "speed": self._channel_ref.config.get("speed", 1.25) if self._channel_ref else 1.25,
                         },
                     )
@@ -240,12 +249,10 @@ class AgentLoop:
         # Update conversation history
         if assistant_parts:
             assistant_text = " ".join(assistant_parts)
-            self.conversation.append(
-                {
-                    "role": "assistant",
-                    "content": assistant_text,
-                }
-            )
+            self.conversation.append({
+                "role": "assistant",
+                "content": assistant_text,
+            })
 
             # Log exchange to CogOS bus (observation channel — Claude can see this)
             _log_exchange_to_bus(event.content, assistant_text, self.provider.name)
@@ -255,6 +262,278 @@ class AgentLoop:
             await self._channel_ref.send_response_complete(
                 metrics={"llm_ms": round(t_llm, 1), "provider": self.provider.name}
             )
+
+    async def speculative_infer(self, committed_text: str) -> None:
+        """D2: Speculative inference trigger.
+
+        When T3 commits a sentence while the human is still speaking,
+        launch background inference with context-so-far. Store result
+        in the DraftQueue. Does NOT play — just buffers.
+        """
+        if not committed_text.strip():
+            return
+
+        logger.info("speculative_infer: '%s'", committed_text[:80])
+
+        # Build speculative conversation with committed text so far
+        spec_messages = list(self.conversation) + [
+            {"role": "user", "content": committed_text},
+        ]
+
+        try:
+            t_start = time.perf_counter()
+            kernel_ctx = _fetch_kernel_context()
+            system_prompt = _BASE_SYSTEM_PROMPT + kernel_ctx
+
+            response = await self.provider.chat(
+                messages=spec_messages,
+                tools=AGENT_TOOLS,
+                system=system_prompt,
+            )
+
+            t_ms = (time.perf_counter() - t_start) * 1000
+
+            # Extract response text
+            response_text = ""
+            for tc in response.tool_calls:
+                if tc.name == "speak":
+                    response_text += tc.arguments.get("text", "") + " "
+            if not response_text and response.text:
+                response_text = response.text
+
+            response_text = response_text.strip()
+            if not response_text:
+                return
+
+            # Add to draft queue
+            import hashlib
+            ctx_hash = hashlib.md5(committed_text.encode()).hexdigest()[:8]
+            block = self.draft_queue.add_block(
+                text=response_text,
+                context_hash=ctx_hash,
+                generation_ms=t_ms,
+            )
+
+            logger.info(
+                "speculative block %s: '%s' (%.0fms)",
+                block.id, response_text[:60], t_ms,
+            )
+
+            # F2: Speculative TTS pre-synthesis
+            # Generate audio immediately but don't play
+            await self._presynthesise_block(block)
+
+            # Notify dashboard of draft queue state
+            if self._channel_ref:
+                await self._channel_ref.ws.send_json({
+                    "type": "draft_queue",
+                    "blocks": [b.to_dict() for b in self.draft_queue.get_pending()],
+                })
+
+        except Exception as e:
+            logger.debug("speculative_infer failed: %s", e)
+
+    async def self_barge_snip(self, block_id: str) -> bool:
+        """E1: Remove a queued block that's no longer relevant."""
+        result = self.draft_queue.snip(block_id)
+        if result:
+            logger.info("self-barge: snipped block %s", block_id)
+            await self._push_draft_queue_state()
+        return result
+
+    async def self_barge_inject(self, position: int, text: str) -> None:
+        """E1: Insert a new block at position."""
+        block = self.draft_queue.inject(position, text)
+        logger.info("self-barge: injected block %s at pos %d", block.id, position)
+        # Pre-synthesize the new block
+        await self._presynthesise_block(block)
+        await self._push_draft_queue_state()
+
+    async def self_barge_revise(self, block_id: str, new_text: str) -> bool:
+        """E1: Replace a block's content and re-synthesize TTS."""
+        result = self.draft_queue.revise(block_id, new_text)
+        if result:
+            logger.info("self-barge: revised block %s -> '%s'", block_id, new_text[:60])
+            # Find the block and re-synthesize
+            for block in self.draft_queue.all_blocks:
+                if block.id == block_id:
+                    await self._presynthesise_block(block)
+                    break
+            await self._push_draft_queue_state()
+        return result
+
+    async def _push_draft_queue_state(self) -> None:
+        """Push current draft queue state to the dashboard."""
+        if self._channel_ref:
+            try:
+                await self._channel_ref.ws.send_json({
+                    "type": "draft_queue",
+                    "blocks": [b.to_dict() for b in self.draft_queue.all_blocks],
+                })
+            except Exception:
+                pass
+
+    async def invalidate_stale_drafts(self, new_context: str) -> int:
+        """D3: Draft block invalidation.
+
+        When a new T3 sentence arrives, check if existing draft blocks
+        are still valid given the updated context. Mark stale ones.
+
+        Uses context hash comparison: if a block was generated with
+        different context than what we have now, it's potentially stale.
+
+        Returns count of invalidated blocks.
+        """
+        import hashlib
+
+        new_hash = hashlib.md5(new_context.encode()).hexdigest()[:8]
+        invalidated = 0
+
+        for block in self.draft_queue.get_pending():
+            if block.context_hash and block.context_hash != new_hash:
+                self.draft_queue.invalidate(block.id)
+                invalidated += 1
+                logger.info("invalidated stale draft block %s (context changed)", block.id)
+
+        if invalidated > 0 and self._channel_ref:
+            try:
+                await self._channel_ref.ws.send_json({
+                    "type": "draft_queue",
+                    "blocks": [b.to_dict() for b in self.draft_queue.all_blocks],
+                })
+            except Exception:
+                pass
+
+        return invalidated
+
+    async def _presynthesise_block(self, block) -> None:
+        """F2: Pre-synthesize TTS audio for a draft block.
+
+        Generates audio immediately and attaches it to the block.
+        Ready for instant playback when the human stops speaking.
+        """
+        from modules.voice import VoiceEncoder, _encode_wav
+
+        try:
+            voice = "bm_lewis"
+            speed = 1.25
+            if self._channel_ref:
+                voice = self._channel_ref.config.get("voice", "bm_lewis")
+                speed = self._channel_ref.config.get("speed", 1.25)
+
+            def _synth():
+                from engine import synthesize
+                samples, sample_rate = synthesize(
+                    block.text,
+                    voice=voice,
+                    speed=speed,
+                )
+                wav_bytes = _encode_wav(samples, sample_rate)
+                duration = len(samples) / sample_rate
+                return wav_bytes, duration
+
+            wav_bytes, duration = await asyncio.to_thread(_synth)
+            block.tts_audio = wav_bytes
+            block.tts_duration_sec = duration
+            logger.info("pre-synthesized block %s: %.1fs audio", block.id, duration)
+
+        except Exception as e:
+            logger.debug("pre-synthesis failed for block %s: %s", block.id, e)
+
+    async def background_validate_drafts(self, latest_user_text: str) -> None:
+        """E2: Background validation loop.
+
+        After each new human sentence, re-evaluate all queued draft blocks.
+        Snips/revises if context has invalidated them. This runs between
+        TTS synthesis and playback — the revision window.
+        """
+        pending = self.draft_queue.get_pending()
+        if not pending:
+            return
+
+        logger.info("background_validate: checking %d pending blocks", len(pending))
+
+        # First, invalidate any blocks whose context is clearly stale
+        await self.invalidate_stale_drafts(latest_user_text)
+
+        # Then re-evaluate remaining valid blocks
+        still_pending = self.draft_queue.get_pending()
+        if not still_pending:
+            return
+
+        # Build context with latest human input
+        check_messages = list(self.conversation) + [
+            {"role": "user", "content": latest_user_text},
+        ]
+
+        for block in still_pending:
+            try:
+                # Quick relevance check: ask the model if this block is still appropriate
+                check_prompt = (
+                    f"Given the user just said: \"{latest_user_text}\"\n"
+                    f"Is this planned response still appropriate? "
+                    f"Response: \"{block.text}\"\n"
+                    f"Answer KEEP or REVISE in one word."
+                )
+
+                response = await self.provider.chat(
+                    messages=[{"role": "user", "content": check_prompt}],
+                    tools=[],
+                    system="You are evaluating whether a planned response is still valid. Answer KEEP or REVISE.",
+                )
+
+                answer = (response.text or "").strip().upper()
+                if "REVISE" in answer:
+                    logger.info("background_validate: block %s needs revision", block.id)
+                    self.draft_queue.invalidate(block.id)
+                else:
+                    logger.debug("background_validate: block %s still valid", block.id)
+
+            except Exception as e:
+                logger.debug("background_validate error for block %s: %s", block.id, e)
+
+        await self._push_draft_queue_state()
+
+    def _build_interrupt_context(self, user_text: str) -> str | None:
+        """Build context stitch from pipeline_state.last_interrupt.
+
+        When the user barged in during TTS playback, captures what was
+        spoken vs unspoken and injects it as structured context for the
+        next inference call. Consumes the interrupt (clears it).
+
+        Returns a context string, or None if no interrupt occurred.
+        """
+        info = self.pipeline_state.last_interrupt
+        if info is None:
+            return None
+
+        # Only use recent interrupts (within last 30 seconds)
+        if time.time() - info.timestamp > 30:
+            return None
+
+        # Clear the interrupt so we don't re-inject it
+        with self.pipeline_state._lock:
+            self.pipeline_state._last_interrupt = None
+
+        # Compute unspoken remainder
+        unspoken = ""
+        if info.full_text and info.delivered_text:
+            if info.full_text.startswith(info.delivered_text):
+                unspoken = info.full_text[len(info.delivered_text):].strip()
+            else:
+                # Fallback: everything after the delivered percentage
+                unspoken = info.full_text[len(info.delivered_text):].strip()
+
+        parts = []
+        parts.append("[Barge-in context — your previous response was interrupted]")
+        parts.append(f"spoken (user heard this): \"{info.delivered_text}\"")
+        if unspoken:
+            parts.append(f"unspoken (user did NOT hear this): \"{unspoken}\"")
+        parts.append(f"interrupted_at: {info.spoken_pct*100:.0f}%")
+        parts.append(f"user_said: \"{user_text}\"")
+        parts.append("Acknowledge what was interrupted and respond to the user's new input.")
+
+        return "\n".join(parts)
 
     def _trim_history(self) -> None:
         """Keep conversation within MAX_HISTORY messages."""

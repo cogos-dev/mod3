@@ -106,6 +106,71 @@
   /* Headphone hint */
   .hint { font-size: 0.7rem; color: var(--muted); padding: 4px 0; flex-shrink: 0; }
 
+  /* Opacity-as-state: three visual states for text blocks */
+  .opacity-inflight { opacity: 0.3; transition: opacity 0.3s ease; }
+  .opacity-corrected { opacity: 0.6; transition: opacity 0.3s ease; }
+  .opacity-committed { opacity: 1.0; transition: opacity 0.3s ease; }
+
+  /* Word-level solidification spans */
+  .voice-word {
+    display: inline;
+    transition: opacity 0.2s ease;
+  }
+  .voice-word.spoken { opacity: 1.0; }
+  .voice-word.speaking { opacity: 0.85; color: var(--accent); }
+  .voice-word.unspoken { opacity: 0.3; }
+
+  /* Draft queue preview blocks */
+  .draft-preview {
+    opacity: 0.3;
+    padding: 6px 12px;
+    margin-top: 4px;
+    border-left: 2px solid var(--accent);
+    border-radius: 4px;
+    font-size: 0.85rem;
+    color: var(--muted);
+    transition: opacity 0.3s ease;
+  }
+  .draft-preview.validated { opacity: 0.6; }
+  .draft-preview.stale {
+    opacity: 0.15;
+    text-decoration: line-through;
+    border-left-color: var(--orange);
+  }
+  .draft-preview.revised {
+    border-left-color: var(--green);
+    animation: revision-flash 0.6s ease;
+  }
+  @keyframes revision-flash {
+    0% { opacity: 0.8; border-left-color: var(--green); }
+    100% { opacity: 0.3; border-left-color: var(--accent); }
+  }
+
+  /* Partial transcript (assembling) */
+  .partial-transcript {
+    font-size: 0.85rem;
+    color: var(--muted);
+    padding: 4px 0;
+    min-height: 1.3em;
+  }
+  .partial-confirmed { opacity: 0.6; color: var(--text); }
+  .partial-tentative { opacity: 0.3; color: var(--muted); font-style: italic; }
+
+  /* Interruption marker */
+  .interrupt-marker {
+    display: inline-block;
+    width: 2px;
+    height: 1em;
+    background: var(--red);
+    margin: 0 2px;
+    vertical-align: middle;
+    animation: blink 1s ease-in-out 3;
+  }
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
   /* Responsive */
   @media (max-width: 700px) {
     .main { padding: 12px 16px; }
@@ -214,8 +279,14 @@
     </div>
   </div>
 
+  <!-- Partial transcript (live speech assembly) -->
+  <div class="partial-transcript" id="partial-transcript" style="display:none;"></div>
+
   <!-- Unified chat / transcript area -->
   <div class="chat-area" id="chat-area"></div>
+
+  <!-- Draft queue preview -->
+  <div id="draft-queue-preview" style="display:none;"></div>
 
   <!-- Metrics -->
   <div class="metrics-bar" id="voice-metrics"></div>
@@ -379,6 +450,49 @@ function appendMessage(role, text, source) {
 }
 
 let _currentAssistantMsg = null;
+let _currentAssistantText = '';  // Full text of current response for word tracking
+
+/**
+ * C2: Word-level timing estimation.
+ * Given total audio duration and full text, estimates the time position
+ * of each word assuming uniform speech rate.
+ *
+ * Returns array of { word, startSec, endSec, index }
+ */
+function estimateWordTimings(text, totalDurationSec) {
+  const words = text.split(/\s+/).filter(w => w.length > 0);
+  if (words.length === 0) return [];
+
+  // Weight by character count (longer words take more time)
+  const totalChars = words.reduce((sum, w) => sum + w.length, 0);
+  let currentTime = 0;
+
+  return words.map((word, index) => {
+    const fraction = word.length / totalChars;
+    const duration = fraction * totalDurationSec;
+    const entry = {
+      word,
+      startSec: currentTime,
+      endSec: currentTime + duration,
+      index,
+    };
+    currentTime += duration;
+    return entry;
+  });
+}
+
+/**
+ * Get the word index being spoken at a given playback time.
+ */
+function getWordAtTime(timings, currentTimeSec) {
+  for (let i = timings.length - 1; i >= 0; i--) {
+    if (currentTimeSec >= timings[i].startSec) return i;
+  }
+  return 0;
+}
+
+let _wordTimings = [];   // Current word timings for solidification
+let _solidificationActive = false;
 
 function appendAssistantStart(source) {
   const div = document.createElement('div');
@@ -393,6 +507,7 @@ function appendAssistantStart(source) {
   chatArea.appendChild(div);
   chatArea.scrollTop = chatArea.scrollHeight;
   _currentAssistantMsg = div.querySelector('.msg-text');
+  _currentAssistantText = '';
   return div;
 }
 
@@ -401,15 +516,72 @@ function appendAssistantChunk(text) {
   if (!_currentAssistantMsg) {
     appendAssistantStart();
   }
-  _currentAssistantMsg.innerHTML += escapeHtml(text);
+  _currentAssistantText += text;
+
+  // C4: Wrap each word in a span for solidification animation
+  const words = text.split(/(\s+)/);
+  words.forEach(segment => {
+    if (/^\s+$/.test(segment)) {
+      _currentAssistantMsg.appendChild(document.createTextNode(segment));
+    } else if (segment) {
+      const span = document.createElement('span');
+      span.className = 'voice-word unspoken';
+      span.textContent = segment;
+      _currentAssistantMsg.appendChild(span);
+    }
+  });
+
   chatArea.scrollTop = chatArea.scrollHeight;
 }
 
+function startSolidification(totalDurationSec) {
+  /**
+   * C4: Begin solidification animation — words solidify left-to-right
+   * tracking the audio playback position. Uses C1 progress + C2 timing.
+   */
+  if (!_currentAssistantMsg || !_currentAssistantText) return;
+
+  _wordTimings = estimateWordTimings(_currentAssistantText, totalDurationSec);
+  _solidificationActive = true;
+}
+
+// Listen for playback progress to drive solidification
+window.addEventListener('playback-progress', (e) => {
+  if (!_solidificationActive || !_currentAssistantMsg) return;
+
+  const { progress } = e.detail;
+  const currentTime = progress * (_wordTimings.length > 0 ?
+    _wordTimings[_wordTimings.length - 1].endSec : 0);
+
+  const wordSpans = _currentAssistantMsg.querySelectorAll('.voice-word');
+  const currentWordIdx = getWordAtTime(_wordTimings, currentTime);
+
+  wordSpans.forEach((span, i) => {
+    if (i < currentWordIdx) {
+      span.className = 'voice-word spoken';
+    } else if (i === currentWordIdx) {
+      span.className = 'voice-word speaking';
+    } else {
+      span.className = 'voice-word unspoken';
+    }
+  });
+});
+
 function finalizeAssistant(suffix) {
-  if (_currentAssistantMsg && suffix) {
-    _currentAssistantMsg.innerHTML += ` <em style="color:var(--muted)">${escapeHtml(suffix)}</em>`;
+  _solidificationActive = false;
+  _wordTimings = [];
+
+  if (_currentAssistantMsg) {
+    // Mark all words as spoken (committed)
+    _currentAssistantMsg.querySelectorAll('.voice-word').forEach(span => {
+      span.className = 'voice-word spoken';
+    });
+    if (suffix) {
+      _currentAssistantMsg.innerHTML += ` <em style="color:var(--muted)">${escapeHtml(suffix)}</em>`;
+    }
   }
   _currentAssistantMsg = null;
+  _currentAssistantText = '';
 }
 
 async function sendTextMessage(text) {
@@ -471,19 +643,51 @@ chatInput.addEventListener('input', () => {
     }
   };
 
+  // Wire up playback progress for solidification
+  pb.onProgress = (samplesPlayed, totalSamples) => {
+    // Will be used by C4 solidification animation (Wave 2)
+    const pct = totalSamples > 0 ? samplesPlayed / totalSamples : 0;
+    // Emit custom event for word-level tracking
+    window.dispatchEvent(new CustomEvent('playback-progress', {
+      detail: { samplesPlayed, totalSamples, progress: pct }
+    }));
+  };
+
   const t = new VoiceTransport(wsUrl, {
     onAudio: (data) => {
       pb.enqueueWav(data);
+      // Start solidification when first audio arrives
+      if (_currentAssistantText && !_solidificationActive) {
+        // Estimate total duration from accumulated audio
+        // (will refine as more chunks arrive)
+        startSolidification(pb.totalDuration || 2.0);
+      }
       const el = document.getElementById('voice-status');
       if (el) { el.textContent = 'Speaking...'; el.style.color = 'var(--accent)'; }
     },
     onTranscript: (msg) => {
       if (msg.source !== 'text') appendMessage('user', msg.text, 'voice');
-      // Don't create assistant bubble here — appendAssistantChunk lazy-creates it
+      // Hide partial transcript when final arrives
+      const ptEl = document.getElementById('partial-transcript');
+      if (ptEl) { ptEl.style.display = 'none'; ptEl.innerHTML = ''; }
       const el = document.getElementById('voice-status');
       if (el) { el.textContent = 'Thinking...'; el.style.color = 'var(--orange)'; }
     },
-    onResponseText: (msg) => appendAssistantChunk(msg.text),
+    onPartialTranscript: (msg) => {
+      // Show partial transcript with confirmed/tentative styling
+      const ptEl = document.getElementById('partial-transcript');
+      if (ptEl) {
+        ptEl.style.display = '';
+        let html = '';
+        if (msg.confirmed) html += `<span class="partial-confirmed">${escapeHtml(msg.confirmed)}</span> `;
+        if (msg.tentative) html += `<span class="partial-tentative">${escapeHtml(msg.tentative)}</span>`;
+        ptEl.innerHTML = html || '...';
+      }
+    },
+    onResponseText: (msg) => {
+      pb.resetProgress(); // Reset progress for new response
+      appendAssistantChunk(msg.text);
+    },
     onResponseComplete: (msg) => {
       finalizeAssistant();
       if (msg.metrics) {
@@ -499,6 +703,67 @@ chatInput.addEventListener('input', () => {
     onInterrupted: () => {
       pb.flush();
       finalizeAssistant('[interrupted]');
+    },
+    onDraftQueue: (msg) => {
+      /**
+       * E3 + D4: Self-barge visual feedback + Queue preview UI.
+       *
+       * When the agent revises queued output, the transparent text visibly
+       * changes in the dashboard. Each block gets a data-block-id attribute
+       * for targeted updates. Revised blocks flash briefly to draw attention.
+       */
+      const dqEl = document.getElementById('draft-queue-preview');
+      if (!dqEl) return;
+      if (msg.blocks && msg.blocks.length > 0) {
+        dqEl.style.display = '';
+
+        msg.blocks.forEach(b => {
+          const existing = dqEl.querySelector(`[data-block-id="${b.id}"]`);
+          if (existing) {
+            // Block exists — check if content changed (self-barge revision)
+            const oldText = existing.getAttribute('data-text') || '';
+            if (oldText !== b.text) {
+              // E3: Content changed — flash animation to show revision
+              existing.innerHTML = escapeHtml(b.text);
+              existing.setAttribute('data-text', b.text);
+              existing.style.transition = 'none';
+              existing.style.borderLeftColor = 'var(--green)';
+              existing.style.opacity = '0.8';
+              requestAnimationFrame(() => {
+                existing.style.transition = 'opacity 0.5s ease, border-left-color 0.5s ease';
+                existing.style.opacity = b.status === 'stale' ? '0.15' : '0.3';
+                existing.style.borderLeftColor = b.status === 'stale' ? 'var(--orange)' : 'var(--accent)';
+              });
+            }
+            // Update status class
+            existing.className = b.status === 'stale' ? 'draft-preview stale' :
+                                 b.status === 'valid' ? 'draft-preview' : 'draft-preview validated';
+          } else {
+            // New block — create element
+            const div = document.createElement('div');
+            div.className = b.status === 'stale' ? 'draft-preview stale' :
+                            b.status === 'valid' ? 'draft-preview' : 'draft-preview validated';
+            div.setAttribute('data-block-id', b.id);
+            div.setAttribute('data-text', b.text);
+            div.textContent = b.text;
+            dqEl.appendChild(div);
+          }
+        });
+
+        // Remove blocks that no longer exist
+        const currentIds = new Set(msg.blocks.map(b => b.id));
+        dqEl.querySelectorAll('[data-block-id]').forEach(el => {
+          if (!currentIds.has(el.getAttribute('data-block-id'))) {
+            // Snipped block — fade out
+            el.style.transition = 'opacity 0.3s ease';
+            el.style.opacity = '0';
+            setTimeout(() => el.remove(), 300);
+          }
+        });
+      } else {
+        dqEl.style.display = 'none';
+        dqEl.innerHTML = '';
+      }
     },
     onMetrics: (msg) => {
       if (msg.sample_rate && msg.sample_rate !== pb.sampleRate) pb.setSampleRate(msg.sample_rate);
@@ -632,7 +897,27 @@ chatInput.addEventListener('input', () => {
         preSpeechPadFrames: 8,
         onSpeechStart: () => {
           console.log('[Silero VAD] Speech START');
+          // B3: Barge-in visual state
           if (_playback && _playback.isPlaying) {
+            // Freeze unspoken words at 30% opacity with interrupt marker
+            if (_currentAssistantMsg && _solidificationActive) {
+              const wordSpans = _currentAssistantMsg.querySelectorAll('.voice-word');
+              let interrupted = false;
+              wordSpans.forEach(span => {
+                if (span.classList.contains('unspoken') || span.classList.contains('speaking')) {
+                  span.classList.remove('speaking');
+                  span.classList.add('unspoken');
+                  if (!interrupted) {
+                    // Insert interrupt marker before the first unspoken word
+                    const marker = document.createElement('span');
+                    marker.className = 'interrupt-marker';
+                    span.parentNode.insertBefore(marker, span);
+                    interrupted = true;
+                  }
+                }
+              });
+              _solidificationActive = false;
+            }
             _playback.flush();
             if (_transport) _transport.interrupt();
           }
@@ -653,9 +938,19 @@ chatInput.addEventListener('input', () => {
         onVADMisfire: () => {
           if (micDebug) micDebug.textContent = 'VAD: misfire (too short)';
         },
-        onFrameProcessed: (probs) => {
+        onFrameProcessed: (probs, audioFrame) => {
           if (levelBar) levelBar.style.width = Math.min(100, probs.isSpeech * 100) + '%';
           if (micDebug) micDebug.textContent = `silero: ${probs.isSpeech.toFixed(3)} thr=${vadThreshold}`;
+
+          // A5: Stream audio chunks during speech for server-side streaming STT
+          // Send frames when speech is detected (server accumulates for T1/T2)
+          if (probs.isSpeech > vadThreshold && audioFrame && _transport && _transport.connected) {
+            const int16 = new Int16Array(audioFrame.length);
+            for (let i = 0; i < audioFrame.length; i++) {
+              int16[i] = Math.max(-32768, Math.min(32767, audioFrame[i] * 32768));
+            }
+            _transport.sendAudio(int16.buffer);
+          }
         },
       });
       capture.start();

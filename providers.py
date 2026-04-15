@@ -121,7 +121,8 @@ def _format_tools_for_prompt(tools: list[dict]) -> str:
             for pname, pinfo in props.items():
                 req_marker = " (required)" if pname in required else ""
                 lines.append(
-                    f"    - {pname} ({pinfo.get('type', 'string')}): {pinfo.get('description', '')}{req_marker}"
+                    f"    - {pname} ({pinfo.get('type', 'string')}): "
+                    f"{pinfo.get('description', '')}{req_marker}"
                 )
     lines.append(
         "\nTo call a tool, output exactly:\n"
@@ -134,7 +135,9 @@ def _format_tools_for_prompt(tools: list[dict]) -> str:
     return "\n".join(lines)
 
 
-_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_TOOL_CALL_RE = re.compile(
+    r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL
+)
 
 
 def _parse_tool_calls(text: str) -> list[ToolCall]:
@@ -165,7 +168,9 @@ class MlxProvider:
     """
 
     def __init__(self, model_id: str | None = None):
-        self._model_id = model_id or os.environ.get("MLX_MODEL", "mlx-community/gemma-3-4b-it-4bit")
+        self._model_id = model_id or os.environ.get(
+            "MLX_MODEL", "mlx-community/gemma-3-4b-it-4bit"
+        )
         self._model = None
         self._tokenizer = None
 
@@ -205,7 +210,9 @@ class MlxProvider:
             msgs = [{"role": "system", "content": "\n\n".join(system_parts)}] + msgs
 
         # Apply chat template
-        prompt = self._tokenizer.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+        prompt = self._tokenizer.apply_chat_template(
+            msgs, add_generation_prompt=True, tokenize=False
+        )
 
         max_tokens = int(os.environ.get("MLX_MAX_TOKENS", "512"))
         raw_output = generate(
@@ -233,7 +240,9 @@ class MlxProvider:
         tools: list[dict] | None = None,
         system: str = "",
     ) -> ProviderResponse:
-        return await asyncio.to_thread(self._generate_sync, messages, tools, system)
+        return await asyncio.to_thread(
+            self._generate_sync, messages, tools, system
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +258,9 @@ class OllamaProvider:
         endpoint: str | None = None,
         model: str | None = None,
     ):
-        self._endpoint = endpoint or os.environ.get("OLLAMA_ENDPOINT", "http://localhost:11434")
+        self._endpoint = endpoint or os.environ.get(
+            "OLLAMA_ENDPOINT", "http://localhost:11434"
+        )
         self._model = model or os.environ.get("OLLAMA_MODEL", "gemma4:e4b")
 
     @property
@@ -311,7 +322,9 @@ class CogOSProvider:
     """CogOS kernel — OpenAI-compatible chat/completions with tool support."""
 
     def __init__(self, endpoint: str | None = None):
-        self._endpoint = endpoint or os.environ.get("COGOS_ENDPOINT", "http://localhost:5100")
+        self._endpoint = endpoint or os.environ.get(
+            "COGOS_ENDPOINT", "http://localhost:5100"
+        )
 
     @property
     def name(self) -> str:
@@ -430,7 +443,7 @@ def auto_detect_provider() -> InferenceProvider:
         return MlxProvider()
 
     try:
-        asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(auto_detect_provider_async())
 

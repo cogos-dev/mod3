@@ -2,7 +2,7 @@
   "mcpServers": {
     "mod3-voice": {
       "command": "python3",
-      "args": ["${MOD3_ROOT}/server.py", "--channel"]
+      "args": ["/Users/slowbro/workspaces/mod3/server.py", "--channel"]
     }
   }
 }

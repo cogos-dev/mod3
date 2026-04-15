@@ -365,18 +365,60 @@ pipeline_state = PipelineState()
 # ---------------------------------------------------------------------------
 
 _BARGEIN_SIGNAL = "/tmp/mod3-barge-in.json"
+_SPEAKING_LOCK = "/tmp/mod3-speaking.json"
 _bargein_last_mtime: float = 0.0
+
+
+def _acquire_speaking_lock(job_id: str, text: str):
+    """Write cross-process speaking lock so the barge-in watcher knows ANY Mod³ is speaking."""
+    try:
+        payload = {
+            "speaking": True,
+            "job_id": job_id,
+            "text": text,
+            "pid": os.getpid(),
+            "timestamp": time.time(),
+        }
+        tmp = _SPEAKING_LOCK + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, _SPEAKING_LOCK)
+    except OSError:
+        pass
+
+
+def _release_speaking_lock():
+    """Clear the cross-process speaking lock."""
+    try:
+        if os.path.exists(_SPEAKING_LOCK):
+            os.remove(_SPEAKING_LOCK)
+    except OSError:
+        pass
+
+
+def _is_any_process_speaking() -> dict | None:
+    """Check if ANY Mod³ process is currently speaking (cross-process)."""
+    try:
+        if not os.path.exists(_SPEAKING_LOCK):
+            return None
+        with open(_SPEAKING_LOCK) as f:
+            lock = json.load(f)
+        # Stale lock check: if older than 60s, ignore it (crashed process)
+        if time.time() - lock.get("timestamp", 0) > 60:
+            os.remove(_SPEAKING_LOCK)
+            return None
+        return lock
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def _bargein_watcher():
     """Background thread that watches for barge-in signal file changes."""
     global _bargein_last_mtime
     import json as _json
-
     while True:
         try:
             import os
-
             if os.path.exists(_BARGEIN_SIGNAL):
                 mtime = os.path.getmtime(_BARGEIN_SIGNAL)
                 if mtime > _bargein_last_mtime:
@@ -384,10 +426,10 @@ def _bargein_watcher():
                     with open(_BARGEIN_SIGNAL) as f:
                         signal = _json.load(f)
                     if signal.get("event") == "user_speaking_start":
+                        # Check local pipeline state first (same process)
                         if pipeline_state.is_speaking:
                             info = pipeline_state.interrupt(reason="barge_in")
                             if info:
-                                # Write interrupt context back to signal file
                                 signal["interrupted"] = {
                                     "spoken_pct": info.spoken_pct,
                                     "delivered_text": info.delivered_text,
@@ -395,9 +437,25 @@ def _bargein_watcher():
                                 }
                                 with open(_BARGEIN_SIGNAL, "w") as f:
                                     _json.dump(signal, f, indent=2)
-                            logging.info(
-                                "Barge-in: paused playback (%.0f%% delivered)", info.spoken_pct * 100 if info else 0
-                            )
+                            logging.info("Barge-in: paused local playback (%.0f%% delivered)", info.spoken_pct * 100 if info else 0)
+                        else:
+                            # Check cross-process lock (another Mod³ process may be speaking)
+                            lock = _is_any_process_speaking()
+                            if lock:
+                                # We can't interrupt another process's pipeline_state,
+                                # but we CAN write the interrupt context from the lock data
+                                signal["interrupted"] = {
+                                    "spoken_pct": 0.0,  # Unknown from cross-process
+                                    "delivered_text": "",
+                                    "full_text": lock.get("text", ""),
+                                    "cross_process": True,
+                                    "source_pid": lock.get("pid"),
+                                }
+                                with open(_BARGEIN_SIGNAL, "w") as f:
+                                    _json.dump(signal, f, indent=2)
+                                # Clear the speaking lock to signal the other process
+                                _release_speaking_lock()
+                                logging.info("Barge-in: cross-process interrupt (pid=%s)", lock.get("pid"))
         except Exception as e:
             logging.debug("Barge-in watcher error: %s", e)
         time.sleep(0.1)  # 100ms poll
@@ -591,6 +649,7 @@ def _run_speech_job(entry: dict) -> None:
 
     # Register with the reflex arc so inbound VAD can interrupt us
     pipeline_state.start_speaking(text, player)
+    _acquire_speaking_lock(job_id, text)
     try:
         for chunk in engine_module.generate_audio(
             text,
@@ -600,6 +659,11 @@ def _run_speech_job(entry: dict) -> None:
             speed=speed,
             emotion=emotion,
         ):
+            # Check if barge-in cleared our speaking lock (cross-process interrupt)
+            if not os.path.exists(_SPEAKING_LOCK):
+                logging.info("Speaking lock cleared by barge-in watcher — stopping generation")
+                player.stop()
+                break
             player.queue_audio(chunk.samples, chunk_meta=chunk.metadata if chunk.metadata else None)
             _set_bus_voice_state(
                 status=ModuleStatus.ENCODING,
@@ -617,6 +681,7 @@ def _run_speech_job(entry: dict) -> None:
     # Final position update and clear speaking state
     pipeline_state.update_position(*player.get_progress())
     pipeline_state.stop_speaking()
+    _release_speaking_lock()
 
     result = metrics.to_dict()
     result["engine"] = engine
@@ -769,14 +834,12 @@ def speak(
     # can't be cleared by stop().
     if user_state == "recording":
         est_duration = _estimate_duration_sec(text, speed)
-        return json.dumps(
-            {
-                "status": "held",
-                "reason": "User is currently speaking — re-send this speak() call after user finishes.",
-                "user_state": "recording",
-                "estimated_duration_sec": round(est_duration, 1),
-            }
-        )
+        return json.dumps({
+            "status": "held",
+            "reason": "User is currently speaking — re-send this speak() call after user finishes.",
+            "user_state": "recording",
+            "estimated_duration_sec": round(est_duration, 1),
+        })
 
     try:
         job_id, position = _start_speech(text, voice, stream=stream, speed=speed, emotion=emotion)
@@ -1079,6 +1142,106 @@ def list_voices() -> str:
     annotations={
         "readOnlyHint": True,
         "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+def await_voice_input(timeout_sec: float = 180.0) -> str:
+    """Block until the user finishes a SuperWhisper recording, then return the transcript.
+
+    This closes the voice input loop: instead of waiting for the user to paste
+    their transcribed text, you can directly receive what they said. Use this
+    when speak() returns "held" (user is recording) or when you want to listen
+    for the next voice input.
+
+    Polls the barge-in signal file for user_speaking_end, then reads the
+    transcript from SuperWhisper's recordings directory.
+
+    Args:
+        timeout_sec: Maximum seconds to wait for recording to finish. Default 180 (3 minutes).
+    """
+    import sqlite3 as _sqlite3
+
+    _sw_db = os.path.expanduser(
+        "~/Library/Application Support/SuperWhisper/database/superwhisper.sqlite"
+    )
+    _rec_dir = os.path.expanduser("~/Documents/superwhisper/recordings")
+
+    start = time.time()
+    # If user is currently recording, wait for them to finish
+    while time.time() - start < timeout_sec:
+        try:
+            if os.path.exists(_BARGEIN_SIGNAL):
+                with open(_BARGEIN_SIGNAL) as f:
+                    signal = json.load(f)
+                if signal.get("event") == "user_speaking_end":
+                    break
+        except (OSError, json.JSONDecodeError):
+            pass
+        time.sleep(0.2)
+    else:
+        return json.dumps({"status": "timeout", "error": f"No recording completed within {timeout_sec}s"})
+
+    # Recording finished — find the latest transcript
+    # Method 1: Check the most recent recording folder's meta.json
+    try:
+        folders = sorted(
+            [d for d in os.listdir(_rec_dir) if d.isdigit()],
+            key=int,
+            reverse=True,
+        )
+        if folders:
+            meta_path = os.path.join(_rec_dir, folders[0], "meta.json")
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                raw = meta.get("rawResult", "").strip()
+                result = meta.get("result", raw).strip()
+                duration_ms = meta.get("duration", 0)
+                return json.dumps({
+                    "status": "ok",
+                    "transcript": result if result else raw,
+                    "raw_transcript": raw,
+                    "duration_sec": round(duration_ms / 1000, 1),
+                    "folder": folders[0],
+                    "source": "superwhisper",
+                })
+    except Exception as e:
+        logger.warning("await_voice_input meta.json fallback failed: %s", e)
+
+    # Method 2: Query SuperWhisper SQLite DB
+    try:
+        conn = _sqlite3.connect(f"file:{_sw_db}?mode=ro", uri=True, timeout=2.0)
+        row = conn.execute(
+            "SELECT folderName, duration FROM recording ORDER BY datetime DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if row:
+            folder_name, duration = row
+            meta_path = os.path.join(_rec_dir, folder_name, "meta.json")
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                raw = meta.get("rawResult", "").strip()
+                result = meta.get("result", raw).strip()
+                return json.dumps({
+                    "status": "ok",
+                    "transcript": result if result else raw,
+                    "raw_transcript": raw,
+                    "duration_sec": round(duration / 1000, 1),
+                    "folder": folder_name,
+                    "source": "superwhisper_db",
+                })
+    except Exception as e:
+        logger.warning("await_voice_input DB fallback failed: %s", e)
+
+    return json.dumps({"status": "error", "error": "Could not retrieve transcript"})
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
     }
@@ -1125,7 +1288,8 @@ def set_output_device(device: str = "") -> str:
     """List audio output devices, or set the active one.
 
     Args:
-        device: Device index (e.g. "3") or name substring (e.g. "AirPods").
+        device: Device index (e.g. "3"), name substring (e.g. "AirPods"),
+                or "default" to track the system default automatically.
                 If empty, lists available devices without changing anything.
     """
     import sounddevice as sd
@@ -1141,11 +1305,15 @@ def set_output_device(device: str = "") -> str:
                 or _output_device == i
                 or (isinstance(_output_device, str) and _output_device in d["name"])
             )
-            outputs.append({"index": i, "name": d["name"], "active": is_active})
+            outputs.append({"index": i, "name": d["name"], "active": is_active, "default": is_default})
 
     if not device:
-        lines = [f"  [{'*' if d['active'] else ' '}] {d['index']}: {d['name']}" for d in outputs]
+        lines = [f"  [{'*' if d['active'] else ' '}] {d['index']}: {d['name']}{' (system default)' if d['default'] else ''}" for d in outputs]
         return "Audio output devices (* = active):\n" + "\n".join(lines)
+
+    if device.lower() == "default":
+        _output_device = None
+        return json.dumps({"status": "ok", "device": "system_default", "note": "Now tracking system default output device"})
 
     if device.isdigit():
         _output_device = int(device)
