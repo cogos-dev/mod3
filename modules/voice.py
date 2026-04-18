@@ -88,7 +88,9 @@ class WhisperDecoder(Decoder):
     - Base (whisper-base-mlx): fast, used for T1 tier (~31ms)
     """
 
-    DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
+    # Downgraded from whisper-large-v3-turbo to base to reduce MLX Metal
+    # pressure (Gemma + Kokoro + Whisper concurrent load segfaults).
+    DEFAULT_MODEL = "mlx-community/whisper-base-mlx"
     BASE_MODEL = "mlx-community/whisper-base-mlx"
 
     def __init__(self, model: str | None = None, load_base: bool = True):

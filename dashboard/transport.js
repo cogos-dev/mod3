@@ -51,6 +51,16 @@ class VoiceTransport {
   }
 
   _dispatch(msg) {
+    // Trace events — cosmetic, never blocks audio/text rendering
+    if (msg.type === "trace_event") {
+      try {
+        if (window.tracePanel && msg.event) window.tracePanel.render(msg.event);
+      } catch (e) {
+        console.warn("[WS] trace_event render failed:", e);
+      }
+      return;
+    }
+
     // Handle base64 audio message — decode and route to onAudio
     if (msg.type === "audio" && msg.data) {
       const binary = atob(msg.data);

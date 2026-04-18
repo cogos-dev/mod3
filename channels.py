@@ -8,6 +8,12 @@ Includes three-tier adaptive STT scheduler:
   T1 (Whisper Base, ~31ms): per-chunk during speech
   T2 (Whisper Large, ~470ms): on natural pause
   T3 (Whisper Large, ~470ms): on end-of-utterance (final)
+
+Server→client WebSocket message types:
+  audio, response_text, response_complete, interrupted,
+  partial_transcript, transcript,
+  trace_event  — kernel cycle-trace events (ADR-083), fanned out via
+                 BrowserChannel.broadcast_trace_event().
 """
 
 from __future__ import annotations
@@ -32,6 +38,12 @@ logger = logging.getLogger("mod3.channels")
 
 class BrowserChannel:
     """WebSocket-backed channel for the browser dashboard."""
+
+    # Registry of currently-active dashboard channels. Used by
+    # broadcast_trace_event() to fan kernel cycle-trace events out to every
+    # connected dashboard client (see ADR-083). Populated in __init__,
+    # pruned in _cleanup.
+    _active_channels: "set[BrowserChannel]" = set()
 
     def __init__(
         self,
@@ -71,6 +83,7 @@ class BrowserChannel:
             modalities=[ModalityType.VOICE, ModalityType.TEXT],
             deliver=self._deliver_sync,
         )
+        BrowserChannel._active_channels.add(self)
         logger.info("BrowserChannel registered: %s", self.channel_id)
 
     # ------------------------------------------------------------------
@@ -425,12 +438,69 @@ class BrowserChannel:
                 self._active = False
 
     # ------------------------------------------------------------------
+    # Trace event broadcast (kernel cycle-trace → dashboards)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def broadcast_trace_event(cls, event: dict) -> None:
+        """Fan a kernel cycle-trace event out to every connected dashboard.
+
+        Per ADR-083, `event` is a pre-parsed CycleEvent dict
+        (id, ts, source, cycle_id, kind, payload). Wrapped in the
+        `{"type": "trace_event", "event": ...}` envelope and sent to each
+        active BrowserChannel's WebSocket. Clients whose send fails are
+        skipped silently (they will be pruned by their own disconnect path).
+        """
+        frame = {"type": "trace_event", "event": event}
+        for ch in list(cls._active_channels):
+            if not ch._active:
+                continue
+            try:
+                asyncio.run_coroutine_threadsafe(ch.ws.send_json(frame), ch._loop)
+            except Exception as exc:  # noqa: BLE001 — disconnected clients are expected
+                logger.debug("trace_event send failed for %s: %s", ch.channel_id, exc)
+
+    @classmethod
+    def broadcast_response_text(cls, text: str, session_id: str | None = None) -> None:
+        """Push an agent-reply text frame to dashboard WebSocket clients.
+
+        Used by the MOD3_USE_COGOS_AGENT response bridge (see
+        `cogos_agent_bridge.run_response_bridge`). The frame matches the
+        existing text-response shape emitted by `_deliver_async` and
+        `send_response_text`: `{"type": "response_text", "text": <text>}`.
+
+        If `session_id` is None (default) the frame is broadcast to every
+        active dashboard channel. When provided, only channels whose
+        `channel_id` matches the `mod3:<channel_id>` convention from
+        `cogos_agent_bridge.post_user_message` receive the frame — this is
+        how future multi-user routing will land, but for v1 a None
+        broadcast is the common case (only one dashboard attached).
+
+        Thread-safe: dispatches each WS send via `run_coroutine_threadsafe`
+        on the channel's own loop, matching `broadcast_trace_event`.
+        """
+        frame = {"type": "response_text", "text": text}
+        expected_channel = None
+        if session_id and session_id.startswith("mod3:"):
+            expected_channel = session_id[len("mod3:"):]
+        for ch in list(cls._active_channels):
+            if not ch._active:
+                continue
+            if expected_channel and ch.channel_id != expected_channel:
+                continue
+            try:
+                asyncio.run_coroutine_threadsafe(ch.ws.send_json(frame), ch._loop)
+            except Exception as exc:  # noqa: BLE001 — disconnected clients are expected
+                logger.debug("response_text send failed for %s: %s", ch.channel_id, exc)
+
+    # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
     def _cleanup(self) -> None:
         """Deactivate channel and cancel pending TTS jobs on disconnect."""
         self._active = False
+        BrowserChannel._active_channels.discard(self)
         ch = self.bus._channels.get(self.channel_id)
         if ch:
             ch.active = False

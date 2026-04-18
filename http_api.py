@@ -67,6 +67,58 @@ async def _warmup_kokoro():
     threading.Thread(target=_do_warmup, daemon=True, name="kokoro-warmup").start()
 
 
+@app.on_event("startup")
+async def _start_bus_bridge():
+    """Launch the kernel-bus → dashboard trace-event bridge.
+
+    Non-blocking: subscriber handles reconnect with backoff, so an unreachable
+    kernel does not fail server startup. Disable with MOD3_BUS_BRIDGE_DISABLED=1.
+    """
+    from bus_bridge_runner import start_bridge
+
+    try:
+        await start_bridge(app.state)
+    except Exception as e:  # noqa: BLE001 — never fail startup on bridge wiring
+        logger.warning("bus-bridge startup failed (non-fatal): %s", e)
+
+
+@app.on_event("shutdown")
+async def _stop_bus_bridge():
+    """Gracefully stop the bus bridge on FastAPI shutdown."""
+    from bus_bridge_runner import stop_bridge
+
+    try:
+        await stop_bridge(app.state, timeout_s=2.0)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("bus-bridge shutdown error (non-fatal): %s", e)
+
+
+@app.on_event("startup")
+async def _start_cogos_agent_bridge():
+    """Launch the cogos-agent response bridge (MOD3_USE_COGOS_AGENT=1).
+
+    No-op unless the env flag is set. Subscribes to `bus_dashboard_response`
+    and forwards assistant replies to the dashboard WS as `response_text`.
+    """
+    from cogos_agent_bridge import start_response_bridge
+
+    try:
+        await start_response_bridge(app.state)
+    except Exception as e:  # noqa: BLE001 — never fail startup on bridge wiring
+        logger.warning("cogos-agent startup failed (non-fatal): %s", e)
+
+
+@app.on_event("shutdown")
+async def _stop_cogos_agent_bridge():
+    """Gracefully stop the cogos-agent response bridge on FastAPI shutdown."""
+    from cogos_agent_bridge import stop_response_bridge
+
+    try:
+        await stop_response_bridge(app.state, timeout_s=2.0)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("cogos-agent shutdown error (non-fatal): %s", e)
+
+
 try:
     from server import _bus as _shared_bus
 except Exception:
