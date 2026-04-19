@@ -3,12 +3,20 @@
 Barge-in signal producer — detects SuperWhisper recording and writes
 the signal file that Mod3's barge-in consumer watches.
 
+DEPRECATED as a standalone script once mod3 absorbs this functionality.
+Prefer the in-process provider at ``mod3.bargein.providers.superwhisper``
+(enabled by setting ``MOD3_BARGEIN_PROVIDERS=superwhisper``), which calls
+into mod3's barge-in consumer directly instead of going through the
+``/tmp/mod3-barge-in.json`` file IPC. This script is retained so existing
+launchd users (e.g. ``com.cogos.bargein-producer.plist``) continue to work
+until they migrate.
+
 Detection method:
   SuperWhisper creates a timestamped directory in its recordings folder
   the instant recording begins (the dir is empty). When recording finishes,
   it writes output.wav and meta.json into that directory. We poll for new
   empty directories to detect start, and for the appearance of output.wav
-  to detect end.
+  (or a matching row in SuperWhisper's SQLite DB) to detect end.
 
 Signal file: /tmp/mod3-barge-in.json
   Start:  {"event": "user_speaking_start", "timestamp": "...", "source": "superwhisper"}
@@ -130,6 +138,32 @@ def _has_output(path: Path) -> bool:
     return (path / "output.wav").exists() or (path / "meta.json").exists()
 
 
+# SuperWhisper SQLite DB — secondary signal for recording completion
+_SW_DB = os.path.expanduser("~/Library/Application Support/SuperWhisper/database/superwhisper.sqlite")
+
+
+def _is_in_db(folder_name: str) -> bool:
+    """Check if SuperWhisper has finished processing this recording.
+
+    SuperWhisper writes to its SQLite DB only AFTER transcription completes.
+    This is the structural ground truth — if the folder is in the DB, the
+    recording is definitely done, regardless of filesystem state.
+    """
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(f"file:{_SW_DB}?mode=ro", uri=True, timeout=1.0)
+        cursor = conn.execute(
+            "SELECT 1 FROM recording WHERE folderName = ? LIMIT 1",
+            (folder_name,),
+        )
+        found = cursor.fetchone() is not None
+        conn.close()
+        return found
+    except Exception:
+        return False
+
+
 _last_dir_mtime: float = 0.0
 
 
@@ -142,12 +176,25 @@ def _scan(state: State, rec_dir: Path):
     """
     global _last_dir_mtime
 
-    # Fast path: if we're tracking an active recording, just check that folder
+    # Fast path: if we're tracking an active recording, check completion signals
     if state.recording and state.active_folder:
         active_path = rec_dir / state.active_folder
+        # Primary: filesystem (output.wav or meta.json appeared)
         if _has_output(active_path):
             state.end()
-        return
+            return
+        # Secondary: SuperWhisper DB (transcription complete — structural ground truth)
+        if _is_in_db(state.active_folder):
+            log.info("DB confirms recording complete (filesystem missed it)")
+            state.end()
+            return
+        # Folder deleted/cancelled
+        if not active_path.exists():
+            log.warning("Active recording folder disappeared, clearing state")
+            state.end()
+            return
+        # Don't return here — fall through to check if directory changed,
+        # so we can detect if a newer recording superseded this one
 
     # Check if directory changed since last scan
     try:
@@ -184,12 +231,18 @@ def _scan(state: State, rec_dir: Path):
 # Staleness guard
 # ---------------------------------------------------------------------------
 
-_STALE_TIMEOUT = 120  # 2 minutes — if a recording folder stays empty this long,
-#                       assume SuperWhisper cancelled/crashed and clear state
+_STALE_TIMEOUT = 150  # 2.5 minutes — if a recording folder stays empty this long,
+#                       assume SuperWhisper cancelled/crashed/system slept and clear state.
+#                       User has long recordings (60s+), so this is generous.
 
 
 def _check_stale(state: State, rec_dir: Path):
-    """Clear recording state if the active folder has been empty too long."""
+    """Clear recording state if the active folder has been empty too long.
+
+    Before clearing, performs a final DB check to confirm the recording
+    isn't still being actively transcribed. This prevents the staleness
+    timeout from invalidating a legitimately long recording session.
+    """
     if not state.recording or not state.active_folder:
         return
     folder = rec_dir / state.active_folder
@@ -199,8 +252,20 @@ def _check_stale(state: State, rec_dir: Path):
     except (OSError, AttributeError):
         return
     if time.time() - ctime > _STALE_TIMEOUT:
-        log.warning("Stale recording detected (>%ds), clearing state", _STALE_TIMEOUT)
-        state.end()
+        # Final gateway: check DB before declaring stale
+        if _is_in_db(state.active_folder):
+            log.info("Stale timeout hit but DB confirms completion — ending normally")
+            state.end()
+        elif _has_output(folder):
+            log.info("Stale timeout hit but output files present — ending normally")
+            state.end()
+        else:
+            # Neither DB nor filesystem confirm completion — truly stale
+            log.warning(
+                "Stale recording (>%ds), no DB entry, no output files — clearing as cancelled/crashed",
+                _STALE_TIMEOUT,
+            )
+            state.end()
 
 
 # ---------------------------------------------------------------------------
@@ -261,9 +326,9 @@ def main():
         while True:
             _scan(state, rec_dir)
 
-            # Check for stale recordings every ~5 seconds
+            # Check for stale recordings every ~2 seconds
             stale_counter += 1
-            if stale_counter >= int(5.0 / POLL_INTERVAL):
+            if stale_counter >= int(2.0 / POLL_INTERVAL):
                 _check_stale(state, rec_dir)
                 stale_counter = 0
 

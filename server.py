@@ -413,9 +413,17 @@ def _is_any_process_speaking() -> dict | None:
 
 
 def _bargein_watcher():
-    """Background thread that watches for barge-in signal file changes."""
+    """Background thread that watches for barge-in signal file changes.
+
+    This path is retained for the standalone ``integrations/bargein-producer.py``
+    producer (and its launchd plist). In-process providers go through
+    ``bargein.BargeinRegistry`` instead, calling the same shared
+    ``handle_bargein_start`` consumer helper.
+    """
     global _bargein_last_mtime
     import json as _json
+
+    from bargein import handle_bargein_start
 
     while True:
         try:
@@ -428,29 +436,31 @@ def _bargein_watcher():
                     with open(_BARGEIN_SIGNAL) as f:
                         signal = _json.load(f)
                     if signal.get("event") == "user_speaking_start":
-                        # Check local pipeline state first (same process)
-                        if pipeline_state.is_speaking:
-                            info = pipeline_state.interrupt(reason="barge_in")
-                            if info:
-                                signal["interrupted"] = {
-                                    "spoken_pct": info.spoken_pct,
-                                    "delivered_text": info.delivered_text,
-                                    "full_text": info.full_text,
-                                }
-                                with open(_BARGEIN_SIGNAL, "w") as f:
-                                    _json.dump(signal, f, indent=2)
-                            logging.info(
-                                "Barge-in: paused local playback (%.0f%% delivered)",
-                                info.spoken_pct * 100 if info else 0,
-                            )
+                        # Shared consumer: check is_speaking + interrupt + log
+                        info = handle_bargein_start(
+                            pipeline_state,
+                            source=signal.get("source", "file_signal"),
+                            metadata={"via": "file_signal"},
+                        )
+                        if info is not None:
+                            # Enrich the on-disk signal so cooperating consumers
+                            # can read the interrupt detail.
+                            signal["interrupted"] = {
+                                "spoken_pct": info.spoken_pct,
+                                "delivered_text": info.delivered_text,
+                                "full_text": info.full_text,
+                            }
+                            with open(_BARGEIN_SIGNAL, "w") as f:
+                                _json.dump(signal, f, indent=2)
                         else:
-                            # Check cross-process lock (another Mod³ process may be speaking)
+                            # Nothing speaking locally — check cross-process lock.
+                            # This path is only meaningful for the file-based IPC
+                            # (another mod3 process owns the speech); in-process
+                            # providers share pipeline_state so never land here.
                             lock = _is_any_process_speaking()
                             if lock:
-                                # We can't interrupt another process's pipeline_state,
-                                # but we CAN write the interrupt context from the lock data
                                 signal["interrupted"] = {
-                                    "spoken_pct": 0.0,  # Unknown from cross-process
+                                    "spoken_pct": 0.0,
                                     "delivered_text": "",
                                     "full_text": lock.get("text", ""),
                                     "cross_process": True,
@@ -458,9 +468,11 @@ def _bargein_watcher():
                                 }
                                 with open(_BARGEIN_SIGNAL, "w") as f:
                                     _json.dump(signal, f, indent=2)
-                                # Clear the speaking lock to signal the other process
                                 _release_speaking_lock()
-                                logging.info("Barge-in: cross-process interrupt (pid=%s)", lock.get("pid"))
+                                logging.info(
+                                    "Barge-in: cross-process interrupt (pid=%s)",
+                                    lock.get("pid"),
+                                )
         except Exception as e:
             logging.debug("Barge-in watcher error: %s", e)
         time.sleep(0.1)  # 100ms poll
@@ -468,6 +480,18 @@ def _bargein_watcher():
 
 _bargein_thread = threading.Thread(target=_bargein_watcher, daemon=True)
 _bargein_thread.start()
+
+
+# ---------------------------------------------------------------------------
+# Barge-in provider registry — in-process providers (SuperWhisper, future:
+# silero VAD, hotkey, etc.). Opt-in via MOD3_BARGEIN_PROVIDERS. Empty default
+# preserves current behavior for users who only run the legacy file producer.
+# ---------------------------------------------------------------------------
+
+from bargein import BargeinRegistry  # noqa: E402
+
+_bargein_registry = BargeinRegistry(pipeline_state)
+_bargein_registry.start_from_env()
 
 
 async def _emit_interruption(info: InterruptInfo):

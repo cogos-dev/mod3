@@ -47,8 +47,11 @@ _jobs: OrderedDict = OrderedDict()
 _jobs_lock = threading.Lock()
 _MAX_JOBS = 50
 
-# Barge-in signal file (same as server.py)
-_BARGEIN_SIGNAL = os.path.expanduser("~/.mod3_bargein_signal.json")
+# Barge-in signal file — must match server.py (_BARGEIN_SIGNAL there).
+# Previously this was ``~/.mod3_bargein_signal.json`` but that was never
+# written by anyone; the canonical path is the one the producer and server
+# already use: /tmp/mod3-barge-in.json.
+_BARGEIN_SIGNAL = os.environ.get("BARGEIN_SIGNAL", "/tmp/mod3-barge-in.json")
 
 
 def _http_request(method: str, path: str, body: dict | None = None, timeout: float = 30.0) -> tuple[int, dict | bytes]:

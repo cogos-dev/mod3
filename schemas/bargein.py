@@ -17,7 +17,7 @@ from typing import Literal
 
 from pipeline_state import InterruptInfo
 
-BargeinSource = Literal["browser_vad", "mcp_signal", "manual"]
+BargeinSource = Literal["browser_vad", "mcp_signal", "manual", "superwhisper"]
 
 
 @dataclass
@@ -43,9 +43,9 @@ class BargeinContext:
         full_text = info.full_text or ""
         spoken = info.delivered_text or ""
         if full_text.startswith(spoken):
-            unspoken = full_text[len(spoken):].strip()
+            unspoken = full_text[len(spoken) :].strip()
         else:
-            unspoken = full_text[len(spoken):].strip()
+            unspoken = full_text[len(spoken) :].strip()
         return cls(
             spoken=spoken,
             unspoken=unspoken,
