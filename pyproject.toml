@@ -1,6 +1,6 @@
 [project]
 name = "mod3"
-version = "0.3.0"
+version = "0.4.0"
 description = "Model Modality Modulator — multi-model TTS + VAD on Apple Silicon"
 requires-python = ">=3.12"
 
