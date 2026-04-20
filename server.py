@@ -507,11 +507,19 @@ def _bargein_watcher():
     producer (and its launchd plist). In-process providers go through
     ``bargein.BargeinRegistry`` instead, calling the same shared
     ``handle_bargein_start`` consumer helper.
+
+    For ``user_speaking_end`` events, the watcher also bridges the file into
+    the registry by dispatching a synthetic ``BargeinEvent`` — that lets
+    registry-side waiters (``await_voice_input``'s ``wait_for_event``) wake
+    from file-based producers without maintaining a second wait path.
+    Feedback is broken by skipping files whose ``via`` marker shows they were
+    written by our own file-mirror subscriber.
     """
     global _bargein_last_mtime
     import json as _json
 
     from bargein import handle_bargein_start
+    from bargein.providers.base import BargeinEvent
 
     while True:
         try:
@@ -523,6 +531,24 @@ def _bargein_watcher():
                     _bargein_last_mtime = mtime
                     with open(_BARGEIN_SIGNAL) as f:
                         signal = _json.load(f)
+                    event_type = signal.get("event")
+                    # Break the file_mirror → watcher → registry feedback loop:
+                    # events the registry itself just mirrored out are marked
+                    # with via=bargein_registry and should not round-trip back.
+                    from_mirror = signal.get("via") == "bargein_registry"
+                    if event_type == "user_speaking_end" and not from_mirror:
+                        # Bridge external producers (integrations/bargein-producer.py)
+                        # into the in-process registry so wait_for_event sees them.
+                        _bargein_registry._dispatch(
+                            BargeinEvent(
+                                source=signal.get("source", "superwhisper"),
+                                event_type="user_speaking_end",
+                                metadata={
+                                    "via": "file_signal",
+                                    **{k: v for k, v in signal.items() if k not in ("event", "source", "timestamp")},
+                                },
+                            )
+                        )
                     if signal.get("event") == "user_speaking_start":
                         # Shared consumer: check is_speaking + interrupt + log
                         info = handle_bargein_start(
@@ -566,14 +592,13 @@ def _bargein_watcher():
         time.sleep(0.1)  # 100ms poll
 
 
-_bargein_thread = threading.Thread(target=_bargein_watcher, daemon=True)
-_bargein_thread.start()
-
-
 # ---------------------------------------------------------------------------
 # Barge-in provider registry — in-process providers (SuperWhisper, future:
 # silero VAD, hotkey, etc.). Opt-in via MOD3_BARGEIN_PROVIDERS. Empty default
 # preserves current behavior for users who only run the legacy file producer.
+#
+# NOTE: the registry is constructed BEFORE the watcher thread starts because
+# the watcher bridges file user_speaking_end events into the registry.
 # ---------------------------------------------------------------------------
 
 from bargein import BargeinRegistry, make_file_mirror_subscriber  # noqa: E402
@@ -584,6 +609,9 @@ _bargein_registry = BargeinRegistry(pipeline_state)
 # keep receiving events from in-process providers like SuperWhisperProvider.
 _bargein_registry.subscribe(make_file_mirror_subscriber(_BARGEIN_SIGNAL))
 _bargein_registry.start_from_env()
+
+_bargein_thread = threading.Thread(target=_bargein_watcher, daemon=True)
+_bargein_thread.start()
 
 
 async def _emit_interruption(info: InterruptInfo):
@@ -1283,13 +1311,14 @@ def await_voice_input(timeout_sec: float = 180.0) -> str:
     when speak() returns "held" (user is recording) or when you want to listen
     for the next voice input.
 
-    Waits on two parallel signal sources, returning when either fires:
-      1. ``BargeinRegistry`` ``user_speaking_end`` events (in-process
-         providers like SuperWhisperProvider).
-      2. The legacy ``/tmp/mod3-barge-in.json`` signal file (standalone
-         producer / cross-process IPC).
+    Single wait path: ``BargeinRegistry.wait_for_event("user_speaking_end", ...)``.
+    Out-of-process producers (``integrations/bargein-producer.py``) write to
+    ``/tmp/mod3-barge-in.json``; the module-level ``_bargein_watcher`` bridges
+    those writes into the registry as synthetic events, so both in-process
+    and out-of-process sources funnel through one wait.
 
-    Then reads the transcript from SuperWhisper's recordings directory.
+    After the wait unblocks, reads the transcript from SuperWhisper's
+    recordings directory (meta.json) or SQLite DB as a fallback.
 
     Args:
         timeout_sec: Maximum seconds to wait for recording to finish. Default 180 (3 minutes).
@@ -1299,34 +1328,8 @@ def await_voice_input(timeout_sec: float = 180.0) -> str:
     _sw_db = os.path.expanduser("~/Library/Application Support/SuperWhisper/database/superwhisper.sqlite")
     _rec_dir = os.path.expanduser("~/Documents/superwhisper/recordings")
 
-    end_signal = threading.Event()
-
-    def _on_end(event):
-        if event.event_type == "user_speaking_end":
-            end_signal.set()
-
-    _bargein_registry.subscribe(_on_end)
-    try:
-        deadline = time.monotonic() + timeout_sec
-        timed_out = True
-        while time.monotonic() < deadline:
-            try:
-                if os.path.exists(_BARGEIN_SIGNAL):
-                    with open(_BARGEIN_SIGNAL) as f:
-                        signal = json.load(f)
-                    if signal.get("event") == "user_speaking_end":
-                        timed_out = False
-                        break
-            except (OSError, json.JSONDecodeError):
-                pass
-            remaining = max(0.0, deadline - time.monotonic())
-            if end_signal.wait(min(0.2, remaining)):
-                timed_out = False
-                break
-    finally:
-        _bargein_registry.unsubscribe(_on_end)
-
-    if timed_out:
+    event = _bargein_registry.wait_for_event("user_speaking_end", timeout=timeout_sec)
+    if event is None:
         return json.dumps({"status": "timeout", "error": f"No recording completed within {timeout_sec}s"})
 
     # Recording finished — find the latest transcript

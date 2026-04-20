@@ -468,5 +468,135 @@ def test_file_mirror_subscriber_writes_event_to_path(tmp_path):
     assert "timestamp" in written
 
 
+# ---------------------------------------------------------------------------
+# await_voice_input — end-to-end regression test for Codex review #4 / Fix 1.
+# The unit tests above cover wait_for_event + make_file_mirror_subscriber in
+# isolation; these lock down the actual mod3 tool function, which is what the
+# original regression (in-process user_speaking_end never waking the tool)
+# was about.
+# ---------------------------------------------------------------------------
+
+
+def test_await_voice_input_returns_when_registry_emits_end(monkeypatch, tmp_path):
+    """Regression: await_voice_input() must return when an in-process provider
+    dispatches user_speaking_end through the registry.
+
+    This is exactly the bug Fix 1 addressed — before the registry-aware wait,
+    await_voice_input only watched the legacy signal file and never saw
+    events from in-process providers like SuperWhisperProvider.
+    """
+    import json as _json
+
+    import server  # noqa: E402
+
+    # Isolate the file signal so we don't race with any existing /tmp state
+    signal_path = str(tmp_path / "mod3-barge-in.json")
+    monkeypatch.setattr(server, "_BARGEIN_SIGNAL", signal_path)
+    monkeypatch.setattr(server, "_bargein_last_mtime", 0.0)
+
+    result_box: list[str] = []
+    t0 = time.monotonic()
+
+    def _caller():
+        result_box.append(server.await_voice_input(timeout_sec=5.0))
+
+    caller = threading.Thread(target=_caller, daemon=True)
+    caller.start()
+
+    # Let await_voice_input subscribe before we dispatch
+    time.sleep(0.2)
+
+    server._bargein_registry._dispatch(
+        BargeinEvent(
+            source="superwhisper",
+            event_type="user_speaking_end",
+            metadata={"folder": "42"},
+        )
+    )
+
+    caller.join(timeout=3.0)
+    elapsed = time.monotonic() - t0
+
+    assert not caller.is_alive(), "await_voice_input did not return after registry dispatch"
+    # 5.0s timeout would mean we missed the event; anything under ~2s means we caught it
+    assert elapsed < 2.5, f"took {elapsed:.2f}s — likely timed out rather than catching the event"
+    assert len(result_box) == 1
+
+    result = _json.loads(result_box[0])
+    # status may be "ok" (if SuperWhisper recordings exist) or "error" (no transcript
+    # to read in this test env), but MUST NOT be "timeout" — that is the regression.
+    assert result["status"] != "timeout", f"timed out despite registry event: {result}"
+
+
+def test_await_voice_input_returns_on_legacy_file_write(monkeypatch, tmp_path):
+    """Backward-compat: out-of-process producers (e.g. integrations/bargein-producer.py)
+    write ``user_speaking_end`` to ``/tmp/mod3-barge-in.json``. await_voice_input()
+    must still wake on that path after the Fix 2 refactor.
+    """
+    import json as _json
+
+    import server  # noqa: E402
+
+    signal_path = str(tmp_path / "mod3-barge-in.json")
+    monkeypatch.setattr(server, "_BARGEIN_SIGNAL", signal_path)
+    monkeypatch.setattr(server, "_bargein_last_mtime", 0.0)
+
+    result_box: list[str] = []
+    t0 = time.monotonic()
+
+    def _caller():
+        result_box.append(server.await_voice_input(timeout_sec=5.0))
+
+    caller = threading.Thread(target=_caller, daemon=True)
+    caller.start()
+
+    # Give await_voice_input a tick to enter its wait
+    time.sleep(0.2)
+
+    # Simulate the legacy producer writing to the signal file
+    with open(signal_path, "w") as f:
+        _json.dump(
+            {
+                "event": "user_speaking_end",
+                "source": "superwhisper",
+                "timestamp": "2026-04-19T00:00:00Z",
+            },
+            f,
+        )
+
+    caller.join(timeout=3.0)
+    elapsed = time.monotonic() - t0
+
+    assert not caller.is_alive(), "await_voice_input did not return after file write"
+    assert elapsed < 2.5, f"took {elapsed:.2f}s — likely timed out rather than reading file"
+    assert len(result_box) == 1
+
+    result = _json.loads(result_box[0])
+    assert result["status"] != "timeout", f"timed out despite file write: {result}"
+
+
+def test_await_voice_input_times_out_when_no_signal(monkeypatch, tmp_path):
+    """If neither source fires, await_voice_input() must actually time out.
+
+    This is the negative control for the two regression tests above — if it
+    always returned quickly, they wouldn't be proving anything.
+    """
+    import json as _json
+
+    import server  # noqa: E402
+
+    signal_path = str(tmp_path / "mod3-barge-in.json")
+    monkeypatch.setattr(server, "_BARGEIN_SIGNAL", signal_path)
+    monkeypatch.setattr(server, "_bargein_last_mtime", 0.0)
+
+    t0 = time.monotonic()
+    raw = server.await_voice_input(timeout_sec=0.4)
+    elapsed = time.monotonic() - t0
+
+    assert 0.3 < elapsed < 2.0, f"timeout path ran for {elapsed:.2f}s"
+    result = _json.loads(raw)
+    assert result["status"] == "timeout"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
