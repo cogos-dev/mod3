@@ -482,25 +482,39 @@ setInterval(checkServices, 30000);
 const audioOutputSelect = document.getElementById('audio-output');
 // _playback declared below with _ws and _transport
 
+const OUTPUT_DEVICE_STORAGE_KEY = 'mod3-output-device';
+
 async function populateOutputDevices() {
   try {
     const devices = await navigator.mediaDevices.enumerateDevices();
     const outputs = devices.filter(d => d.kind === 'audiooutput');
     if (outputs.length === 0) return;
     audioOutputSelect.innerHTML = '';
+    const saved = localStorage.getItem(OUTPUT_DEVICE_STORAGE_KEY);
     let selectedIdx = 0;
+    let sawSaved = false;
     outputs.forEach((d, i) => {
       const opt = document.createElement('option');
       opt.value = d.deviceId;
       opt.textContent = d.label || `Speaker ${i + 1}`;
       audioOutputSelect.appendChild(opt);
+      if (saved && d.deviceId === saved) {
+        selectedIdx = i;
+        sawSaved = true;
+      }
       const label = (d.label || '').toLowerCase();
-      // Prefer device starting with "Default -"
-      if (label.startsWith('default -') || label.startsWith('default —')) {
+      // Prefer device starting with "Default -" only when no saved pick exists
+      if (!sawSaved && (label.startsWith('default -') || label.startsWith('default —'))) {
         selectedIdx = i;
       }
     });
     audioOutputSelect.selectedIndex = selectedIdx;
+    // Push the resolved sink into the Wave 4 audio context now that enumeration
+    // is complete — otherwise first-playback races populateOutputDevices and
+    // pins the sink to whatever the dropdown transiently held.
+    if (window.__mod3AudioSink) {
+      await window.__mod3AudioSink(audioOutputSelect.value);
+    }
   } catch (err) {
     console.warn('Could not enumerate output devices:', err);
   }
@@ -556,6 +570,10 @@ navigator.mediaDevices.addEventListener('devicechange', () => {
 audioOutputSelect.addEventListener('change', async () => {
   const deviceId = audioOutputSelect.value;
   const label = audioOutputSelect.options[audioOutputSelect.selectedIndex].text;
+  // Persist the user's choice so reloads honor it (fixes timing race where
+  // ensureAudioCtx runs before populateOutputDevices and pins the sink to
+  // whatever was transiently first in the select).
+  try { localStorage.setItem(OUTPUT_DEVICE_STORAGE_KEY, deviceId); } catch { /* private mode */ }
   // Legacy chat-path playback
   if (_playback) {
     await _playback.setOutputDevice(deviceId);
