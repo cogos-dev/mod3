@@ -554,10 +554,17 @@ navigator.mediaDevices.addEventListener('devicechange', () => {
 });
 
 audioOutputSelect.addEventListener('change', async () => {
+  const deviceId = audioOutputSelect.value;
+  const label = audioOutputSelect.options[audioOutputSelect.selectedIndex].text;
+  // Legacy chat-path playback
   if (_playback) {
-    await _playback.setOutputDevice(audioOutputSelect.value);
-    console.log('[Output] Switched to:', audioOutputSelect.options[audioOutputSelect.selectedIndex].text);
+    await _playback.setOutputDevice(deviceId);
   }
+  // Wave 4 WebSocket-path AudioContext (new)
+  if (window.__mod3AudioSink) {
+    await window.__mod3AudioSink(deviceId);
+  }
+  console.log('[Output] Switched to:', label);
 });
 
 // --- WebSocket transport reference (shared between voice and text) ---
@@ -1029,12 +1036,39 @@ chatInput.addEventListener('input', () => {
   let reconnectDelay = 1000;
   let currentSessionId = null;
   let pendingHeader = null;  // last JSON header waiting for its binary pair
+  let pendingSinkId = null;  // selected output device id, applied once audioCtx exists
+
+  async function applySinkId(ctx, sinkId) {
+    if (!ctx || typeof ctx.setSinkId !== 'function') return false;
+    // setSinkId accepts "" for default, or a deviceId. Chrome's enumerateDevices
+    // uses "" for the system default; we pass that through.
+    const id = (sinkId == null) ? '' : sinkId;
+    try {
+      await ctx.setSinkId(id);
+      console.log('[AudioWS] sink bound to', id || '(default)');
+      return true;
+    } catch (err) {
+      console.warn('[AudioWS] setSinkId failed:', err);
+      return false;
+    }
+  }
+
+  // Exposed so the outer audio-output <select> handler can push new sinks in.
+  window.__mod3AudioSink = async (deviceId) => {
+    pendingSinkId = deviceId;
+    if (audioCtx) await applySinkId(audioCtx, deviceId);
+  };
 
   function ensureAudioCtx() {
     if (audioCtx) return audioCtx;
     const Ctor = window.AudioContext || window.webkitAudioContext;
     if (!Ctor) { console.error('[AudioWS] Web Audio API unavailable'); return null; }
     audioCtx = new Ctor();
+    // Honor any pre-play device selection (pendingSinkId), else pick up the
+    // currently-selected dropdown value. AudioContext.setSinkId is Chrome 110+.
+    const initialSink = pendingSinkId ?? document.getElementById('audio-output')?.value;
+    if (initialSink != null) applySinkId(audioCtx, initialSink);
+    window.__mod3AudioCtx = audioCtx;  // for diagnostics
     return audioCtx;
   }
 
