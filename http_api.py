@@ -39,6 +39,10 @@ from engine import MODELS, generate_audio, get_loaded_engines
 from modality import EncodedOutput, ModalityType
 from modules.text import TextModule
 from modules.voice import VoiceModule
+from session_registry import (
+    get_default_registry,
+    resolve_output_device,
+)
 from vad import detect_speech_file, is_hallucination
 from vad import is_model_loaded as vad_loaded
 
@@ -244,6 +248,11 @@ class SynthesizeRequest(BaseModel):
     speed: float = Field(default=1.25)
     emotion: float = Field(default=0.5)
     format: str = Field(default="wav", pattern="^(wav|pcm)$")
+    # ADR-082 Phase 1: optional session routing. When present, the
+    # session's assigned_voice overrides ``voice`` (unless an explicit
+    # non-default was passed), and the session is advanced in the global
+    # serializer's round-robin.
+    session_id: str | None = Field(default=None)
 
 
 class SpeechRequest(BaseModel):
@@ -254,6 +263,9 @@ class SpeechRequest(BaseModel):
     voice: str = Field(default="af_heart")
     response_format: str = Field(default="mp3")
     speed: float = Field(default=1.0)
+    # ADR-082 Phase 1 extension — not part of the OpenAI schema but harmless
+    # to accept. When absent, behavior is identical to before Phase 1.
+    session_id: str | None = Field(default=None)
 
 
 class ShutdownRequest(BaseModel):
@@ -261,6 +273,17 @@ class ShutdownRequest(BaseModel):
 
     timeout_sec: float = Field(default=5.0, ge=0, le=60)
     reason: str = Field(default="shutdown-requested")
+
+
+class SessionRegisterRequest(BaseModel):
+    """Register a session with the Mod3 communication bus (ADR-082)."""
+
+    session_id: str
+    participant_id: str
+    participant_type: str = Field(default="agent")
+    preferred_voice: str | None = Field(default=None)
+    preferred_output_device: str = Field(default="system-default")
+    priority: int = Field(default=0)
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +313,39 @@ def synthesize(req: SynthesizeRequest):
     import numpy as np
 
     t_request = time.perf_counter()
+
+    # ADR-082 Phase 1: session routing. If the request names a session, we
+    # honor the session's assigned voice (unless the caller explicitly
+    # picked a non-default voice) and account the job against the session's
+    # queue + serializer so multi-session callers can see round-robin.
+    session_id = req.session_id
+    session_payload: dict | None = None
+    if session_id:
+        registry = get_default_registry()
+        session = registry.get(session_id)
+        if session is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": f"session '{session_id}' is not registered — POST /v1/sessions/register first",
+                },
+            )
+        if req.voice == "bm_lewis" and session.assigned_voice != "bm_lewis":
+            req.voice = session.assigned_voice
+        # Register the submission with the serializer for accounting only.
+        # The synthesize endpoint is non-blocking on the audio side (we
+        # return bytes synchronously), so we do not run the registry's
+        # dispatcher here — we just record the submission.
+        try:
+            registry.submit(session_id, {"type": "synthesize", "text": req.text[:200]})
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("session submit accounting failed: %s", exc)
+        session_payload = {
+            "session_id": session.session_id,
+            "assigned_voice": session.assigned_voice,
+            "preferred_output_device": session.preferred_output_device,
+        }
+
     job_id = _record_job(
         {
             "type": "synthesize",
@@ -301,6 +357,7 @@ def synthesize(req: SynthesizeRequest):
             "emotion": req.emotion,
             "format": req.format,
             "engine": None,
+            "session_id": session_id,
             "timeline": [{"event": "request_received", "t": 0.0}],
         }
     )
@@ -389,6 +446,8 @@ def synthesize(req: SynthesizeRequest):
         "X-Mod3-RTF": f"{duration / gen_time:.2f}" if gen_time > 0 else "0",
         "X-Mod3-Chunks": str(len(chunk_metrics)),
     }
+    if session_payload is not None:
+        headers["X-Mod3-Session-Id"] = session_payload["session_id"]
 
     return Response(content=audio_bytes, media_type=media_type, headers=headers)
 
@@ -399,6 +458,30 @@ def audio_speech(req: SpeechRequest):
     import numpy as np
 
     t_request = time.perf_counter()
+
+    # ADR-082 Phase 1: optional session routing. Same semantics as
+    # /v1/synthesize — the session's assigned voice overrides ``voice`` when
+    # the caller passed the default, and the submission is accounted against
+    # the session's queue.
+    session_id = req.session_id
+    if session_id:
+        registry = get_default_registry()
+        session = registry.get(session_id)
+        if session is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": f"session '{session_id}' is not registered — POST /v1/sessions/register first",
+                },
+            )
+        # OpenAI default is af_heart; if the caller left it at the default,
+        # prefer the session's voice.
+        if req.voice == "af_heart" and session.assigned_voice != "af_heart":
+            req.voice = session.assigned_voice
+        try:
+            registry.submit(session_id, {"type": "audio_speech", "text": req.input[:200]})
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("session submit accounting failed: %s", exc)
 
     voice = req.voice
     try:
@@ -414,6 +497,7 @@ def audio_speech(req: SpeechRequest):
             "text": req.input[:200],
             "voice": voice,
             "speed": req.speed,
+            "session_id": session_id,
             "timeline": [{"event": "request_received", "t": 0.0}],
         }
     )
@@ -464,6 +548,8 @@ def audio_speech(req: SpeechRequest):
         "X-Mod3-Gen-Time-Sec": f"{gen_time:.3f}",
         "X-Mod3-Total-Time-Sec": f"{total_time:.3f}",
     }
+    if session_id:
+        headers["X-Mod3-Session-Id"] = session_id
 
     return Response(content=audio_bytes, media_type="audio/wav", headers=headers)
 
@@ -648,6 +734,81 @@ def stop_speech(job_id: str = ""):
             }
     except ImportError:
         return JSONResponse(status_code=503, content={"error": "Speech queue not available in HTTP-only mode"})
+
+
+# ---------------------------------------------------------------------------
+# Sessions — ADR-082 Phase 1
+# ---------------------------------------------------------------------------
+
+
+@app.post("/v1/sessions/register")
+def session_register(req: SessionRegisterRequest):
+    """Register a session with the Mod3 communication bus (ADR-082).
+
+    Body:
+      {
+        "session_id": "...",
+        "participant_id": "cog" | "sandy" | "slowbro" | ...,
+        "participant_type": "agent" | "user",
+        "preferred_voice": "bm_lewis" | ... | null,
+        "preferred_output_device": "system-default" | "<device-name>"
+      }
+
+    Returns the SessionChannel with a live-resolved output_device.
+    """
+    registry = get_default_registry()
+    try:
+        result = registry.register(
+            session_id=req.session_id,
+            participant_id=req.participant_id,
+            participant_type=req.participant_type,
+            preferred_voice=req.preferred_voice,
+            preferred_output_device=req.preferred_output_device or "system-default",
+            priority=req.priority,
+        )
+    except Exception as exc:  # noqa: BLE001 — surface the error verbatim
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+    payload = result.session.to_dict(device_resolver=resolve_output_device)
+    payload["created"] = result.created
+    # Top-level live device snapshot so the caller does not have to
+    # round-trip; the nested one is available for debugging.
+    payload["output_device"] = registry.resolve_device(result.session.session_id).to_dict()
+    return payload
+
+
+@app.post("/v1/sessions/{session_id}/deregister")
+def session_deregister(session_id: str):
+    """Drop a session — drains/cancels pending jobs, returns voice to pool."""
+    registry = get_default_registry()
+    result = registry.deregister(session_id)
+    if result.get("status") == "not_found":
+        return JSONResponse(status_code=404, content=result)
+    return result
+
+
+@app.get("/v1/sessions")
+def session_list():
+    """List all registered sessions plus a serializer snapshot."""
+    registry = get_default_registry()
+    return {
+        "sessions": registry.list_serialized(),
+        "serializer": registry.serializer.snapshot(),
+        "voice_pool": registry.voice_pool(),
+        "voice_holders": registry.voice_holder_snapshot(),
+    }
+
+
+@app.get("/v1/sessions/{session_id}")
+def session_get(session_id: str):
+    """Get a single session's current state (with live device resolution)."""
+    registry = get_default_registry()
+    session = registry.get(session_id)
+    if session is None:
+        return JSONResponse(status_code=404, content={"error": f"session '{session_id}' not found"})
+    payload = session.to_dict(device_resolver=resolve_output_device)
+    payload["output_device"] = registry.resolve_device(session_id).to_dict()
+    return payload
 
 
 @app.get("/health")

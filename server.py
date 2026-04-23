@@ -40,6 +40,11 @@ from bus import ModalityBus
 from modality import ModalityType, ModuleStatus
 from modules.voice import PlaceholderDecoder, VoiceModule
 from pipeline_state import InterruptInfo, PipelineState
+from session_registry import (
+    ResolvedOutputDevice,
+    get_default_registry,
+    resolve_output_device,
+)
 
 logger = logging.getLogger("mod3.server")
 
@@ -748,6 +753,28 @@ def _estimate_duration_sec(text: str, speed: float) -> float:
     return (words / 150.0) * 60.0 / speed
 
 
+def _resolve_device_for_entry(entry: dict) -> tuple[int | str | None, ResolvedOutputDevice | None]:
+    """Resolve the output device for a speech job, live.
+
+    Priority (per the ADR-082 2026-04-22 amendment):
+      1. If the job's session has a preferred_output_device, re-query live —
+         "system-default" always reads the current OS default, and named
+         devices are enumerated per dispatch.
+      2. Otherwise fall back to the legacy ``_output_device`` module global
+         set by set_output_device() so existing callers keep working.
+    """
+    session_id = entry.get("session_id")
+    if session_id:
+        try:
+            registry = get_default_registry()
+            resolved = registry.resolve_device(session_id)
+            entry["resolved_device"] = resolved
+            return resolved.index, resolved
+        except Exception as exc:  # noqa: BLE001 — never fail synthesis on resolution
+            logger.warning("device resolution failed for session %s: %s", session_id, exc)
+    return _output_device, None
+
+
 def _run_speech_job(entry: dict) -> None:
     """Execute a single speech job (blocking). Called from the drain thread."""
     global _last_metrics, _current_player
@@ -765,7 +792,8 @@ def _run_speech_job(entry: dict) -> None:
         AdaptivePlayer = _adaptive_player_class()
         engine, resolved_voice = _resolve_voice_via_bus(voice)
         model = engine_module.get_model(engine)
-        player = AdaptivePlayer(sample_rate=model.sample_rate, device=_output_device)
+        device, _resolved = _resolve_device_for_entry(entry)
+        player = AdaptivePlayer(sample_rate=model.sample_rate, device=device)
     except Exception as e:
         _jobs[job_id]["status"] = "error"
         _jobs[job_id]["error"] = str(e)
@@ -865,10 +893,17 @@ def _start_speech(
     streaming_interval: float = 1.0,
     speed: float = 1.0,
     emotion: float = 0.5,
+    session_id: str | None = None,
 ) -> tuple[str, int]:
     """Submit speech to the queue. Returns (job_id, queue_position).
 
     queue_position is 0 if playing immediately, >0 if queued behind others.
+
+    When ``session_id`` is provided, the job is tagged with it so the drain
+    thread can live-resolve the session's preferred output device before
+    playback. Voice selection still uses the explicit ``voice`` argument —
+    callers should pass the session's assigned_voice when registering a job
+    against a session.
     """
     job_id = uuid.uuid4().hex[:8]
     _jobs[job_id] = {
@@ -884,20 +919,21 @@ def _start_speech(
         "player": None,
         "speed": speed,
         "estimated_duration_sec": round(_estimate_duration_sec(text, speed), 1),
+        "session_id": session_id,
     }
     _prune_jobs()
 
-    position = _speech_queue.enqueue(
-        job_id,
-        {
-            "text": text,
-            "voice": voice,
-            "stream": stream,
-            "streaming_interval": streaming_interval,
-            "speed": speed,
-            "emotion": emotion,
-        },
-    )
+    entry = {
+        "text": text,
+        "voice": voice,
+        "stream": stream,
+        "streaming_interval": streaming_interval,
+        "speed": speed,
+        "emotion": emotion,
+    }
+    if session_id:
+        entry["session_id"] = session_id
+    position = _speech_queue.enqueue(job_id, entry)
     return job_id, position
 
 
@@ -947,6 +983,7 @@ def speak(
     stream: bool = True,
     speed: float = 1.25,
     emotion: float = 0.5,
+    session_id: str = "",
 ) -> str:
     """Synthesize text to speech and play it through the user's speakers.
 
@@ -966,9 +1003,38 @@ def speak(
                 If False, generates all audio first then plays (better prosody).
         speed: Speed multiplier (engines with speed support). Default 1.25.
         emotion: Emotion/exaggeration intensity 0.0-1.0 (Chatterbox only). Default 0.5.
+        session_id: Optional ADR-082 session id. When provided and the session
+                    is registered (see register_session), the job is routed
+                    through the per-session queue and the session's assigned
+                    voice + preferred_output_device are used. When empty,
+                    falls back to today's global-queue behavior for backward
+                    compatibility.
     """
     if not text.strip():
         return json.dumps({"status": "error", "error": "Nothing to say"})
+
+    # Route through the session registry when session_id is provided.
+    # If the session is registered, its assigned_voice overrides the ``voice``
+    # argument unless the caller explicitly passed a non-default voice — the
+    # ADR treats voice as a session identity attribute, not a per-call knob.
+    effective_session_id: str | None = session_id or None
+    if effective_session_id:
+        registry = get_default_registry()
+        session = registry.get(effective_session_id)
+        if session is None:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": f"session '{effective_session_id}' is not registered — call register_session first",
+                }
+            )
+        # If caller did not pass an explicit non-default voice, use the
+        # session's assigned voice. "bm_lewis" is the old default so we can't
+        # distinguish "explicit bm_lewis" from "unspecified"; tolerate that
+        # and only override when the caller asks for the default.
+        if voice == "bm_lewis" and session.assigned_voice != "bm_lewis":
+            voice = session.assigned_voice
+        session.state = "speaking"
 
     # Check if user is currently speaking (barge-in signal file)
     user_state = "idle"
@@ -999,7 +1065,14 @@ def speak(
         )
 
     try:
-        job_id, position = _start_speech(text, voice, stream=stream, speed=speed, emotion=emotion)
+        job_id, position = _start_speech(
+            text,
+            voice,
+            stream=stream,
+            speed=speed,
+            emotion=emotion,
+            session_id=effective_session_id,
+        )
     except ValueError as e:
         return json.dumps({"status": "error", "error": str(e)})
     except Exception as e:
@@ -1478,6 +1551,95 @@ def set_output_device(device: str = "") -> str:
         _output_device = device
 
     return json.dumps({"status": "ok", "device": _output_device})
+
+
+# ---------------------------------------------------------------------------
+# Session registry (ADR-082 Phase 1)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def register_session(
+    session_id: str,
+    participant_id: str,
+    participant_type: str = "agent",
+    preferred_voice: str = "",
+    preferred_output_device: str = "system-default",
+) -> str:
+    """Register a session with the Mod3 communication bus (ADR-082).
+
+    Each registered session gets its own output queue, an assigned voice
+    from the ranked pool, and a preferred output device. The global
+    serializer interleaves speech across sessions (round-robin by default)
+    so two concurrent agents do not collide on the shared speaker.
+
+    Args:
+        session_id: Caller-chosen id (e.g., the Claude Code session id).
+        participant_id: Identity of the speaker (e.g., 'cog', 'sandy', 'slowbro').
+        participant_type: 'agent' or 'user'. Free-form beyond that.
+        preferred_voice: Optional voice preset. If taken, voice_conflict=true
+                         is returned but assignment still succeeds.
+        preferred_output_device: 'system-default' (re-queried per playback),
+                                 a device-name substring, or a numeric index.
+    """
+    registry = get_default_registry()
+    result = registry.register(
+        session_id=session_id,
+        participant_id=participant_id,
+        participant_type=participant_type,
+        preferred_voice=preferred_voice or None,
+        preferred_output_device=preferred_output_device or "system-default",
+    )
+    payload = result.session.to_dict(device_resolver=resolve_output_device)
+    payload["status"] = "ok"
+    payload["created"] = result.created
+    # Also expose a live-resolved device at the top level for convenience —
+    # callers can log or display it without walking nested keys.
+    live = registry.resolve_device(result.session.session_id)
+    payload["output_device"] = live.to_dict()
+    return json.dumps(payload)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def deregister_session(session_id: str) -> str:
+    """Release a session's voice and drop its pending jobs."""
+    registry = get_default_registry()
+    result = registry.deregister(session_id)
+    return json.dumps(result)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def list_sessions() -> str:
+    """List all registered sessions with live device resolution."""
+    registry = get_default_registry()
+    return json.dumps(
+        {
+            "status": "ok",
+            "sessions": registry.list_serialized(),
+            "serializer": registry.serializer.snapshot(),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
