@@ -194,9 +194,24 @@ def _extract_response_text(payload: dict) -> Optional[str]:
 async def run_response_bridge(subscriber: KernelBusSubscriber) -> None:
     """Consume `subscriber` and broadcast agent replies to dashboard clients.
 
-    `BrowserChannel.broadcast_response_text()` is thread-safe via
-    `run_coroutine_threadsafe`, matching the existing trace-event pattern.
-    Malformed events (no recoverable text) are logged at debug and skipped.
+    Each kernel `agent_response` event on `bus_dashboard_response` is a
+    complete per-turn reply (see `apps/cogos/agent_tools_respond.go` — the
+    `respond` tool is documented as "call at most once per user turn" and
+    the auto-fallback publishes once if the model skipped the tool call).
+    We therefore emit two dashboard frames per kernel event:
+
+      * ``broadcast_response_text`` — the reply body (chat panel render)
+      * ``broadcast_response_complete`` — the turn-done signal so the UI's
+        per-turn spinner clears. Without this, the dashboard hangs
+        awaiting completion because the kernel path never reaches the
+        ``send_response_complete`` call that the local-inference branch
+        emits at ``agent_loop._process`` ~L300.
+
+    ``BrowserChannel.broadcast_response_{text,complete}()`` are thread-safe
+    via ``run_coroutine_threadsafe``, matching the existing trace-event
+    pattern. Malformed events (no recoverable text) are logged at debug
+    and skipped — we do NOT emit a completion frame for skipped events
+    (keeps the 1:1 pairing with what the UI actually rendered).
     """
     first_event_logged = False
     forwarded = 0
@@ -221,6 +236,16 @@ async def run_response_bridge(subscriber: KernelBusSubscriber) -> None:
         session_id = _extract_session_id(env.payload)
         try:
             BrowserChannel.broadcast_response_text(text, session_id=session_id)
+            # Pair the text frame with a completion frame so the dashboard's
+            # per-turn "awaiting response" state clears. Kernel emits exactly
+            # one agent_response per user turn, so one complete per event is
+            # the correct cardinality.
+            metrics: dict = {"provider": "cogos-agent"}
+            if env.event_id:
+                metrics["event_id"] = env.event_id
+            if env.ts:
+                metrics["kernel_ts"] = env.ts
+            BrowserChannel.broadcast_response_complete(metrics, session_id=session_id)
             forwarded += 1
             logger.debug(
                 "cogos-agent: forwarded response event_id=%s session=%s (total=%d)",

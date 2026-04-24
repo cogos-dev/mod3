@@ -42,6 +42,14 @@ _current_player_lock = threading.Lock()
 _current_sd_stream = None
 _playback_interrupt = threading.Event()
 
+# ADR-082 Phase 1: local session state. Populated by tool_register_session
+# so tool_speak can live-resolve the session's preferred output device
+# before each playback. The HTTP service owns the canonical registry; this
+# is a thin cache so the shim does not have to re-query per play.
+_shim_sessions: dict[str, dict[str, Any]] = {}
+_shim_sessions_lock = threading.Lock()
+_active_session_id: str | None = None
+
 # Job tracking (lightweight — just for speak/stop/status)
 _jobs: OrderedDict = OrderedDict()
 _jobs_lock = threading.Lock()
@@ -86,7 +94,92 @@ def _http_request(method: str, path: str, body: dict | None = None, timeout: flo
         return 0, {"error": f"Request failed: {e}"}
 
 
-def _play_wav_bytes(wav_bytes: bytes, job_id: str):
+def _resolve_device_live(preferred: str | None) -> tuple[Any, dict[str, Any]]:
+    """Resolve an output device live, per the ADR-082 2026-04-22 amendment.
+
+    ``preferred`` mirrors the SessionChannel field: "system-default" re-queries
+    the OS default immediately; a named device is resolved by substring
+    against the current device list; a numeric string picks by index; and
+    ``None`` falls back to the legacy ``_output_device`` module global.
+
+    Returns ``(device_arg, diag)`` where ``device_arg`` is ready to pass to
+    ``sd.play(device=...)`` and ``diag`` is a dict describing how we resolved
+    for logging / responses.
+    """
+    try:
+        import sounddevice as sd
+    except ImportError:
+        return None, {"preferred": preferred, "index": None, "reason": "sounddevice not installed"}
+
+    if preferred is None:
+        return _output_device, {
+            "preferred": None,
+            "index": _output_device if isinstance(_output_device, int) else None,
+            "reason": "legacy module default",
+        }
+
+    pref = preferred.strip() if isinstance(preferred, str) else "system-default"
+    if not pref or pref.lower() in ("system-default", "default"):
+        # Live re-query. sd.default.device is (input, output) — we want output.
+        try:
+            devices = sd.query_devices()
+            default_tuple = sd.default.device
+            idx = default_tuple[1] if isinstance(default_tuple, (tuple, list)) else None
+            if isinstance(idx, int) and 0 <= idx < len(devices):
+                return idx, {
+                    "preferred": pref,
+                    "index": idx,
+                    "name": devices[idx].get("name", ""),
+                    "reason": "OS default (live-queried)",
+                }
+        except Exception as exc:  # noqa: BLE001
+            return None, {"preferred": pref, "index": None, "reason": f"default query failed: {exc}"}
+        return None, {"preferred": pref, "index": None, "reason": "OS default unknown"}
+
+    # Named / indexed device
+    try:
+        devices = sd.query_devices()
+    except Exception as exc:  # noqa: BLE001
+        return None, {"preferred": pref, "index": None, "reason": f"query failed: {exc}"}
+
+    if pref.isdigit():
+        i = int(pref)
+        if 0 <= i < len(devices) and devices[i].get("max_output_channels", 0) > 0:
+            return i, {
+                "preferred": pref,
+                "index": i,
+                "name": devices[i].get("name", ""),
+                "reason": "index match",
+            }
+
+    low = pref.lower()
+    for i, d in enumerate(devices):
+        if d.get("max_output_channels", 0) > 0 and low in str(d.get("name", "")).lower():
+            return i, {
+                "preferred": pref,
+                "index": i,
+                "name": d.get("name", ""),
+                "reason": "name match",
+            }
+
+    # Fall back to system default — identity just changed devices.
+    try:
+        default_tuple = sd.default.device
+        idx = default_tuple[1] if isinstance(default_tuple, (tuple, list)) else None
+        if isinstance(idx, int) and 0 <= idx < len(devices):
+            return idx, {
+                "preferred": pref,
+                "index": idx,
+                "name": devices[idx].get("name", ""),
+                "fallback": True,
+                "reason": f"named device '{pref}' unavailable — fell back to system default",
+            }
+    except Exception:
+        pass
+    return None, {"preferred": pref, "index": None, "fallback": True, "reason": "no match, no default"}
+
+
+def _play_wav_bytes(wav_bytes: bytes, job_id: str, session_id: str | None = None):
     """Play WAV audio bytes through speakers via sounddevice."""
     global _current_sd_stream
     try:
@@ -126,7 +219,30 @@ def _play_wav_bytes(wav_bytes: bytes, job_id: str):
                 _jobs[job_id]["duration_sec"] = round(duration, 2)
 
         _playback_interrupt.clear()
-        device = _output_device
+
+        # Live device resolution per playback. If the session pins a device,
+        # honor it; if it's system-default, re-read OS default now. This is
+        # the core of the ADR-082 2026-04-22 amendment.
+        preferred: str | None = None
+        if session_id:
+            with _shim_sessions_lock:
+                cfg = _shim_sessions.get(session_id)
+            if cfg is not None:
+                preferred = cfg.get("preferred_output_device", "system-default")
+        if preferred is None and _active_session_id:
+            with _shim_sessions_lock:
+                cfg = _shim_sessions.get(_active_session_id)
+            if cfg is not None:
+                preferred = cfg.get("preferred_output_device", "system-default")
+
+        if preferred is not None:
+            device, diag = _resolve_device_live(preferred)
+            with _jobs_lock:
+                if job_id in _jobs:
+                    _jobs[job_id]["device_resolution"] = diag
+        else:
+            device = _output_device
+
         with _current_player_lock:
             _current_sd_stream = job_id
 
@@ -165,9 +281,21 @@ def _estimate_duration(text: str, speed: float) -> float:
 
 
 def tool_speak(
-    text: str, voice: str = "bm_lewis", stream: bool = True, speed: float = 1.25, emotion: float = 0.5
+    text: str,
+    voice: str = "bm_lewis",
+    stream: bool = True,
+    speed: float = 1.25,
+    emotion: float = 0.5,
+    session_id: str = "",
 ) -> str:
-    """Synthesize via HTTP, play locally."""
+    """Synthesize via HTTP, play locally.
+
+    When ``session_id`` is provided, the HTTP call includes it so the server
+    routes through ADR-082 session-aware playback (assigned voice,
+    preferred output device). The shim resolves its own preferred output
+    device live from its cached session info — each playback picks up the
+    current OS default.
+    """
     if not text.strip():
         return json.dumps({"status": "error", "error": "Nothing to say"})
 
@@ -189,16 +317,20 @@ def tool_speak(
         pass
 
     # Request synthesis from HTTP service
+    synth_body: dict[str, Any] = {
+        "text": text,
+        "voice": voice,
+        "speed": speed,
+        "emotion": emotion,
+        "format": "wav",
+    }
+    if session_id:
+        synth_body["session_id"] = session_id
+
     status, resp = _http_request(
         "POST",
         "/v1/synthesize",
-        {
-            "text": text,
-            "voice": voice,
-            "speed": speed,
-            "emotion": emotion,
-            "format": "wav",
-        },
+        synth_body,
         timeout=60.0,
     )
 
@@ -218,14 +350,19 @@ def tool_speak(
             "text": text[:100],
             "voice": voice,
             "created": time.time(),
+            "session_id": session_id or None,
         }
         while len(_jobs) > _MAX_JOBS:
             _jobs.popitem(last=False)
 
-    t = threading.Thread(target=_play_wav_bytes, args=(resp, job_id), daemon=True)
+    t = threading.Thread(
+        target=_play_wav_bytes,
+        args=(resp, job_id, session_id or None),
+        daemon=True,
+    )
     t.start()
 
-    return json.dumps({"status": "speaking", "job_id": job_id})
+    return json.dumps({"status": "speaking", "job_id": job_id, "session_id": session_id or None})
 
 
 def tool_stop(job_id: str = "") -> str:
@@ -415,6 +552,78 @@ def tool_await_voice_input(timeout_sec: float = 180.0) -> str:
     return json.dumps({"status": "error", "error": "Could not retrieve transcript"})
 
 
+def tool_register_session(
+    session_id: str,
+    participant_id: str,
+    participant_type: str = "agent",
+    preferred_voice: str = "",
+    preferred_output_device: str = "system-default",
+) -> str:
+    """Register a session with the Mod3 bus (ADR-082 Phase 1).
+
+    Forwards to POST /v1/sessions/register on the HTTP service, then caches
+    the result locally so future tool_speak() calls can live-resolve the
+    session's preferred output device before each playback.
+    """
+    global _active_session_id
+
+    body: dict[str, Any] = {
+        "session_id": session_id,
+        "participant_id": participant_id,
+        "participant_type": participant_type,
+        "preferred_output_device": preferred_output_device or "system-default",
+    }
+    if preferred_voice:
+        body["preferred_voice"] = preferred_voice
+
+    status, resp = _http_request("POST", "/v1/sessions/register", body, timeout=10.0)
+    if status != 200:
+        err = resp.get("error", f"HTTP {status}") if isinstance(resp, dict) else f"HTTP {status}"
+        return json.dumps({"status": "error", "error": err})
+
+    # Cache locally — the playback path reads preferred_output_device from
+    # here each play.
+    if isinstance(resp, dict):
+        with _shim_sessions_lock:
+            _shim_sessions[session_id] = {
+                "participant_id": participant_id,
+                "participant_type": participant_type,
+                "assigned_voice": resp.get("assigned_voice"),
+                "preferred_output_device": resp.get("preferred_output_device", "system-default"),
+            }
+            _active_session_id = session_id
+        resp["status"] = "ok"
+        return json.dumps(resp)
+    return json.dumps({"status": "error", "error": "unexpected response shape"})
+
+
+def tool_deregister_session(session_id: str) -> str:
+    """Release a session's voice and drop pending jobs (ADR-082 Phase 1)."""
+    global _active_session_id
+    status, resp = _http_request("POST", f"/v1/sessions/{session_id}/deregister", {}, timeout=5.0)
+    with _shim_sessions_lock:
+        _shim_sessions.pop(session_id, None)
+        if _active_session_id == session_id:
+            _active_session_id = None
+    if status == 200 and isinstance(resp, dict):
+        return json.dumps(resp)
+    if status == 404:
+        return json.dumps({"status": "not_found", "session_id": session_id})
+    err = resp.get("error", f"HTTP {status}") if isinstance(resp, dict) else f"HTTP {status}"
+    return json.dumps({"status": "error", "error": err})
+
+
+def tool_list_sessions() -> str:
+    """List all registered sessions (ADR-082 Phase 1)."""
+    status, resp = _http_request("GET", "/v1/sessions", timeout=5.0)
+    if status != 200:
+        return json.dumps({"status": "error", "error": f"HTTP {status}"})
+    if isinstance(resp, dict):
+        resp["status"] = "ok"
+        return json.dumps(resp)
+    return json.dumps({"status": "error", "error": "unexpected response shape"})
+
+
 def tool_vad_check(file_path: str, threshold: float = 0.5) -> str:
     """VAD check via HTTP."""
     if not os.path.exists(file_path):
@@ -502,6 +711,15 @@ TOOLS = [
                     "type": "number",
                     "default": 0.5,
                     "description": "Emotion/exaggeration intensity 0.0-1.0 (Chatterbox only). Default 0.5.",
+                },
+                "session_id": {
+                    "type": "string",
+                    "default": "",
+                    "description": (
+                        "Optional ADR-082 session id. When set and the session is registered, "
+                        "playback uses the session's assigned voice + preferred_output_device "
+                        "(live-resolved per playback). When empty, behaves as before."
+                    ),
                 },
             },
             "required": ["text"],
@@ -629,6 +847,73 @@ TOOLS = [
             "required": ["file_path"],
         },
     },
+    {
+        "name": "register_session",
+        "description": (
+            "Register a session with the Mod3 communication bus (ADR-082 Phase 1).\n\n"
+            "Each registered session gets its own output queue, an assigned voice from\n"
+            "the ranked pool, and a preferred output device that is re-queried live per\n"
+            "playback when set to 'system-default'. Multiple sessions share one physical\n"
+            "speaker via a global round-robin serializer.\n\n"
+            "Args:\n"
+            "    session_id: Caller-chosen id (e.g., the Claude Code session id).\n"
+            "    participant_id: Identity of the speaker (e.g., 'cog', 'sandy', 'alice').\n"
+            "    participant_type: 'agent' or 'user'. Free-form beyond that.\n"
+            "    preferred_voice: Optional voice preset (e.g., 'bm_lewis'). If taken,\n"
+            "                     voice_conflict=true is returned but assignment still succeeds.\n"
+            "    preferred_output_device: 'system-default' (re-queried per playback), a\n"
+            "                             device-name substring, or a numeric index."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Caller-chosen session id."},
+                "participant_id": {
+                    "type": "string",
+                    "description": "Identity of the speaker (e.g., 'cog', 'sandy', 'alice').",
+                },
+                "participant_type": {
+                    "type": "string",
+                    "default": "agent",
+                    "description": "'agent' or 'user'. Free-form beyond that.",
+                },
+                "preferred_voice": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Optional voice preset. If taken, voice_conflict is flagged.",
+                },
+                "preferred_output_device": {
+                    "type": "string",
+                    "default": "system-default",
+                    "description": "'system-default', device-name substring, or numeric index.",
+                },
+            },
+            "required": ["session_id", "participant_id"],
+        },
+    },
+    {
+        "name": "deregister_session",
+        "description": (
+            "Release a session's voice and drop its pending jobs (ADR-082 Phase 1).\n\n"
+            "Call at session end so the voice can be allocated to a new session."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Session id to deregister."},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "list_sessions",
+        "description": (
+            "List all registered sessions with live device resolution (ADR-082 Phase 1).\n\n"
+            "Returns each session's assigned voice, preferred output device, queue depth,\n"
+            "and the serializer's current state (policy + round-robin cursor)."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 TOOL_DISPATCH = {
@@ -638,6 +923,7 @@ TOOL_DISPATCH = {
         stream=args.get("stream", True),
         speed=args.get("speed", 1.25),
         emotion=args.get("emotion", 0.5),
+        session_id=args.get("session_id", ""),
     ),
     "speech_status": lambda args: tool_speech_status(
         job_id=args.get("job_id", ""),
@@ -656,6 +942,17 @@ TOOL_DISPATCH = {
         file_path=args["file_path"],
         threshold=args.get("threshold", 0.5),
     ),
+    "register_session": lambda args: tool_register_session(
+        session_id=args["session_id"],
+        participant_id=args["participant_id"],
+        participant_type=args.get("participant_type", "agent"),
+        preferred_voice=args.get("preferred_voice", ""),
+        preferred_output_device=args.get("preferred_output_device", "system-default"),
+    ),
+    "deregister_session": lambda args: tool_deregister_session(
+        session_id=args["session_id"],
+    ),
+    "list_sessions": lambda args: tool_list_sessions(),
 }
 
 

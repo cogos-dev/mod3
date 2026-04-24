@@ -92,6 +92,17 @@ def _broadcast_with_loop(text: str, session_id: str | None = None) -> None:
         loop.close()
 
 
+def _broadcast_complete_with_loop(metrics: dict | None = None, session_id: str | None = None) -> None:
+    """Sibling of _broadcast_with_loop for the response_complete frame."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        with patch("channels.asyncio.run_coroutine_threadsafe", _patched_run):
+            BrowserChannel.broadcast_response_complete(metrics, session_id=session_id)
+    finally:
+        loop.close()
+
+
 def test_broadcast_with_no_session_id_fans_out_to_all_active_channels():
     loop = asyncio.new_event_loop()
     a = _FakeChannel("browser:aaa", loop)
@@ -165,6 +176,79 @@ def test_broadcast_session_id_with_no_match_drops_silently():
     _broadcast_with_loop("for a ghost", session_id="mod3:browser:zzz")
 
     assert a.ws.sent == []
+
+    loop.close()
+
+
+# ---------------------------------------------------------------------------
+# response_complete routing (kernel-path turn-done signal)
+#
+# Paired with broadcast_response_text in cogos_agent_bridge.run_response_bridge;
+# must follow the same session-scoped routing so the complete-frame lands on
+# the originating dashboard channel (otherwise multi-client setups see
+# cross-talk or hang on a non-matching spinner).
+# ---------------------------------------------------------------------------
+
+
+def test_broadcast_complete_with_no_session_id_fans_out_to_all_active_channels():
+    loop = asyncio.new_event_loop()
+    a = _FakeChannel("browser:aaa", loop)
+    b = _FakeChannel("browser:bbb", loop)
+    BrowserChannel._active_channels.update({a, b})
+
+    _broadcast_complete_with_loop({"provider": "cogos-agent"})
+
+    for ch in (a, b):
+        assert len(ch.ws.sent) == 1
+        frame = ch.ws.sent[0]
+        assert frame["type"] == "response_complete"
+        assert frame["metrics"] == {"provider": "cogos-agent"}
+
+    loop.close()
+
+
+def test_broadcast_complete_routes_to_matching_session_only():
+    loop = asyncio.new_event_loop()
+    a = _FakeChannel("browser:aaa", loop)
+    b = _FakeChannel("browser:bbb", loop)
+    BrowserChannel._active_channels.update({a, b})
+
+    _broadcast_complete_with_loop(
+        {"provider": "cogos-agent", "event_id": "r42"},
+        session_id="mod3:browser:bbb",
+    )
+
+    assert a.ws.sent == []
+    assert len(b.ws.sent) == 1
+    assert b.ws.sent[0]["type"] == "response_complete"
+    assert b.ws.sent[0]["metrics"]["event_id"] == "r42"
+
+    loop.close()
+
+
+def test_broadcast_complete_defaults_to_empty_metrics():
+    loop = asyncio.new_event_loop()
+    a = _FakeChannel("browser:aaa", loop)
+    BrowserChannel._active_channels.add(a)
+
+    _broadcast_complete_with_loop()
+
+    assert a.ws.sent == [{"type": "response_complete", "metrics": {}}]
+
+    loop.close()
+
+
+def test_broadcast_complete_skips_inactive_channels():
+    loop = asyncio.new_event_loop()
+    a = _FakeChannel("browser:aaa", loop)
+    a._active = False
+    b = _FakeChannel("browser:bbb", loop)
+    BrowserChannel._active_channels.update({a, b})
+
+    _broadcast_complete_with_loop({"provider": "cogos-agent"})
+
+    assert a.ws.sent == []
+    assert len(b.ws.sent) == 1
 
     loop.close()
 

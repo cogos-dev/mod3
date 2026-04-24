@@ -14,6 +14,11 @@ Server→client WebSocket message types:
   partial_transcript, transcript,
   trace_event  — kernel cycle-trace events (ADR-083), fanned out via
                  BrowserChannel.broadcast_trace_event().
+
+The MOD3_USE_COGOS_AGENT kernel-bridged path emits response_text AND
+response_complete via BrowserChannel.broadcast_response_{text,complete}
+so the dashboard UI's turn-done signal fires on every turn, matching the
+local-inference path's behavior.
 """
 
 from __future__ import annotations
@@ -492,6 +497,40 @@ class BrowserChannel:
                 asyncio.run_coroutine_threadsafe(ch.ws.send_json(frame), ch._loop)
             except Exception as exc:  # noqa: BLE001 — disconnected clients are expected
                 logger.debug("response_text send failed for %s: %s", ch.channel_id, exc)
+
+    @classmethod
+    def broadcast_response_complete(
+        cls,
+        metrics: dict | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        """Push a `response_complete` frame to dashboard WebSocket clients.
+
+        Companion to :meth:`broadcast_response_text`: the MOD3_USE_COGOS_AGENT
+        response bridge emits exactly one complete-frame per kernel
+        `agent_response` event so the dashboard UI's per-turn `isResponding`
+        state gets cleared (otherwise the chat panel spinner hangs forever).
+
+        Routing and threading match `broadcast_response_text` 1:1 — pass the
+        same `session_id` so the completion frame lands on the same channel
+        that received the text frames for this turn. `metrics` follows the
+        local-path convention from `agent_loop._process` (`{"llm_ms": ...,
+        "provider": ...}`); the kernel path populates it with
+        `{"provider": "cogos-agent", ...}`.
+        """
+        frame = {"type": "response_complete", "metrics": metrics or {}}
+        expected_channel = None
+        if session_id and session_id.startswith("mod3:"):
+            expected_channel = session_id[len("mod3:") :]
+        for ch in list(cls._active_channels):
+            if not ch._active:
+                continue
+            if expected_channel and ch.channel_id != expected_channel:
+                continue
+            try:
+                asyncio.run_coroutine_threadsafe(ch.ws.send_json(frame), ch._loop)
+            except Exception as exc:  # noqa: BLE001 — disconnected clients are expected
+                logger.debug("response_complete send failed for %s: %s", ch.channel_id, exc)
 
     # ------------------------------------------------------------------
     # Cleanup

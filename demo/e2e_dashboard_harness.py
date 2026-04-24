@@ -120,7 +120,7 @@ async def run_dashboard_session(interrupt_after_s: float, text: str) -> None:
                         audio_pcm.append(wav_bytes)
                 except Exception as e:
                     print(f"  (audio decode err: {e})", flush=True)
-            elif t == "response_done" or t == "turn_complete":
+            elif t == "response_complete":
                 got_done = True
                 done_ts = time.time()
             elif t == "trace_event":

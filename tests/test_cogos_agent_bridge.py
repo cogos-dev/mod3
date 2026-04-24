@@ -104,11 +104,20 @@ def test_run_response_bridge_fans_out_to_broadcast():
     ]
     sub = _FakeSubscriber(envelopes)
 
-    with patch("cogos_agent_bridge.BrowserChannel.broadcast_response_text") as mock_bcast:
+    with (
+        patch("cogos_agent_bridge.BrowserChannel.broadcast_response_text") as mock_text,
+        patch("cogos_agent_bridge.BrowserChannel.broadcast_response_complete") as mock_done,
+    ):
         asyncio.run(run_response_bridge(sub))
 
-    texts = [c.args[0] for c in mock_bcast.call_args_list]
+    texts = [c.args[0] for c in mock_text.call_args_list]
     assert texts == ["reply one", "free-form string reply"]
+    # One completion frame per forwarded text — never zero, never doubled.
+    assert mock_done.call_count == 2
+    # Payload shape: provider tag plus any kernel-supplied timing/ids.
+    for call in mock_done.call_args_list:
+        metrics = call.args[0]
+        assert metrics["provider"] == "cogos-agent"
 
 
 # ---------------------------------------------------------------------------
@@ -144,14 +153,22 @@ def test_run_response_bridge_forwards_session_id_when_present():
     envelopes = [_env({"content": inner}, "r1")]
     sub = _FakeSubscriber(envelopes)
 
-    with patch("cogos_agent_bridge.BrowserChannel.broadcast_response_text") as mock_bcast:
+    with (
+        patch("cogos_agent_bridge.BrowserChannel.broadcast_response_text") as mock_text,
+        patch("cogos_agent_bridge.BrowserChannel.broadcast_response_complete") as mock_done,
+    ):
         asyncio.run(run_response_bridge(sub))
 
-    assert mock_bcast.call_count == 1
-    call = mock_bcast.call_args_list[0]
-    assert call.args[0] == "scoped reply"
+    assert mock_text.call_count == 1
+    text_call = mock_text.call_args_list[0]
+    assert text_call.args[0] == "scoped reply"
     # session_id passed as keyword
-    assert call.kwargs.get("session_id") == "mod3:browser:abc"
+    assert text_call.kwargs.get("session_id") == "mod3:browser:abc"
+    # Completion frame routes to the same session so the originating
+    # channel's spinner clears — not a broadcast.
+    assert mock_done.call_count == 1
+    done_call = mock_done.call_args_list[0]
+    assert done_call.kwargs.get("session_id") == "mod3:browser:abc"
 
 
 def test_run_response_bridge_falls_back_to_broadcast_when_no_session_id():
@@ -160,13 +177,38 @@ def test_run_response_bridge_falls_back_to_broadcast_when_no_session_id():
     envelopes = [_env({"content": inner}, "r1")]
     sub = _FakeSubscriber(envelopes)
 
-    with patch("cogos_agent_bridge.BrowserChannel.broadcast_response_text") as mock_bcast:
+    with (
+        patch("cogos_agent_bridge.BrowserChannel.broadcast_response_text") as mock_text,
+        patch("cogos_agent_bridge.BrowserChannel.broadcast_response_complete") as mock_done,
+    ):
         asyncio.run(run_response_bridge(sub))
 
-    assert mock_bcast.call_count == 1
-    call = mock_bcast.call_args_list[0]
-    assert call.args[0] == "broadcast reply"
-    assert call.kwargs.get("session_id") is None
+    assert mock_text.call_count == 1
+    text_call = mock_text.call_args_list[0]
+    assert text_call.args[0] == "broadcast reply"
+    assert text_call.kwargs.get("session_id") is None
+    # Completion frame also broadcasts (matches the text-frame routing).
+    assert mock_done.call_count == 1
+    assert mock_done.call_args_list[0].kwargs.get("session_id") is None
+
+
+def test_run_response_bridge_skips_complete_when_text_missing():
+    """Events with no recoverable text must not emit a completion frame.
+
+    Holding the 1:1 pairing keeps the UI's turn counter honest: we only
+    mark a turn done when we actually rendered something for it.
+    """
+    envelopes = [_env({"foo": "bar"}, "r1"), _env({}, "r2")]
+    sub = _FakeSubscriber(envelopes)
+
+    with (
+        patch("cogos_agent_bridge.BrowserChannel.broadcast_response_text") as mock_text,
+        patch("cogos_agent_bridge.BrowserChannel.broadcast_response_complete") as mock_done,
+    ):
+        asyncio.run(run_response_bridge(sub))
+
+    assert mock_text.call_count == 0
+    assert mock_done.call_count == 0
 
 
 def test_post_user_message_uses_runtime_endpoint(monkeypatch):
