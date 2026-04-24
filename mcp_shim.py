@@ -179,9 +179,67 @@ def _resolve_device_live(preferred: str | None) -> tuple[Any, dict[str, Any]]:
     return None, {"preferred": pref, "index": None, "fallback": True, "reason": "no match, no default"}
 
 
+def _session_has_ws_subscriber(session_id: str | None) -> bool:
+    """Wave 4.3 — ask the HTTP service whether any dashboard has attached
+    a WebSocket audio subscription for this session.
+
+    When True, the shim skips local sounddevice playback — the HTTP
+    service's /ws/audio/{session_id} route is delivering the WAV bytes to
+    the browser and local speakers would double-play. When False (no
+    subscriber, or the check fails), the caller falls back to sounddevice
+    exactly as the pre-Wave-4 path did. A fast 1.5s timeout keeps the
+    check from ever blocking a speak for long if mod3 HTTP is wedged.
+    """
+    if not session_id:
+        return False
+    status, resp = _http_request("GET", f"/v1/sessions/{session_id}/subscribers", timeout=1.5)
+    if status != 200 or not isinstance(resp, dict):
+        return False
+    return bool(resp.get("subscribed", False))
+
+
 def _play_wav_bytes(wav_bytes: bytes, job_id: str, session_id: str | None = None):
-    """Play WAV audio bytes through speakers via sounddevice."""
+    """Play WAV audio bytes through speakers via sounddevice.
+
+    Wave 4.3: when ``session_id`` has a live /ws/audio subscriber, skip the
+    local playback — the HTTP service is routing the bytes to the browser
+    and running sounddevice here would double-play. The subscriber check
+    already happens in ``_play_wav_bytes``'s first branch so the
+    ``_jobs`` ledger records ``status=routed`` and the caller can
+    correlate.
+    """
     global _current_sd_stream
+
+    # Wave 4.3: subscriber short-circuit. The server still emits WAV bytes
+    # out the WebSocket as part of the synthesize response path (see
+    # ``audio_subscribers.emit_wav``); here we simply skip the local
+    # sounddevice fallback when a dashboard is attached.
+    if _session_has_ws_subscriber(session_id):
+        try:
+            buf = io.BytesIO(wav_bytes)
+            with wave.open(buf, "rb") as wf:
+                sr = wf.getframerate()
+                duration = wf.getnframes() / float(sr) if sr else 0.0
+        except Exception:  # noqa: BLE001 — not fatal for the routing path
+            sr = 0
+            duration = 0.0
+        with _jobs_lock:
+            if job_id in _jobs:
+                _jobs[job_id]["status"] = "routed_ws"
+                _jobs[job_id]["duration_sec"] = round(duration, 2)
+                _jobs[job_id]["metrics"] = {
+                    "audio_duration_sec": round(duration, 2),
+                    "sample_rate": sr,
+                    "routing": "dashboard_ws",
+                }
+        logger.info(
+            "playback routed to WS: session=%s job=%s duration=%.2fs",
+            session_id,
+            job_id,
+            duration,
+        )
+        return
+
     try:
         import numpy as np
         import sounddevice as sd

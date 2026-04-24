@@ -34,6 +34,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from audio_subscribers import get_default_audio_subscribers
 from bus import ModalityBus
 from engine import MODELS, generate_audio, get_loaded_engines
 from modality import EncodedOutput, ModalityType
@@ -403,9 +404,11 @@ def synthesize(req: SynthesizeRequest):
         pcm = (np.clip(all_samples, -1.0, 1.0) * 32767).astype(np.int16)
         audio_bytes = pcm.tobytes()
         media_type = "audio/pcm"
+        wav_for_ws = encode_wav(all_samples, sample_rate)  # dashboard always gets WAV
     else:
         audio_bytes = encode_wav(all_samples, sample_rate)
         media_type = "audio/wav"
+        wav_for_ws = audio_bytes
     t_encode_end = time.perf_counter()
 
     total_time = t_encode_end - t_request
@@ -414,6 +417,28 @@ def synthesize(req: SynthesizeRequest):
     # Finalize job record
     _append_timeline(job_id, "generation_complete", t_gen_end - t_request)
     _append_timeline(job_id, "encoding_complete", t_encode_end - t_request)
+
+    # Wave 4.3 — route to any dashboard WebSocket subscribers for this
+    # session before returning the HTTP response. Mod3 emits the WAV over
+    # the /ws/audio/{session_id} channel; the MCP shim and the kernel both
+    # consult /v1/sessions/{id}/subscribers to skip local playback when
+    # this path fired, so there's no double-play. Pure HTTP callers without
+    # a session (or without a subscriber) still get their bytes in the
+    # response body exactly as before.
+    ws_delivered = 0
+    if session_id:
+        subs = get_default_audio_subscribers()
+        try:
+            ws_delivered = subs.emit_wav(
+                session_id,
+                wav_for_ws,
+                job_id=job_id,
+                duration_sec=round(duration, 3),
+                sample_rate=sample_rate,
+            )
+        except Exception as exc:  # noqa: BLE001 — never fail synthesize on a WS push
+            logger.debug("ws audio emit failed: %s", exc)
+
     _update_job(
         job_id,
         {
@@ -431,6 +456,7 @@ def synthesize(req: SynthesizeRequest):
                 "per_chunk": chunk_metrics,
                 "output_bytes": len(audio_bytes),
                 "output_format": req.format,
+                "ws_subscribers_delivered": ws_delivered,
             },
         },
     )
@@ -445,6 +471,7 @@ def synthesize(req: SynthesizeRequest):
         "X-Mod3-Total-Time-Sec": f"{total_time:.3f}",
         "X-Mod3-RTF": f"{duration / gen_time:.2f}" if gen_time > 0 else "0",
         "X-Mod3-Chunks": str(len(chunk_metrics)),
+        "X-Mod3-WS-Subscribers": str(ws_delivered),
     }
     if session_payload is not None:
         headers["X-Mod3-Session-Id"] = session_payload["session_id"]
@@ -811,6 +838,26 @@ def session_get(session_id: str):
     return payload
 
 
+@app.get("/v1/sessions/{session_id}/subscribers")
+def session_subscribers(session_id: str):
+    """Wave 4.3 — does this session have any live audio WebSocket subscribers?
+
+    The kernel queries this before spawning afplay: if any dashboard or
+    native client has attached to ``/ws/audio/{session_id}``, the bytes are
+    routed over the WebSocket and the server-side fallback player is
+    skipped. Unknown sessions return ``{"subscribed": false, "count": 0}``
+    instead of 404 so the kernel's check stays a single well-defined
+    predicate regardless of registration state.
+    """
+    subs = get_default_audio_subscribers()
+    count = subs.count(session_id)
+    return {
+        "session_id": session_id,
+        "subscribed": count > 0,
+        "count": count,
+    }
+
+
 @app.get("/health")
 def health():
     """Health check — standardized CogOS service format."""
@@ -1078,6 +1125,50 @@ async def dashboard_page():
     if index.exists():
         return FileResponse(str(index))
     return JSONResponse({"error": "dashboard not found"}, status_code=404)
+
+
+@app.websocket("/ws/audio/{session_id}")
+async def ws_audio(websocket: WebSocket, session_id: str):
+    """Wave 4.3 — per-session playback channel for the dashboard.
+
+    The dashboard (or any client) opens ``ws://host:7860/ws/audio/<sid>``
+    to receive audio frames that would otherwise play through afplay /
+    sounddevice. The wire contract per send from the server:
+
+      1. JSON text frame: ``{"type": "audio_header", "session_id": ...,
+         "job_id": ..., "duration_sec": ..., "sample_rate": ..., "bytes": N,
+         "format": "wav", "seq": N}``
+      2. Binary frame: the raw WAV bytes.
+
+    The browser decodes via ``AudioContext.decodeAudioData`` — browsers
+    accept a whole-WAV in one blob so we don't need chunking for the v1
+    implementation. A future iteration can stream PCM frames for lower
+    latency; the header envelope is the forward-compatibility seam.
+
+    On disconnect the subscriber is removed and the session falls back to
+    ``afplay`` (kernel) / ``sd.play`` (MCP shim) automatically — the
+    subscribers registry tracks liveness, so the very next
+    ``/v1/sessions/<sid>/subscribers`` probe returns ``subscribed: false``.
+
+    Client → server frames are ignored for v1. A future revision may use
+    them for barge-in signaling or playback ack, but today the dashboard's
+    existing ``/ws/chat`` channel carries those events.
+    """
+    await websocket.accept()
+    subs = get_default_audio_subscribers()
+    loop = asyncio.get_running_loop()
+    subscriber = subs.register(session_id, websocket, loop)
+    try:
+        # Keep the connection open; drain any client frames so the socket
+        # close handshake fires promptly.
+        while True:
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+    except Exception as exc:  # noqa: BLE001 — disconnect is the normal exit
+        logger.debug("/ws/audio/%s disconnect: %s", session_id, exc)
+    finally:
+        subs.unregister(session_id, subscriber)
 
 
 @app.websocket("/ws/chat")
