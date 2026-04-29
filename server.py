@@ -216,6 +216,9 @@ mcp = FastMCP(
         "Keep spoken text conversational and concise — this is voice, not a document. "
         "For permission prompts, reply verbally with 'yes [code]' or 'no [code]'."
     ),
+    # When the FastAPI app mounts streamable_http_app() at /mcp, the sub-app's
+    # internal route must live at "/" so external /mcp requests resolve.
+    streamable_http_path="/",
 )
 
 # ---------------------------------------------------------------------------
@@ -1648,10 +1651,28 @@ def list_sessions() -> str:
 
 
 def _run_http(host: str = "0.0.0.0", port: int = 7860):
-    """Start the HTTP API server."""
+    """Start the HTTP API server with MCP streamable-HTTP mounted at /mcp."""
     import uvicorn
 
     from http_api import app
+
+    app.mount("/mcp", mcp.streamable_http_app())
+
+    # FastMCP's StreamableHTTPSessionManager needs an async task group started
+    # inside the app lifespan; mounting alone isn't enough.
+    _mcp_session_cm: dict[str, Any] = {}
+
+    @app.on_event("startup")
+    async def _enter_mcp_session_manager():
+        cm = mcp.session_manager.run()
+        _mcp_session_cm["cm"] = cm
+        await cm.__aenter__()
+
+    @app.on_event("shutdown")
+    async def _exit_mcp_session_manager():
+        cm = _mcp_session_cm.pop("cm", None)
+        if cm is not None:
+            await cm.__aexit__(None, None, None)
 
     uvicorn.run(app, host=host, port=port, log_level="info")
 
