@@ -24,6 +24,7 @@ import os
 import threading
 import time
 import uuid
+import warnings
 import wave
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -1682,17 +1683,31 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Mod³ TTS Server")
     parser.add_argument("--http", action="store_true", help="Run HTTP API only")
-    parser.add_argument("--all", action="store_true", help="Run both MCP (stdio) and HTTP")
-    parser.add_argument("--channel", action="store_true", help="Run as channel server with voice input")
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Run both MCP (stdio) and HTTP [deprecated — use HTTP-MCP: python server.py --http, then connect via /mcp]",
+    )
+    parser.add_argument(
+        "--channel",
+        action="store_true",
+        help="Run as channel server with voice input [deprecated — use HTTP-MCP: python server.py --http, then connect via /mcp]",
+    )
     parser.add_argument("--dashboard", action="store_true", help="Run HTTP API with voice/text dashboard (no MCP)")
     parser.add_argument("--port", type=int, default=7860, help="HTTP port (default: 7860)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="HTTP bind address")
     args = parser.parse_args()
 
+    _STDIO_DEPRECATION_MSG = (
+        "stdio MCP transport is deprecated; prefer HTTP-MCP at /mcp (see README). "
+        "This path will be removed in a future release."
+    )
+
     if args.http:
         _run_http(host=args.host, port=args.port)
     elif args.all:
         # HTTP in background thread, MCP on stdio
+        warnings.warn(_STDIO_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
         http_thread = threading.Thread(
             target=_run_http,
             kwargs={"host": args.host, "port": args.port},
@@ -1714,6 +1729,7 @@ if __name__ == "__main__":
         _run_http(host=args.host, port=args.port)
     elif args.channel:
         # Channel mode: MCP on stdio + inbound voice pipeline
+        warnings.warn(_STDIO_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
         from bus import ModalityBus
         from inbound import InboundPipeline
         from modules.voice import VoiceModule
@@ -1727,4 +1743,5 @@ if __name__ == "__main__":
         finally:
             inbound.stop()
     else:
+        warnings.warn(_STDIO_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
         mcp.run()

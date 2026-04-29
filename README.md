@@ -37,7 +37,33 @@ cd mod3
 ./setup.sh
 ```
 
-Then add to your project's `.mcp.json`:
+### HTTP-MCP (recommended)
+
+Start mod3 as a persistent daemon and connect via HTTP-MCP. This is the canonical transport going forward. The daemon stays alive between agent sessions so TTS engines stay warm and multiple clients can share one instance.
+
+```bash
+# Start the server (or configure as a launchd service)
+python server.py --http
+```
+
+Then point your MCP client at the HTTP-MCP endpoint:
+
+```json
+{
+  "mcpServers": {
+    "mod3": {
+      "type": "http",
+      "url": "http://localhost:7860/mcp"
+    }
+  }
+}
+```
+
+### stdio MCP (deprecated)
+
+> **Deprecated.** stdio MCP is still functional but is being phased out. Each client session spawns a new mod3 process, which means TTS engines cold-start on every connection (~60s for Kokoro) and state is not shared across sessions. Prefer HTTP-MCP above. A `DeprecationWarning` is printed to stderr at boot when this path is active. Removal is tracked in [issue #11](https://github.com/cogos-dev/mod3/issues/11).
+
+For users who have not migrated yet, the stdio path remains available. Add to your project's `.mcp.json`:
 
 ```json
 {
