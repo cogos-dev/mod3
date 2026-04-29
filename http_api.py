@@ -25,6 +25,7 @@ import time
 import uuid
 import wave
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Optional
@@ -47,19 +48,39 @@ from session_registry import (
 from vad import detect_speech_file, is_hallucination
 from vad import is_model_loaded as vad_loaded
 
-app = FastAPI(title="Mod³", description="Local multi-model TTS on Apple Silicon")
-
 logger = logging.getLogger("mod3.http")
 
 _server_start_time = time.time()
 _shutting_down = False
 
 
-@app.on_event("startup")
-async def _warmup_kokoro():
-    """Pre-load Kokoro TTS engine in background to avoid ~60s cold start on first request."""
+@asynccontextmanager
+async def _lifespan(application: FastAPI):
+    """Unified FastAPI lifespan — replaces all @app.on_event hooks.
+
+    Startup order (pre-yield):
+      1. Kokoro warmup — spawns a daemon thread; non-blocking, never fails startup.
+      2. Kernel-bus bridge — subscribes to cycle-trace events for the dashboard.
+         Non-blocking: the subscriber's backoff loop handles an unreachable kernel.
+      3. CogOS agent bridge — forwards kernel agent replies to the dashboard WS.
+         No-op unless MOD3_USE_COGOS_AGENT=1 is set.
+
+    Shutdown order (post-yield, reverse of startup):
+      3. Stop CogOS agent bridge.
+      2. Stop kernel-bus bridge.
+
+    Each phase catches and logs its own errors so a failure in one phase does not
+    prevent the remaining phases from running (preserving the original semantics of
+    the per-hook try/except blocks).
+    """
     import threading
 
+    from bus_bridge_runner import start_bridge, stop_bridge
+    from cogos_agent_bridge import start_response_bridge, stop_response_bridge
+
+    # --- startup ---
+
+    # 1. Kokoro warmup (thread spawn; never blocks or fails startup)
     def _do_warmup():
         try:
             from engine import get_model
@@ -71,57 +92,40 @@ async def _warmup_kokoro():
 
     threading.Thread(target=_do_warmup, daemon=True, name="kokoro-warmup").start()
 
-
-@app.on_event("startup")
-async def _start_bus_bridge():
-    """Launch the kernel-bus → dashboard trace-event bridge.
-
-    Non-blocking: subscriber handles reconnect with backoff, so an unreachable
-    kernel does not fail server startup. Disable with MOD3_BUS_BRIDGE_DISABLED=1.
-    """
-    from bus_bridge_runner import start_bridge
-
+    # 2. Kernel-bus → dashboard bridge
     try:
-        await start_bridge(app.state)
+        await start_bridge(application.state)
     except Exception as e:  # noqa: BLE001 — never fail startup on bridge wiring
         logger.warning("bus-bridge startup failed (non-fatal): %s", e)
 
-
-@app.on_event("shutdown")
-async def _stop_bus_bridge():
-    """Gracefully stop the bus bridge on FastAPI shutdown."""
-    from bus_bridge_runner import stop_bridge
-
+    # 3. CogOS agent response bridge (no-op when MOD3_USE_COGOS_AGENT is unset)
     try:
-        await stop_bridge(app.state, timeout_s=2.0)
+        await start_response_bridge(application.state)
+    except Exception as e:  # noqa: BLE001 — never fail startup on bridge wiring
+        logger.warning("cogos-agent startup failed (non-fatal): %s", e)
+
+    yield  # application is running
+
+    # --- shutdown (reverse order) ---
+
+    # 3. Stop CogOS agent bridge
+    try:
+        await stop_response_bridge(application.state, timeout_s=2.0)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("cogos-agent shutdown error (non-fatal): %s", e)
+
+    # 2. Stop kernel-bus bridge
+    try:
+        await stop_bridge(application.state, timeout_s=2.0)
     except Exception as e:  # noqa: BLE001
         logger.debug("bus-bridge shutdown error (non-fatal): %s", e)
 
 
-@app.on_event("startup")
-async def _start_cogos_agent_bridge():
-    """Launch the cogos-agent response bridge (MOD3_USE_COGOS_AGENT=1).
-
-    No-op unless the env flag is set. Subscribes to `bus_dashboard_response`
-    and forwards assistant replies to the dashboard WS as `response_text`.
-    """
-    from cogos_agent_bridge import start_response_bridge
-
-    try:
-        await start_response_bridge(app.state)
-    except Exception as e:  # noqa: BLE001 — never fail startup on bridge wiring
-        logger.warning("cogos-agent startup failed (non-fatal): %s", e)
-
-
-@app.on_event("shutdown")
-async def _stop_cogos_agent_bridge():
-    """Gracefully stop the cogos-agent response bridge on FastAPI shutdown."""
-    from cogos_agent_bridge import stop_response_bridge
-
-    try:
-        await stop_response_bridge(app.state, timeout_s=2.0)
-    except Exception as e:  # noqa: BLE001
-        logger.debug("cogos-agent shutdown error (non-fatal): %s", e)
+app = FastAPI(
+    title="Mod³",
+    description="Local multi-model TTS on Apple Silicon",
+    lifespan=_lifespan,
+)
 
 
 try:

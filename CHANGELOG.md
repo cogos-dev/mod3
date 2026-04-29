@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Changed
+- **FastAPI lifespan migration** (`http_api.py`) — replaced all `@app.on_event("startup")` / `@app.on_event("shutdown")` decorators with a single `@asynccontextmanager` lifespan passed to `FastAPI(lifespan=...)`. Startup order: Kokoro warmup thread, kernel-bus bridge, CogOS agent bridge. Shutdown order: reverse. Eliminates the DeprecationWarning emitted on every boot.
+
 ## [0.4.0] - 2026-04-19
 
 ### Added — Voice pipeline
