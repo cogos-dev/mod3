@@ -69,8 +69,7 @@ def test_mcp_initialize_handshake_succeeds(mcp_client):
         "lifespan startup. See server.install_mcp_route()."
     )
     assert "mcp-session-id" in response.headers, (
-        "MCP server did not mint a session id; session manager probably never "
-        "entered its task group."
+        "MCP server did not mint a session id; session manager probably never entered its task group."
     )
     assert "Task group is not initialized" not in response.text
 
