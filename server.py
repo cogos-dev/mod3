@@ -1651,30 +1651,37 @@ def list_sessions() -> str:
 # ---------------------------------------------------------------------------
 
 
+def install_mcp_route(app) -> None:
+    """Mount FastMCP's streamable-HTTP transport at /mcp and start its session manager.
+
+    FastMCP's StreamableHTTPSessionManager needs an async task group entered inside
+    the app lifespan; mounting alone yields 500s with "Task group is not initialized".
+    http_api.app uses a `lifespan=` context manager, which makes legacy
+    `@app.on_event("startup")` hooks silent no-ops — so we wrap the existing
+    lifespan instead. Tested by tests/test_mcp_route.py.
+    """
+    from contextlib import asynccontextmanager
+
+    app.mount("/mcp", mcp.streamable_http_app())
+
+    original_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def _combined_lifespan(application):
+        async with mcp.session_manager.run():
+            async with original_lifespan(application):
+                yield
+
+    app.router.lifespan_context = _combined_lifespan
+
+
 def _run_http(host: str = "0.0.0.0", port: int = 7860):
     """Start the HTTP API server with MCP streamable-HTTP mounted at /mcp."""
     import uvicorn
 
     from http_api import app
 
-    app.mount("/mcp", mcp.streamable_http_app())
-
-    # FastMCP's StreamableHTTPSessionManager needs an async task group started
-    # inside the app lifespan; mounting alone isn't enough.
-    _mcp_session_cm: dict[str, Any] = {}
-
-    @app.on_event("startup")
-    async def _enter_mcp_session_manager():
-        cm = mcp.session_manager.run()
-        _mcp_session_cm["cm"] = cm
-        await cm.__aenter__()
-
-    @app.on_event("shutdown")
-    async def _exit_mcp_session_manager():
-        cm = _mcp_session_cm.pop("cm", None)
-        if cm is not None:
-            await cm.__aexit__(None, None, None)
-
+    install_mcp_route(app)
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
