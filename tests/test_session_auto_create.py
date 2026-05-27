@@ -39,7 +39,7 @@ def client():
     import http_api
 
     # TestClient wraps the app's lifespan, so startup hooks run on __enter__.
-    with TestClient(http_api.app) as c:
+    with TestClient(http_api.app, base_url="http://localhost:7860") as c:
         yield c
 
 

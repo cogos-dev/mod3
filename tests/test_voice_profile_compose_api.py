@@ -90,7 +90,7 @@ def client(monkeypatch, tmp_path):
 
     from fastapi.testclient import TestClient
 
-    return TestClient(http_api.app)
+    return TestClient(http_api.app, base_url="http://localhost:7860")
 
 
 @pytest.fixture()
