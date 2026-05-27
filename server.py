@@ -1870,7 +1870,7 @@ def _prewarm_tts_if_enabled() -> None:
     threading.Thread(target=_warm, name="kokoro-prewarm", daemon=True).start()
 
 
-def _run_http(host: str = "0.0.0.0", port: int = 7860):
+def _run_http(host: str = "127.0.0.1", port: int = 7860):
     """Start the HTTP API server with MCP streamable-HTTP mounted at /mcp."""
     import uvicorn
 
@@ -1902,7 +1902,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--dashboard", action="store_true", help="Run HTTP API with voice/text dashboard (no MCP)")
     parser.add_argument("--port", type=int, default=7860, help="HTTP port (default: 7860)")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="HTTP bind address")
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="HTTP bind address (default: 127.0.0.1 loopback; use 0.0.0.0 to expose on LAN)",
+    )
     args = parser.parse_args()
 
     _STDIO_DEPRECATION_MSG = (

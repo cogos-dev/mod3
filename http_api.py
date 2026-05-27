@@ -335,6 +335,142 @@ async def _reject_during_shutdown(request: Request, call_next):
 
 
 # ---------------------------------------------------------------------------
+# localhost CSRF / DNS-rebinding guard
+# ---------------------------------------------------------------------------
+#
+# Threat model: a malicious web page the user visits can issue cross-origin
+# requests to the localhost daemon (localhost CSRF).  With DNS rebinding the
+# attacker also controls the Host header.  The browser sends an Origin header
+# on cross-origin fetches and same-site form POST; it does NOT send Origin on
+# same-origin requests from the dashboard or on programmatic non-browser
+# clients (httpx / MCP clients).
+#
+# Defence — two layers applied only to state-changing methods (POST, PUT,
+# PATCH, DELETE):
+#
+#   1. Host-header allowlist: must be localhost / 127.0.0.1 (with optional
+#      port).  Blocks DNS-rebinding attacks where the attacker substitutes a
+#      hostname that resolves to 127.0.0.1.
+#
+#   2. Origin / Referer check (when the header is present): the origin must
+#      be in the allowed set.  Same-origin requests from the dashboard omit
+#      Origin entirely — those are always permitted.  Non-browser clients
+#      (httpx, MCP) also omit Origin — permitted.  Only cross-origin browser
+#      requests carry Origin, and those are rejected unless explicitly listed.
+#
+# Allowed origins are configured via MOD3_ALLOWED_ORIGINS (comma-separated
+# scheme+host[:port]).  The default covers all common localhost variants so
+# the dashboard and channel client work without configuration.
+#
+# Read-only GET / HEAD / OPTIONS requests are deliberately NOT gated — they
+# are lower-risk and blocking them would break CORS preflight and monitoring.
+
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_LOCALHOST_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
+
+# Build the allowed origins set once at import time.
+# Default: all localhost variants on the canonical port and no port.
+_DEFAULT_ALLOWED_ORIGINS: frozenset[str] = frozenset(
+    {
+        "http://localhost",
+        "http://localhost:7860",
+        "http://127.0.0.1",
+        "http://127.0.0.1:7860",
+        "http://[::1]",
+        "http://[::1]:7860",
+    }
+)
+
+
+def _build_allowed_origins() -> frozenset[str]:
+    """Return the effective allowed-origin set from env + defaults."""
+    raw = os.environ.get("MOD3_ALLOWED_ORIGINS", "").strip()
+    if not raw:
+        return _DEFAULT_ALLOWED_ORIGINS
+    extras = frozenset(o.strip().rstrip("/") for o in raw.split(",") if o.strip())
+    return _DEFAULT_ALLOWED_ORIGINS | extras
+
+
+_ALLOWED_ORIGINS: frozenset[str] = _build_allowed_origins()
+
+
+def _is_localhost_host(host_header: str) -> bool:
+    """Return True when the Host header is a loopback address (with optional port)."""
+    # Strip port: "localhost:7860" → "localhost"
+    bare = host_header.split(":")[0].lower().strip("[]")
+    return bare in {"localhost", "127.0.0.1", "::1"}
+
+
+def _origin_is_allowed(origin: str) -> bool:
+    """Return True when origin is in the allowed set (exact match after stripping trailing slash)."""
+    return origin.rstrip("/") in _ALLOWED_ORIGINS
+
+
+@app.middleware("http")
+async def _localhost_csrf_guard(request: Request, call_next):
+    """Reject cross-origin state-changing requests (CSRF / DNS-rebinding guard).
+
+    Skips read-only methods (GET, HEAD, OPTIONS) and the /health probe.
+    Applies to all mutating methods (POST, PUT, PATCH, DELETE).
+
+    Rules:
+      1. Host header must be a loopback address (stops DNS rebinding).
+      2. If Origin is present it must be in the allowed set.
+      3. Absent Origin is always permitted (non-browser or same-origin).
+
+    On violation: 403 with a JSON body describing which check failed.
+    """
+    method = request.method.upper()
+    path = request.url.path
+
+    # Read-only methods and the health probe are never gated.
+    if method in _SAFE_METHODS or path == "/health":
+        return await call_next(request)
+
+    # --- 1. Host header check (DNS-rebinding) ---
+    host = request.headers.get("host", "")
+    if host and not _is_localhost_host(host):
+        logger.warning(
+            "CSRF guard: rejected %s %s — disallowed Host header %r",
+            method,
+            path,
+            host,
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": "forbidden",
+                "detail": (
+                    f"Host header {host!r} is not a localhost address. "
+                    "mod3 only accepts requests addressed to localhost."
+                ),
+            },
+        )
+
+    # --- 2. Origin check ---
+    origin = request.headers.get("origin", "")
+    if origin and not _origin_is_allowed(origin):
+        logger.warning(
+            "CSRF guard: rejected %s %s — disallowed Origin %r",
+            method,
+            path,
+            origin,
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": "forbidden",
+                "detail": (
+                    f"Origin {origin!r} is not allowed. "
+                    "Set MOD3_ALLOWED_ORIGINS to add origins."
+                ),
+            },
+        )
+
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 

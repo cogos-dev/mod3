@@ -77,7 +77,7 @@ class TestSpeakEndpoint:
 
         import http_api
 
-        return TestClient(http_api.app)
+        return TestClient(http_api.app, base_url="http://localhost:7860")
 
     def test_first_call_returns_queue_position_zero(self, client):
         """First enqueued job returns queue_position=0 and status=speaking."""

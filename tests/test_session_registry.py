@@ -325,7 +325,7 @@ class TestHTTPSessionEndpoints:
 
         import http_api
 
-        return TestClient(http_api.app)
+        return TestClient(http_api.app, base_url="http://localhost:7860")
 
     @pytest.fixture(autouse=True)
     def _cleanup(self):
