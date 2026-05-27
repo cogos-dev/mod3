@@ -142,7 +142,7 @@ The adaptive player is model-agnostic. Any TTS engine that produces audio chunks
 ## Requirements
 
 - macOS with Apple Silicon (M1/M2/M3/M4)
-- Python 3.10+
+- Python 3.12+
 - espeak-ng (`brew install espeak-ng`) -- required for Kokoro's phonemizer
 
 ## Using Voice as a Modality
