@@ -1679,6 +1679,56 @@ async def seat_register(session_id: str, request: Request):
     except Exception as e:  # noqa: BLE001 — never fail seat registration on mirror
         logger.warning("session-registry mirror failed (non-fatal): %s", e)
 
+    # Fix A — session-registration-unification (SYNC half):
+    # After the local seat/session registers, fire a best-effort callback to
+    # the kernel so the kernel's ChannelSessionRegistry stays authoritative
+    # (fixes the kernel:1 / mod3:99 skew reported in
+    # cog://mem/semantic/insights/cross-session-tapestry-2026-05-26).
+    #
+    # Payload shape matches POST /v1/channel-sessions/register.  We pass the
+    # EXISTING session_id — the kernel mints only when session_id is absent,
+    # so this is idempotent and never re-mints.
+    #
+    # iss / sub: the mod3 Seat object uses the user_iss/user_sub split
+    # (Wave 6c / Primitive 2). We forward user_iss as "iss" and user_sub as
+    # "sub" per the ChannelSessionRecord field names on the kernel side.
+    # The feat/mod3-session-identity-claims merge fully wires these; on the
+    # current main branch user_iss / user_sub are available from this
+    # handler's local vars (see binding at lines ~1446-1450 above).
+    #
+    # DEPENDENCY NOTE: iss/sub population is conditional on the identity
+    # claims being present on the seat (Wave 6b+). Pre-Wave-6b callers that
+    # don't supply iss/sub register with empty strings; the kernel record is
+    # still valid and the callback is still idempotent.
+    try:
+        import httpx as _httpx
+
+        _kernel_payload: dict = {
+            "session_id": session_id,  # pass EXISTING id — never re-mint
+            "participant_id": f"channel-client::{client_type}",
+            "participant_type": "agent",
+            "kind": "channel-client",
+            # Forward identity claims — user_iss/user_sub are bound above from
+            # the seat request body (see Wave 6c handling ~line 1446).
+            # Pass None-as-absent: omitempty on the Go side ignores empty strings.
+            "iss": user_iss or None,
+            "sub": user_sub or None,
+        }
+        # Drop None values so the JSON payload stays clean.
+        _kernel_payload = {k: v for k, v in _kernel_payload.items() if v is not None}
+        _httpx.post(
+            f"{_cogos_kernel_url}/v1/channel-sessions/register",
+            json=_kernel_payload,
+            timeout=1.5,
+        )
+        logger.debug(
+            "kernel session-register callback OK: session=%s participant=%s",
+            session_id,
+            _kernel_payload["participant_id"],
+        )
+    except Exception as _kce:  # noqa: BLE001 — never block seat registration on kernel callback
+        logger.warning("kernel session-register callback failed (non-fatal): %s", _kce)
+
     # Emit presence.started when any identity claim is present.
     #
     # Shape (Wave 6c / Primitive 2):
@@ -1743,6 +1793,26 @@ def seat_revoke(session_id: str, seat_id: str):
             status_code=404,
             content={"error": f"seat '{seat_id}' not found in session '{session_id}'"},
         )
+
+    # Fix A — session-registration-unification (SYNC half, deregister cascade):
+    # After the local seat is revoked, notify the kernel so it can drop its
+    # ChannelSessionRecord. Best-effort / non-fatal — the seat is already gone
+    # locally; a kernel-side orphan will be cleaned up by Fix B's reaper.
+    try:
+        import httpx as _httpx
+
+        _httpx.post(
+            f"{_cogos_kernel_url}/v1/channel-sessions/{session_id}/deregister",
+            timeout=1.5,
+        )
+        logger.debug(
+            "kernel session-deregister callback OK: session=%s seat=%s",
+            session_id,
+            seat_id,
+        )
+    except Exception as _kde:  # noqa: BLE001 — never block seat revoke on kernel callback
+        logger.warning("kernel session-deregister callback failed (non-fatal): %s", _kde)
+
     return {"status": "revoked", "seat_id": seat_id, "session_id": session_id}
 
 
