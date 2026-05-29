@@ -23,7 +23,13 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from providers import CogOSProvider, ProviderResponse, ToolCall  # noqa: E402
+from providers import (  # noqa: E402
+    _LOCAL_FALLBACK_DEGRADED_TEXT,
+    CogOSProvider,
+    OllamaProvider,
+    ProviderResponse,
+    ToolCall,
+)
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -282,3 +288,70 @@ class TestKernelErrorFallsBackLocal:
 
         assert ollama.called
         assert resp.text == "from ollama"
+
+
+# ---------------------------------------------------------------------------
+# BUG 2 — Ollama fallback itself fails → graceful degradation, never raises
+# ---------------------------------------------------------------------------
+
+
+class TestOllamaProviderDegradesGracefully:
+    """The local fallback (OllamaProvider) must never bubble an HTTPStatusError.
+
+    The fallback is reached when the kernel already errored; if local Ollama
+    then returns a non-2xx, an unprotected raise_for_status would post a raw
+    "[error: …]" to the user — violating the autonomy-floor "never kill the
+    voice turn" guarantee.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ollama_500_returns_graceful_response(self, monkeypatch):
+        def _post(url):
+            return _FakeResponse(500, {"error": "internal"})
+
+        _patch_client(monkeypatch, get_handler=lambda u: None, post_handler=_post)
+
+        provider = OllamaProvider()
+        resp = await provider.chat([{"role": "user", "content": "hi"}])
+
+        assert isinstance(resp, ProviderResponse)
+        assert resp.tool_calls == []
+        assert resp.text == _LOCAL_FALLBACK_DEGRADED_TEXT
+        assert resp.raw and "_mod3_provider_error" in resp.raw
+
+    @pytest.mark.asyncio
+    async def test_ollama_connect_error_returns_graceful_response(self, monkeypatch):
+        def _post(url):
+            raise httpx.ConnectError("connection refused")
+
+        _patch_client(monkeypatch, get_handler=lambda u: None, post_handler=_post)
+
+        provider = OllamaProvider()
+        resp = await provider.chat([{"role": "user", "content": "hi"}])
+
+        assert resp.text == _LOCAL_FALLBACK_DEGRADED_TEXT
+
+    @pytest.mark.asyncio
+    async def test_double_failure_kernel_and_ollama_does_not_raise(self, monkeypatch):
+        """Kernel 503 AND local Ollama 500: the voice turn degrades, not dies."""
+        real_ollama = OllamaProvider()
+
+        def _get(url):
+            return _FakeResponse(200, {})  # Eclipse healthy → kernel is tried
+
+        def _post(url):
+            # Both the kernel /v1/chat/completions and Ollama /api/chat use POST.
+            if url.endswith("/api/chat"):
+                return _FakeResponse(500, {"error": "ollama down"})
+            return _FakeResponse(503, {"error": "kernel unavailable"})
+
+        _patch_client(monkeypatch, get_handler=_get, post_handler=_post)
+
+        provider = CogOSProvider(
+            eclipse_probe_url="http://eclipse/v1/models",
+            ollama_fallback=real_ollama,
+        )
+        resp = await provider.chat([{"role": "user", "content": "hi"}])
+
+        assert isinstance(resp, ProviderResponse)
+        assert resp.text == _LOCAL_FALLBACK_DEGRADED_TEXT, "double-failure must degrade gracefully, not raise"
