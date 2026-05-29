@@ -22,7 +22,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from seats import VALID_CLIENT_TYPES, Seat, SeatRegistry  # noqa: E402
+from seats import (  # noqa: E402
+    _SEAT_QUEUE_MAXSIZE,
+    VALID_CLIENT_TYPES,
+    Seat,
+    SeatRegistry,
+    get_seat_registry,
+    sse_stream,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -287,3 +294,92 @@ class TestDashboardChatEchoSuppression:
 
         assert len(_drain(sender)) == 0, "Sender must not receive its own message"
         assert len(_drain(receiver)) == 1
+
+
+# ---------------------------------------------------------------------------
+# BUG 1 — seat is revoked on SSE teardown (no zombie-seat leak)
+# ---------------------------------------------------------------------------
+
+
+class TestSeatRevokedOnSseTeardown:
+    """A seat's liveness IS its SSE stream. When the stream tears down (client
+    crash/kill, no graceful DELETE), the seat must be removed so it cannot
+    accumulate as a zombie holding an identity claim + an unbounded queue.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_singleton(self):
+        reg = get_seat_registry()
+        with reg._lock:
+            reg._seats.clear()
+            reg._live_streams.clear()
+        yield
+        with reg._lock:
+            reg._seats.clear()
+            reg._live_streams.clear()
+
+    def test_stream_teardown_revokes_seat_and_drops_liveness(self):
+        reg = get_seat_registry()
+        seat = reg.register("sess-crash", "claude-code-channel", "dev-1")
+        assert reg.get("sess-crash", seat.seat_id) is not None
+
+        async def _consume_then_close():
+            gen = sse_stream(seat)
+            # Pre-load one event so the first step returns immediately instead
+            # of blocking on the 15s keepalive. The generator binds seat.loop on
+            # first step; enqueue directly so put_nowait runs on this loop.
+            seat.queue.put_nowait({"type": "user_message", "content": "hi"})
+            await gen.__anext__()  # marks open, yields the event
+            assert reg.has_live_stream("sess-crash") is True
+            # Simulate a client crash: the consumer stops iterating and the
+            # generator is closed by GC / StreamingResponse teardown.
+            await gen.aclose()
+
+        asyncio.run(_consume_then_close())
+
+        # Seat is gone and liveness dropped to zero.
+        assert reg.get("sess-crash", seat.seat_id) is None, "zombie seat leaked after SSE teardown"
+        assert reg.has_live_stream("sess-crash") is False
+
+    def test_revoke_is_idempotent_after_graceful_delete(self):
+        """If a graceful DELETE already revoked the seat, teardown revoke is a no-op."""
+        reg = get_seat_registry()
+        seat = reg.register("sess-graceful", "claude-code-channel", "dev-2")
+
+        async def _graceful_then_teardown():
+            gen = sse_stream(seat)
+            seat.queue.put_nowait({"type": "user_message", "content": "hi"})
+            await gen.__anext__()  # open, yields the event
+            # Graceful DELETE path removes the seat first.
+            assert reg.revoke("sess-graceful", seat.seat_id) is True
+            await gen.aclose()  # teardown revoke must not raise on already-gone seat
+
+        asyncio.run(_graceful_then_teardown())
+        assert reg.get("sess-graceful", seat.seat_id) is None
+
+
+# ---------------------------------------------------------------------------
+# BUG 1 — per-seat queue is bounded (drop-oldest, no unbounded growth)
+# ---------------------------------------------------------------------------
+
+
+class TestSeatQueueBounded:
+    def test_queue_has_maxsize(self):
+        seat = _make_seat("sess", "seat-q")
+        assert seat.queue.maxsize == _SEAT_QUEUE_MAXSIZE
+
+    def test_full_queue_drops_oldest_not_unbounded(self):
+        reg = SeatRegistry()
+        seat = _make_seat("sess", "seat-q")
+        with reg._lock:
+            reg._seats["sess"] = {"seat-q": seat}
+
+        # Enqueue maxsize + N events; depth must never exceed maxsize.
+        overflow = 50
+        for i in range(_SEAT_QUEUE_MAXSIZE + overflow):
+            reg.fan_out("sess", {"type": "e", "i": i})
+
+        assert seat.queue.qsize() == _SEAT_QUEUE_MAXSIZE, "queue must stay bounded (drop-oldest)"
+        # Oldest events were evicted; the newest event is retained.
+        items = _drain(seat)
+        assert items[-1]["i"] == _SEAT_QUEUE_MAXSIZE + overflow - 1

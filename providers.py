@@ -19,6 +19,13 @@ import httpx
 
 logger = logging.getLogger("mod3.providers")
 
+# Spoken-friendly text returned when the LOCAL fallback provider (Ollama E4B)
+# itself fails. Honors the autonomy-floor "never kill the voice turn" guarantee:
+# the agent loop speaks this rather than a raw "[error: …]" stack message.
+_LOCAL_FALLBACK_DEGRADED_TEXT = (
+    "Sorry, I'm having trouble reaching my local model right now. Please try again in a moment."
+)
+
 # ---------------------------------------------------------------------------
 # Types
 # ---------------------------------------------------------------------------
@@ -307,10 +314,29 @@ class OllamaProvider:
         if tools:
             body["tools"] = tools
 
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            resp = await client.post(f"{self._endpoint}/api/chat", json=body)
-            resp.raise_for_status()
-            data = resp.json()
+        # Autonomy-floor guarantee: this provider is the LOCAL fallback the
+        # voice loop drops to when the kernel errors (see CogOSProvider.chat).
+        # If the local Ollama endpoint itself fails (non-2xx, timeout, connect
+        # refused), an unprotected raise_for_status would bubble a raw
+        # HTTPStatusError up through agent_loop.handle_event and post
+        # "[error: …]" to the user — killing the voice turn. We must NEVER kill
+        # the turn. On any provider-side failure, degrade gracefully by
+        # returning a spoken-friendly ProviderResponse instead of raising.
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                resp = await client.post(f"{self._endpoint}/api/chat", json=body)
+                resp.raise_for_status()
+                data = resp.json()
+        except (httpx.HTTPStatusError, httpx.TransportError, ValueError) as exc:
+            logger.warning(
+                "ollama: local inference failed (%s) — degrading gracefully instead of killing the voice turn",
+                exc,
+            )
+            return ProviderResponse(
+                tool_calls=[],
+                text=_LOCAL_FALLBACK_DEGRADED_TEXT,
+                raw={"_mod3_provider_error": str(exc)},
+            )
 
         msg = data.get("message", {})
         raw_tool_calls = msg.get("tool_calls", [])

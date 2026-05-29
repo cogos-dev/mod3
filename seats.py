@@ -42,6 +42,17 @@ VALID_CLIENT_TYPES = frozenset({"claude-code-channel", "generic", "rtvi-client"}
 
 _SEAT_TTL_SECONDS = 3600  # seats auto-expire after 1 hour of inactivity
 
+# Upper bound on a seat's pending-event queue. A live SSE stream drains the
+# queue continuously, so under normal operation depth stays near zero. The
+# bound is a backstop against an unbounded-growth memory leak when a seat's
+# consumer stalls or a zombie seat survives teardown: _enqueue_nowait drops
+# the oldest event rather than letting the queue grow without limit.
+_SEAT_QUEUE_MAXSIZE = 1024
+
+
+def _new_seat_queue() -> asyncio.Queue:
+    return asyncio.Queue(maxsize=_SEAT_QUEUE_MAXSIZE)
+
 
 @dataclass
 class Seat:
@@ -63,8 +74,10 @@ class Seat:
     # "intentional" (default) = session-scoped, explicit participation.
     # "ambient" = always-on, VAD-gated, continuous diarization.
     channel_mode: str = "intentional"
-    # SSE event queue — one entry per pending event
-    queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    # SSE event queue — one entry per pending event. Bounded so a stalled
+    # consumer or zombie seat cannot grow it without limit (see
+    # _SEAT_QUEUE_MAXSIZE / _enqueue_nowait drop-oldest behavior).
+    queue: asyncio.Queue = field(default_factory=_new_seat_queue)
     # asyncio loop that owns this seat's queue
     loop: asyncio.AbstractEventLoop | None = None
 
@@ -297,15 +310,35 @@ class SeatRegistry:
         return count
 
 
-def _enqueue_nowait(seat: Seat, event: dict[str, Any]) -> None:
-    """Thread-safe enqueue — uses the seat's loop if available."""
-    if seat.loop is not None and seat.loop.is_running():
-        seat.loop.call_soon_threadsafe(seat.queue.put_nowait, event)
-    else:
+def _put_drop_oldest(seat: Seat, event: dict[str, Any]) -> None:
+    """Enqueue *event*, evicting the oldest event if the bounded queue is full.
+
+    Must run on the loop that owns the queue (or with no running loop, in tests),
+    since asyncio.Queue is not thread-safe. _enqueue_nowait guarantees that.
+    """
+    try:
+        seat.queue.put_nowait(event)
+    except asyncio.QueueFull:
         try:
+            dropped = seat.queue.get_nowait()
+            logger.debug(
+                "Seat %s queue full (maxsize=%d) — dropped oldest event %s for %s",
+                seat.seat_id,
+                _SEAT_QUEUE_MAXSIZE,
+                dropped.get("type") if isinstance(dropped, dict) else dropped,
+                event.get("type"),
+            )
             seat.queue.put_nowait(event)
-        except asyncio.QueueFull:
-            logger.debug("Seat %s queue full — dropping event %s", seat.seat_id, event.get("type"))
+        except (asyncio.QueueEmpty, asyncio.QueueFull):
+            logger.debug("Seat %s queue churn — dropping event %s", seat.seat_id, event.get("type"))
+
+
+def _enqueue_nowait(seat: Seat, event: dict[str, Any]) -> None:
+    """Thread-safe enqueue — hops to the seat's loop if available."""
+    if seat.loop is not None and seat.loop.is_running():
+        seat.loop.call_soon_threadsafe(_put_drop_oldest, seat, event)
+    else:
+        _put_drop_oldest(seat, event)
 
 
 # ---------------------------------------------------------------------------
@@ -365,5 +398,20 @@ async def sse_stream(seat: Seat):
     except asyncio.CancelledError:
         pass
     finally:
+        # A seat's liveness IS its SSE stream (seat-as-coordination-surface).
+        # When the stream tears down — graceful close, client crash, or kill —
+        # the seat has no live connection and must be removed, mirroring the
+        # graceful DELETE-seat path. Without this, a crashed client (which never
+        # runs the DELETE hook) leaves a zombie seat holding an identity claim
+        # and a queue that fan_out/fan_out_all keep enqueuing to forever.
+        #
+        # Order matters: revoke the seat first so it is gone from _seats before
+        # mark_stream_closed fires _on_session_idle (which deregisters the now
+        # seatless session). Revoke is idempotent — a prior DELETE that already
+        # removed the seat just returns False here.
+        try:
+            registry.revoke(seat.session_id, seat.seat_id)
+        except Exception as exc:  # noqa: BLE001 — teardown must never raise
+            logger.warning("seat revoke on SSE teardown failed for %s: %s", seat.seat_id, exc)
         registry.mark_stream_closed(seat.session_id)
-        logger.debug("SSE stream closed for seat %s", seat.seat_id)
+        logger.debug("SSE stream closed and seat %s revoked", seat.seat_id)
