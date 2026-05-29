@@ -51,8 +51,10 @@ class TestKernelRegisterCallback:
         mock_response = MagicMock()
         mock_response.status_code = 200
 
-        with patch("access.is_allowed", return_value=True), \
-             patch("httpx.post", return_value=mock_response) as mock_post:
+        with (
+            patch("access.is_allowed", return_value=True),
+            patch("httpx.post", return_value=mock_response) as mock_post,
+        ):
             resp = client.post(
                 f"/v1/sessions/{session_id}/seats",
                 json={"client_type": "claude-code-channel", "device_uuid": session_id},
@@ -64,21 +66,16 @@ class TestKernelRegisterCallback:
         assert mock_post.called, "httpx.post must be called to notify kernel"
 
         # Find the kernel register call (not any other httpx call).
-        kernel_calls = [
-            call for call in mock_post.call_args_list
-            if "/v1/channel-sessions/register" in str(call)
-        ]
+        kernel_calls = [call for call in mock_post.call_args_list if "/v1/channel-sessions/register" in str(call)]
         assert len(kernel_calls) >= 1, (
-            f"Expected at least one call to /v1/channel-sessions/register, "
-            f"got calls: {mock_post.call_args_list}"
+            f"Expected at least one call to /v1/channel-sessions/register, got calls: {mock_post.call_args_list}"
         )
 
         # The payload must pass the EXISTING session_id — never let the kernel re-mint.
         call_kwargs = kernel_calls[0].kwargs
         payload = call_kwargs.get("json", {})
         assert payload.get("session_id") == session_id, (
-            f"kernel callback must pass the existing session_id={session_id!r}, "
-            f"got payload: {payload}"
+            f"kernel callback must pass the existing session_id={session_id!r}, got payload: {payload}"
         )
         assert payload.get("participant_id"), "participant_id must be set in kernel callback"
 
@@ -86,8 +83,10 @@ class TestKernelRegisterCallback:
         """If the kernel is unreachable, seat registration must still succeed."""
         session_id = str(uuid.uuid4())
 
-        with patch("access.is_allowed", return_value=True), \
-             patch("httpx.post", side_effect=Exception("kernel unreachable")):
+        with (
+            patch("access.is_allowed", return_value=True),
+            patch("httpx.post", side_effect=Exception("kernel unreachable")),
+        ):
             resp = client.post(
                 f"/v1/sessions/{session_id}/seats",
                 json={"client_type": "claude-code-channel", "device_uuid": session_id},
@@ -109,8 +108,10 @@ class TestKernelRegisterCallback:
         mock_response = MagicMock()
         mock_response.status_code = 200
 
-        with patch("access.is_allowed", return_value=True), \
-             patch("httpx.post", return_value=mock_response) as mock_post:
+        with (
+            patch("access.is_allowed", return_value=True),
+            patch("httpx.post", return_value=mock_response) as mock_post,
+        ):
             resp = client.post(
                 f"/v1/sessions/{session_id}/seats",
                 json={
@@ -123,19 +124,14 @@ class TestKernelRegisterCallback:
 
         assert resp.status_code in (200, 201), resp.text
 
-        kernel_calls = [
-            call for call in mock_post.call_args_list
-            if "/v1/channel-sessions/register" in str(call)
-        ]
+        kernel_calls = [call for call in mock_post.call_args_list if "/v1/channel-sessions/register" in str(call)]
         assert len(kernel_calls) >= 1
 
         payload = kernel_calls[0].kwargs.get("json", {})
         assert payload.get("iss") == "https://cogos.local", (
             f"user_iss must be forwarded as 'iss', got payload: {payload}"
         )
-        assert payload.get("sub") == "chaz", (
-            f"user_sub must be forwarded as 'sub', got payload: {payload}"
-        )
+        assert payload.get("sub") == "chaz", f"user_sub must be forwarded as 'sub', got payload: {payload}"
 
     def test_kernel_callback_omits_iss_sub_when_absent(self, client):
         """When no identity claims are present the iss/sub keys must be absent
@@ -145,8 +141,10 @@ class TestKernelRegisterCallback:
         mock_response = MagicMock()
         mock_response.status_code = 200
 
-        with patch("access.is_allowed", return_value=True), \
-             patch("httpx.post", return_value=mock_response) as mock_post:
+        with (
+            patch("access.is_allowed", return_value=True),
+            patch("httpx.post", return_value=mock_response) as mock_post,
+        ):
             resp = client.post(
                 f"/v1/sessions/{session_id}/seats",
                 json={"client_type": "claude-code-channel", "device_uuid": session_id},
@@ -154,10 +152,7 @@ class TestKernelRegisterCallback:
 
         assert resp.status_code in (200, 201), resp.text
 
-        kernel_calls = [
-            call for call in mock_post.call_args_list
-            if "/v1/channel-sessions/register" in str(call)
-        ]
+        kernel_calls = [call for call in mock_post.call_args_list if "/v1/channel-sessions/register" in str(call)]
         assert len(kernel_calls) >= 1
 
         payload = kernel_calls[0].kwargs.get("json", {})
@@ -177,8 +172,7 @@ class TestKernelDeregisterCallback:
         mock_response = MagicMock()
         mock_response.status_code = 200
 
-        with patch("access.is_allowed", return_value=True), \
-             patch("httpx.post", return_value=mock_response):
+        with patch("access.is_allowed", return_value=True), patch("httpx.post", return_value=mock_response):
             reg = client.post(
                 f"/v1/sessions/{session_id}/seats",
                 json={"client_type": "claude-code-channel", "device_uuid": session_id},
@@ -193,12 +187,9 @@ class TestKernelDeregisterCallback:
         assert del_resp.status_code == 200, del_resp.text
 
         deregister_calls = [
-            call for call in mock_post.call_args_list
-            if f"/v1/channel-sessions/{session_id}/deregister" in str(call)
+            call for call in mock_post.call_args_list if f"/v1/channel-sessions/{session_id}/deregister" in str(call)
         ]
-        assert len(deregister_calls) >= 1, (
-            f"Expected kernel deregister callback, got calls: {mock_post.call_args_list}"
-        )
+        assert len(deregister_calls) >= 1, f"Expected kernel deregister callback, got calls: {mock_post.call_args_list}"
 
     def test_kernel_deregister_failure_does_not_block_seat_revoke(self, client):
         """If the kernel is unreachable during deregister, seat revoke must still succeed."""
@@ -208,8 +199,7 @@ class TestKernelDeregisterCallback:
         mock_response.status_code = 200
 
         # Register seat (mock kernel callback as success).
-        with patch("access.is_allowed", return_value=True), \
-             patch("httpx.post", return_value=mock_response):
+        with patch("access.is_allowed", return_value=True), patch("httpx.post", return_value=mock_response):
             reg = client.post(
                 f"/v1/sessions/{session_id}/seats",
                 json={"client_type": "claude-code-channel", "device_uuid": session_id},

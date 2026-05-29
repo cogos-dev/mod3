@@ -1540,7 +1540,7 @@ async def seat_register(session_id: str, request: Request):
         import httpx as _httpx
 
         _kernel_payload: dict = {
-            "session_id": session_id,                   # pass EXISTING id — never re-mint
+            "session_id": session_id,  # pass EXISTING id — never re-mint
             "participant_id": f"channel-client::{client_type}",
             "participant_type": "agent",
             "kind": "channel-client",
@@ -1563,9 +1563,7 @@ async def seat_register(session_id: str, request: Request):
             _kernel_payload["participant_id"],
         )
     except Exception as _kce:  # noqa: BLE001 — never block seat registration on kernel callback
-        logger.warning(
-            "kernel session-register callback failed (non-fatal): %s", _kce
-        )
+        logger.warning("kernel session-register callback failed (non-fatal): %s", _kce)
 
     # Emit presence.started when any identity claim is present.
     #
@@ -1649,9 +1647,7 @@ def seat_revoke(session_id: str, seat_id: str):
             seat_id,
         )
     except Exception as _kde:  # noqa: BLE001 — never block seat revoke on kernel callback
-        logger.warning(
-            "kernel session-deregister callback failed (non-fatal): %s", _kde
-        )
+        logger.warning("kernel session-deregister callback failed (non-fatal): %s", _kde)
 
     return {"status": "revoked", "seat_id": seat_id, "session_id": session_id}
 
