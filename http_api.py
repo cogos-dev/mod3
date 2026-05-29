@@ -166,6 +166,37 @@ async def _lifespan(application: FastAPI):
     except Exception as e:  # noqa: BLE001 — never fail startup on session init
         logger.warning("auto-create 'main' session failed (non-fatal): %s", e)
 
+    # 3b. Wire seat-liveness ↔ session-lifecycle so orphaned sessions get reaped.
+    #
+    #     A seat with no live SSE stream is not a seat (per the
+    #     seat-as-coordination-surface model). Two hooks close the loop:
+    #       * liveness_check: the reaper asks the seat registry whether a
+    #         session still has a live SSE connection before pruning it, so a
+    #         live-but-quiet seat is preserved.
+    #       * on_session_idle: when a session's last SSE stream closes (client
+    #         killed/crashed/closed without the graceful DELETE-seat hook), the
+    #         seat registry tells the session registry to deregister it. 'main'
+    #         is never reaped — it is the daemon's persistent pool.
+    try:
+        from seats import get_seat_registry as _get_seat_registry
+        from session_registry import MAIN_SESSION_ID as _MAIN_SID
+        from session_registry import get_default_registry as _get_session_registry
+
+        _seat_reg = _get_seat_registry()
+        _sess_reg = _get_session_registry()
+        _sess_reg.set_liveness_check(_seat_reg.has_live_stream)
+
+        def _on_session_idle(session_id: str) -> None:
+            if session_id == _MAIN_SID:
+                return
+            res = _sess_reg.deregister(session_id)
+            if res.get("status") == "ok":
+                logger.info("deregistered session '%s' on last-SSE-stream close", session_id)
+
+        _seat_reg.set_on_session_idle(_on_session_idle)
+    except Exception as e:  # noqa: BLE001 — never fail startup on liveness wiring
+        logger.warning("seat-liveness wiring failed (non-fatal): %s", e)
+
     yield  # application is running
 
     # --- shutdown (reverse order) ---
@@ -1817,6 +1848,15 @@ async def session_message(session_id: str, request: Request):
         },
         exclude_seat=originating_seat,
     )
+
+    # Mark the session active so the lifecycle reaper does not prune a quiet
+    # but still-coordinating session on the next sweep.
+    try:
+        from session_registry import get_default_registry as _get_session_registry
+
+        _get_session_registry().touch(session_id)
+    except Exception:  # noqa: BLE001 — touch is best-effort
+        pass
 
     try:
         from message_store import get_default_store as _get_msg_store

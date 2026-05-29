@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger("mod3.seats")
 
@@ -98,6 +98,55 @@ class SeatRegistry:
         self._lock = threading.Lock()
         # {session_id: {seat_id: Seat}}
         self._seats: dict[str, dict[str, Seat]] = {}
+        # Live SSE stream counts keyed by session_id. A seat's liveness is
+        # defined by an open SSE stream (GET .../events), not by the registry
+        # record — a seat with no live connection is not a seat (per the
+        # seat-as-coordination-surface model). ``sse_stream`` increments on
+        # entry and decrements on disconnect via mark_stream_open/closed.
+        self._live_streams: dict[str, int] = {}
+        # Callback fired when a session's last live SSE stream closes. Wired by
+        # http_api to deregister the orphaned session from the SessionRegistry.
+        # Kept as a plain callable to avoid a circular import on session_registry.
+        self._on_session_idle: Callable[[str], None] | None = None
+
+    # ------------------------------------------------------------------
+    # Liveness tracking
+    # ------------------------------------------------------------------
+
+    def set_on_session_idle(self, callback: Callable[[str], None] | None) -> None:
+        """Register a callback fired when a session's last SSE stream closes."""
+        with self._lock:
+            self._on_session_idle = callback
+
+    def mark_stream_open(self, session_id: str) -> None:
+        with self._lock:
+            self._live_streams[session_id] = self._live_streams.get(session_id, 0) + 1
+
+    def mark_stream_closed(self, session_id: str) -> None:
+        """Decrement the live-stream count; fire the idle callback at zero."""
+        with self._lock:
+            count = self._live_streams.get(session_id, 0) - 1
+            if count <= 0:
+                self._live_streams.pop(session_id, None)
+                idle = True
+                callback = self._on_session_idle
+            else:
+                self._live_streams[session_id] = count
+                idle = False
+                callback = None
+        if idle and callback is not None:
+            try:
+                callback(session_id)
+            except Exception as exc:  # noqa: BLE001 — never let a stream teardown crash on the callback
+                logger.warning("on_session_idle callback failed for %s: %s", session_id, exc)
+
+    def has_live_stream(self, session_id: str) -> bool:
+        with self._lock:
+            return self._live_streams.get(session_id, 0) > 0
+
+    def live_session_ids(self) -> set[str]:
+        with self._lock:
+            return {sid for sid, n in self._live_streams.items() if n > 0}
 
     # ------------------------------------------------------------------
     # Seat lifecycle
@@ -291,6 +340,12 @@ async def sse_stream(seat: Seat):
     """
     seat.loop = asyncio.get_running_loop()
     KEEPALIVE_INTERVAL = 15.0
+    # Liveness: an open SSE stream is what makes this seat's session "live".
+    # Mark it open here and closed in the finally so a killed/crashed client
+    # (which never runs the DELETE seat hook) still drops liveness when its
+    # stream tears down — letting the reaper prune the orphaned session.
+    registry = get_seat_registry()
+    registry.mark_stream_open(seat.session_id)
     try:
         while True:
             try:
@@ -310,4 +365,5 @@ async def sse_stream(seat: Seat):
     except asyncio.CancelledError:
         pass
     finally:
+        registry.mark_stream_closed(seat.session_id)
         logger.debug("SSE stream closed for seat %s", seat.seat_id)
