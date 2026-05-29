@@ -460,10 +460,7 @@ async def _localhost_csrf_guard(request: Request, call_next):
             status_code=403,
             content={
                 "error": "forbidden",
-                "detail": (
-                    f"Origin {origin!r} is not allowed. "
-                    "Set MOD3_ALLOWED_ORIGINS to add origins."
-                ),
+                "detail": (f"Origin {origin!r} is not allowed. Set MOD3_ALLOWED_ORIGINS to add origins."),
             },
         )
 
