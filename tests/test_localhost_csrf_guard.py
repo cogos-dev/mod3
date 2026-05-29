@@ -108,9 +108,7 @@ class TestOriginGuard:
             json=_MUTATING_BODY,
             headers={"Host": _GOOD_HOST, "Origin": disallowed},
         )
-        assert resp.status_code == 403, (
-            f"Expected 403 for Origin={disallowed!r}, got {resp.status_code}"
-        )
+        assert resp.status_code == 403, f"Expected 403 for Origin={disallowed!r}, got {resp.status_code}"
 
     @pytest.mark.parametrize("allowed", _ALLOWED_ORIGINS)
     def test_allowed_localhost_origin_passes(self, client, allowed):
@@ -122,9 +120,7 @@ class TestOriginGuard:
         )
         # 200 = ok, 400 = bad payload — either means the guard passed.
         # 403 would mean the guard wrongly blocked it.
-        assert resp.status_code != 403, (
-            f"Guard incorrectly rejected allowed Origin={allowed!r}: {resp.status_code}"
-        )
+        assert resp.status_code != 403, f"Guard incorrectly rejected allowed Origin={allowed!r}: {resp.status_code}"
 
     def test_no_origin_header_passes(self, client):
         """Requests without an Origin header (non-browser / same-origin) are not blocked.
@@ -138,9 +134,7 @@ class TestOriginGuard:
             headers={"Host": _GOOD_HOST},
             # No Origin header.
         )
-        assert resp.status_code != 403, (
-            f"Guard incorrectly blocked request with no Origin: {resp.status_code}"
-        )
+        assert resp.status_code != 403, f"Guard incorrectly blocked request with no Origin: {resp.status_code}"
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +182,7 @@ class TestHostGuard:
             json=_MUTATING_BODY,
             headers={"Host": good_host},
         )
-        assert resp.status_code != 403, (
-            f"Guard incorrectly rejected Host={good_host!r}: {resp.status_code}"
-        )
+        assert resp.status_code != 403, f"Guard incorrectly rejected Host={good_host!r}: {resp.status_code}"
 
 
 # ---------------------------------------------------------------------------
