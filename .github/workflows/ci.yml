@@ -51,7 +51,10 @@ jobs:
           python -c "
           from fastapi.testclient import TestClient
           from http_api import app
-          client = TestClient(app)
+          # base_url must be a loopback host: the _localhost_csrf_guard
+          # (Origin/Host validation) 403s state-changing requests whose Host
+          # is not loopback, and TestClient's default Host is "testserver".
+          client = TestClient(app, base_url="http://localhost")
 
           # Health check
           r = client.get('/health')
