@@ -29,6 +29,7 @@ from __future__ import annotations
 import atexit
 import heapq
 import logging
+import os
 import threading
 import time
 import uuid
@@ -64,6 +65,16 @@ VOICE_POOL: tuple[str, ...] = (
 DEFAULT_SESSION_ID = "default"
 DEFAULT_PARTICIPANT_ID = "legacy"
 DEFAULT_PARTICIPANT_TYPE = "agent"
+
+# The 'main' session is the daemon's persistent channel pool (seeded at startup
+# in http_api). It is never reaped: it represents the daemon itself, not a
+# per-client harness, so it must survive idle periods.
+MAIN_SESSION_ID = "main"
+
+# Sessions whose ``last_active`` exceeds this and which have no live SSE stream
+# are pruned by the background reaper. Overridable per-registry and via env.
+DEFAULT_SESSION_TTL_SECONDS = 600.0  # 10 minutes
+DEFAULT_REAPER_INTERVAL_SECONDS = 60.0
 
 SERIALIZATION_POLICIES = ("round-robin", "priority", "fifo-global")
 
@@ -629,6 +640,10 @@ class SessionRegistry:
         voice_pool: Iterable[str] | None = None,
         serializer: GlobalSerializer | None = None,
         device_resolver: Callable[[str], ResolvedOutputDevice] | None = None,
+        ttl_seconds: float | None = None,
+        reaper_interval_seconds: float | None = None,
+        liveness_check: Callable[[str], bool] | None = None,
+        now: Callable[[], float] = time.time,
     ):
         self._lock = threading.RLock()
         self._sessions: dict[str, SessionChannel] = {}
@@ -640,6 +655,27 @@ class SessionRegistry:
         self._serializer = serializer or GlobalSerializer()
         self._device_resolver = device_resolver or resolve_output_device
 
+        # -- Reaper (session-lifecycle TTL) ---------------------------------
+        # A session with no live SSE stream that has been idle past the TTL is
+        # an orphan: its client was killed/crashed/closed without running the
+        # graceful DELETE-seat hook. The reaper prunes these so the registry
+        # tracks live coordination surfaces, not stale records.
+        self._now = now
+        if ttl_seconds is None:
+            ttl_seconds = float(os.environ.get("MOD3_SESSION_TTL_SECONDS", DEFAULT_SESSION_TTL_SECONDS))
+        if reaper_interval_seconds is None:
+            reaper_interval_seconds = float(
+                os.environ.get("MOD3_SESSION_REAPER_INTERVAL_SECONDS", DEFAULT_REAPER_INTERVAL_SECONDS)
+            )
+        self._ttl_seconds = ttl_seconds
+        self._reaper_interval = reaper_interval_seconds
+        # Returns True if the session currently has a live connection (SSE
+        # stream). Defaults to "never live" so the reaper falls back purely to
+        # the TTL when no liveness source is wired (e.g. in isolated tests).
+        self._liveness_check = liveness_check or (lambda _sid: False)
+        self._reaper_stopping = threading.Event()
+        self._reaper_thread: threading.Thread | None = None
+
     # -- Lifecycle ----------------------------------------------------------
 
     @property
@@ -648,9 +684,97 @@ class SessionRegistry:
 
     def start(self) -> None:
         self._serializer.start()
+        self._start_reaper()
 
     def stop(self) -> None:
+        self._stop_reaper()
         self._serializer.stop()
+
+    def set_liveness_check(self, check: Callable[[str], bool]) -> None:
+        """Wire the source of truth for "does this session have a live stream".
+
+        The reaper consults this before pruning so a live-but-quiet seat
+        (idle past the TTL but still holding an SSE connection) is preserved.
+        """
+        with self._lock:
+            self._liveness_check = check
+
+    # -- Reaper -------------------------------------------------------------
+
+    def _start_reaper(self) -> None:
+        """Start the background sweep thread. Idempotent."""
+        with self._lock:
+            if self._reaper_thread is not None and self._reaper_thread.is_alive():
+                return
+            if self._reaper_interval <= 0:
+                return  # disabled
+            self._reaper_stopping.clear()
+            self._reaper_thread = threading.Thread(
+                target=self._reaper_run,
+                name="mod3-session-reaper",
+                daemon=True,
+            )
+            self._reaper_thread.start()
+
+    def _stop_reaper(self) -> None:
+        self._reaper_stopping.set()
+        t = self._reaper_thread
+        if t is not None:
+            t.join(timeout=2.0)
+        self._reaper_thread = None
+
+    def _reaper_run(self) -> None:
+        while not self._reaper_stopping.wait(self._reaper_interval):
+            try:
+                self.reap_stale()
+            except Exception as exc:  # noqa: BLE001 — never let the reaper thread die
+                logger.exception("session reaper sweep raised: %s", exc)
+
+    def reap_stale(self) -> list[str]:
+        """Deregister sessions that are stale AND have no live SSE stream.
+
+        A session is stale when ``now - last_active`` exceeds the TTL. The
+        ``main`` session is never reaped (it is the daemon's persistent pool).
+        Returns the list of session_ids that were reaped. Exposed (not just
+        internal) so it can be triggered deterministically in tests.
+        """
+        now = self._now()
+        with self._lock:
+            candidates = [
+                sid
+                for sid, s in self._sessions.items()
+                if sid != MAIN_SESSION_ID and (now - s.last_active) > self._ttl_seconds
+            ]
+            liveness_check = self._liveness_check
+        reaped: list[str] = []
+        for sid in candidates:
+            # Re-check liveness outside the registry lock — the liveness source
+            # (seat registry) takes its own lock and we must not nest them.
+            try:
+                if liveness_check(sid):
+                    continue
+            except Exception as exc:  # noqa: BLE001 — treat a failing check as "unknown"; do not reap
+                logger.warning("liveness check failed for %s — skipping reap: %s", sid, exc)
+                continue
+            result = self.deregister(sid)
+            if result.get("status") == "ok":
+                reaped.append(sid)
+        if reaped:
+            logger.info("session reaper pruned %d stale session(s): %s", len(reaped), reaped)
+        return reaped
+
+    def touch(self, session_id: str) -> bool:
+        """Bump ``last_active`` for ``session_id``. Returns False if unknown.
+
+        Called on seat activity (registration, fan-out, message routing) so the
+        reaper's TTL reflects real coordination traffic, not just submit() jobs.
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return False
+            session.last_active = self._now()
+            return True
 
     # -- Session management -------------------------------------------------
 
@@ -670,12 +794,13 @@ class SessionRegistry:
                 existing.participant_id = participant_id
                 existing.participant_type = participant_type
                 existing.preferred_output_device = preferred_output_device or "system-default"
-                existing.last_active = time.time()
+                existing.last_active = self._now()
                 # Don't reshuffle voice on re-register. If the caller wants a
                 # different voice they should deregister first.
                 return RegistrationResult(existing, created=False, voice_conflict=existing.voice_conflict)
 
             voice, conflict = self._allocate_voice(session_id, preferred_voice)
+            _now = self._now()
             session = SessionChannel(
                 session_id=session_id,
                 participant_id=participant_id,
@@ -685,6 +810,8 @@ class SessionRegistry:
                 preferred_voice=preferred_voice,
                 preferred_output_device=preferred_output_device or "system-default",
                 priority=priority,
+                registered_at=_now,
+                last_active=_now,
             )
             self._sessions[session_id] = session
             self._serializer.attach_session(session)
@@ -882,6 +1009,9 @@ __all__ = [
     "DEFAULT_SESSION_ID",
     "DEFAULT_PARTICIPANT_ID",
     "DEFAULT_PARTICIPANT_TYPE",
+    "MAIN_SESSION_ID",
+    "DEFAULT_SESSION_TTL_SECONDS",
+    "DEFAULT_REAPER_INTERVAL_SECONDS",
     "GlobalSerializer",
     "RegistrationResult",
     "ResolvedOutputDevice",
