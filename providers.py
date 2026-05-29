@@ -342,24 +342,85 @@ class OllamaProvider:
 class CogOSProvider:
     """CogOS kernel — OpenAI-compatible chat/completions with tool support.
 
-    Routes inference through the kernel at localhost:6931, which applies the
-    Tier-1 provider ladder: Eclipse 26b A4B (on LAN) > Darkstar local runtimes
-    (off-LAN) > Ollama E4B (safety net). The dashboard always gets the best
-    available model, not the in-process Gemma 3 4B fallback.
+    Routes inference through the kernel at localhost:6931, asking for the
+    preferred LOCAL model (Eclipse 26b A4B on the LAN) via the COGOS_MODEL
+    alias. The kernel's own ``fallback_chain`` is cloud-first, so when the
+    preferred local model is unreachable the kernel would silently route to a
+    PAID cloud provider (Claude / Codex) — exactly the wrong thing for the
+    voice loop, which must stay on local inference (see the autonomy-floor
+    constraint: E4B-on-Darkstar is the floor every path is designed against).
+
+    To guarantee voice never silently leaves local inference, this provider:
+
+      1. Pre-flight-probes the preferred local LAN model (Eclipse) before
+         delegating to the kernel. If Eclipse is unreachable, it routes
+         DIRECTLY through a local ``OllamaProvider`` (gemma4:e4b) instead of
+         letting the kernel pick a cloud provider. ``cog://kernel/status``
+         reports KERNEL liveness, not per-provider liveness, so a direct probe
+         of the Eclipse endpoint is the only signal that actually answers
+         "is the preferred local model up THIS turn?".
+      2. Falls back to the same local ``OllamaProvider`` on any kernel error
+         (429 cloud rate-limit, 5xx, timeout, connection failure) rather than
+         killing the turn.
 
     Model routing is controlled by the COGOS_MODEL env var (default:
     "lmstudio-eclipse" — the kernel provider alias for Eclipse 26b A4B). Set to
     "local" for the Ollama baseline, "google/gemma-4-26b-a4b" for an explicit
     model id, or any other kernel provider alias.
+
+    Local-fallback knobs:
+      MOD3_ECLIPSE_PROBE_URL — health URL for the preferred LAN model
+        (default: http://192.168.10.191:1234/v1/models, the LM Studio
+        /v1/models endpoint on Eclipse). Set to empty string to disable the
+        pre-flight probe (delegate to the kernel unconditionally).
+      MOD3_COGOS_TIMEOUT — kernel request timeout in seconds (default 45).
+        A kernel CLI cold-start can stall a voice turn for a long time; a
+        shorter ceiling with local fallback keeps the loop responsive.
     """
 
-    def __init__(self, endpoint: str | None = None, model: str | None = None):
+    def __init__(
+        self,
+        endpoint: str | None = None,
+        model: str | None = None,
+        eclipse_probe_url: str | None = None,
+        ollama_fallback: "OllamaProvider | None" = None,
+    ):
         self._endpoint = endpoint or os.environ.get("COGOS_ENDPOINT", "http://localhost:6931")
         self._model = model or os.environ.get("COGOS_MODEL", "lmstudio-eclipse")
+        # Preferred LOCAL LAN model health URL. Probed before delegating to the
+        # kernel so we never let the kernel's cloud-first fallback chain route
+        # voice to a paid provider when the local model is down.
+        if eclipse_probe_url is None:
+            eclipse_probe_url = os.environ.get("MOD3_ECLIPSE_PROBE_URL", "http://192.168.10.191:1234/v1/models")
+        self._eclipse_probe_url = eclipse_probe_url
+        # Local fallback target — E4B on the local Ollama daemon, the autonomy
+        # floor. Constructed lazily-but-eagerly here so it shares this process's
+        # env config; never points at a cloud provider.
+        self._ollama = ollama_fallback or OllamaProvider()
+        try:
+            self._timeout = float(os.environ.get("MOD3_COGOS_TIMEOUT", "45"))
+        except ValueError:
+            self._timeout = 45.0
 
     @property
     def name(self) -> str:
         return f"cogos/{self._model}"
+
+    async def _eclipse_reachable(self) -> bool:
+        """Probe the preferred local LAN model (Eclipse) endpoint.
+
+        Returns True when the endpoint answers with a non-5xx status. An empty
+        probe URL disables the check (returns True — delegate to the kernel
+        unconditionally). Any connection/timeout error counts as unreachable.
+        """
+        if not self._eclipse_probe_url:
+            return True
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                r = await client.get(self._eclipse_probe_url)
+                return r.status_code < 500
+        except Exception:
+            return False
 
     @staticmethod
     def _make_traceparent() -> tuple[str, str]:
@@ -373,7 +434,7 @@ class CogOSProvider:
         dict so downstream phase events (chat_flow_log.emit_phase) can
         include it as a correlation field without an OTel SDK dependency.
         """
-        trace_id = uuid.uuid4().hex + uuid.uuid4().hex[:0]  # 32 hex chars
+        trace_id = uuid.uuid4().hex  # uuid4().hex is exactly 32 hex chars
         # uuid4().hex is 32 chars; take first 16 for parent span id
         parent_id = uuid.uuid4().hex[:16]
         traceparent = f"00-{trace_id}-{parent_id}-01"
@@ -385,6 +446,21 @@ class CogOSProvider:
         tools: list[dict] | None = None,
         system: str = "",
     ) -> ProviderResponse:
+        # FIX #1 (primary): guarantee voice stays on a LOCAL model.
+        #
+        # The kernel's fallback_chain is cloud-first, so if we delegate while
+        # the preferred local model (Eclipse) is down, the kernel silently
+        # routes to a PAID cloud provider. Pre-flight-probe Eclipse; if it's
+        # unreachable, route DIRECTLY through the local Ollama E4B floor and
+        # never touch the kernel (whose chain might pick cloud).
+        if not await self._eclipse_reachable():
+            logger.warning(
+                "cogos: preferred local model unreachable (%s) — routing voice "
+                "to local Ollama E4B instead of letting the kernel pick cloud",
+                self._eclipse_probe_url,
+            )
+            return await self._ollama.chat(messages, tools=tools, system=system)
+
         msgs = list(messages)
         if system:
             msgs = [{"role": "system", "content": system}] + msgs
@@ -412,14 +488,26 @@ class CogOSProvider:
             "traceparent": traceparent,
         }
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(
-                f"{self._endpoint}/v1/chat/completions",
-                json=body,
-                headers=headers,
+        # FIX #2 (medium): never let a kernel error kill the voice turn.
+        # A kernel 429 (cloud rate-limit), 5xx, timeout, or connection failure
+        # falls back to the local Ollama E4B floor instead of raising. The
+        # timeout is a short ceiling (MOD3_COGOS_TIMEOUT, default 45s) so a
+        # kernel CLI cold-start can't stall a voice turn for two minutes.
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.post(
+                    f"{self._endpoint}/v1/chat/completions",
+                    json=body,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except (httpx.HTTPStatusError, httpx.TransportError) as exc:
+            logger.warning(
+                "cogos: kernel request failed (%s) — falling back to local Ollama E4B",
+                exc,
             )
-            resp.raise_for_status()
-            data = resp.json()
+            return await self._ollama.chat(messages, tools=tools, system=system)
 
         choice = data.get("choices", [{}])[0]
         msg = choice.get("message", {})
