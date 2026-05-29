@@ -277,7 +277,7 @@ class TestSubscribersEndpoint:
 
         import http_api
 
-        return TestClient(http_api.app)
+        return TestClient(http_api.app, base_url="http://localhost:7860")
 
     @pytest.fixture(autouse=True)
     def _isolate_subscribers(self):
@@ -366,7 +366,7 @@ class TestDisconnectBot:
 
         import http_api
 
-        return TestClient(http_api.app)
+        return TestClient(http_api.app, base_url="http://localhost:7860")
 
     @pytest.fixture(autouse=True)
     def _isolate_subscribers(self):
@@ -437,7 +437,7 @@ class TestSynthesizeEmitsRtviOverWS:
 
         import http_api
 
-        return TestClient(http_api.app)
+        return TestClient(http_api.app, base_url="http://localhost:7860")
 
     @pytest.fixture(autouse=True)
     def _isolate(self):

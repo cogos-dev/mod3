@@ -31,7 +31,7 @@ def client():
 
     import http_api
 
-    return TestClient(http_api.app)
+    return TestClient(http_api.app, base_url="http://localhost:7860")
 
 
 # ---------------------------------------------------------------------------

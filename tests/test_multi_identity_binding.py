@@ -261,7 +261,7 @@ def client():
     # TestClient host is "testclient", not "127.0.0.1". Patch the import so
     # these tests focus on identity binding, not access policy.
     with patch.dict("sys.modules", {"access": None}):
-        yield TestClient(http_api.app)
+        yield TestClient(http_api.app, base_url="http://localhost:7860")
 
 
 @pytest.fixture(autouse=True)

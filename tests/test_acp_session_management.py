@@ -35,7 +35,7 @@ def client():
 
     import http_api
 
-    return TestClient(http_api.app)
+    return TestClient(http_api.app, base_url="http://localhost:7860")
 
 
 def _req(method: str, params: dict, id: int = 1) -> str:
