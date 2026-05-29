@@ -4,7 +4,9 @@ Runs a background thread that listens to the microphone via AudioCapture,
 gates on Silero VAD to avoid waking Whisper on silence, accumulates speech
 until an utterance boundary (silence window), then sends the complete
 utterance through ModalityBus.perceive() for STT and BoH filtering.
-Transcripts are emitted as MCP channel notifications to Claude Code.
+Transcripts are fanned out to all channel-client seats via the seat
+registry; each seat forwards them to its Claude Code host as a
+``notifications/claude/channel`` notification (see clients/channel_client.py).
 
 Reflex arc: if TTS is playing when the user speaks, the pipeline calls
 PipelineState.interrupt() to flush playback within ~50ms — no LLM
@@ -31,7 +33,6 @@ No side effects on import.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import re
@@ -44,7 +45,7 @@ from bus import ModalityBus
 from capture import AudioCapture
 from pipeline_graph import ChannelMode, compose_stages, register_stage, resolve_pipeline
 from pipeline_state import PipelineState
-from server import emit_channel_event, emit_permission_verdict
+from seats import get_seat_registry
 from vad import VADResult, detect_speech
 
 # Matches verbal permission verdicts like "yes abcde", "n fghij" (case insensitive).
@@ -243,8 +244,9 @@ class InboundPipeline:
     """Continuous voice input: mic → VAD → STT → channel notification.
 
     Runs in a background thread. Uses AudioCapture for mic input,
-    ModalityBus.perceive() for the VAD→STT→BoH pipeline, and
-    emit_channel_event() to send notifications to Claude Code.
+    ModalityBus.perceive() for the VAD→STT→BoH pipeline, and the seat
+    registry's fan_out_all() to deliver transcripts to channel-client
+    seats (which relay them to Claude Code as notifications/claude/channel).
     """
 
     # Default silence threshold for utterance endpointing.
@@ -553,7 +555,7 @@ class InboundPipeline:
 
             _get_subs().emit_user_transcription("default", event.content, is_final=True)
         except Exception:
-            pass  # best-effort; ACP delivery above is the primary path
+            pass  # best-effort; seat fan-out above is the primary path
 
     # ------------------------------------------------------------------
     # Speech accumulation
@@ -659,15 +661,35 @@ class InboundPipeline:
     # ------------------------------------------------------------------
 
     def _emit_notification(self, event, vad_result: VADResult) -> None:
-        """Send the transcript to Claude Code as a channel notification.
+        """Fan the transcript out to channel-client seats.
 
-        If the transcript matches a permission verdict pattern (e.g. "yes abcde"),
-        emits a permission verdict notification instead of a normal channel event.
+        Transcripts are broadcast to ALL seats across all sessions via
+        ``SeatRegistry.fan_out_all()``; each channel-client seat relays the
+        ``user_message`` event to its Claude Code host as a
+        ``notifications/claude/channel`` notification (clients/channel_client.py).
 
-        emit_channel_event() / emit_permission_verdict() are async; we run
-        them synchronously from the background thread via asyncio.run().
+        ``fan_out_all`` is synchronous and thread-safe (it enqueues onto each
+        seat's SSE queue via ``loop.call_soon_threadsafe``), so it is called
+        directly from this background thread — no asyncio.run() round-trip.
+
+        The inbound pipeline is not session-scoped today, so it broadcasts to
+        all seats rather than a specific session. If/when the pipeline becomes
+        session-scoped, switch to ``fan_out(session_id, ...)``.
+
+        Permission verdicts:
+          A verbal verdict ("yes abcde") still parses here, but the
+          channel-client split (PR #40) removed the in-process
+          ``emit_permission_verdict`` path that pushed
+          ``notifications/claude/channel/permission`` to Claude Code. There is
+          no seat fan-out event type for verdicts today, so the verbal-verdict
+          path is broadcast best-effort as a ``permission_verdict`` event and
+          flagged for follow-up (see module-level NOTE). Until a channel-client
+          handler + verdict relay land, verbal verdicts are NOT delivered to
+          Claude Code as permission responses.
         """
-        # Check if this transcript is a permission verdict
+        registry = get_seat_registry()
+
+        # Check if this transcript is a permission verdict.
         match = PERMISSION_VERDICT_RE.match(event.content)
         if match:
             request_id = match.group(2).lower()
@@ -678,29 +700,40 @@ class InboundPipeline:
                 request_id,
                 event.content,
             )
+            # FOLLOW-UP: no channel-client handler consumes "permission_verdict"
+            # yet (clients/channel_client.py:_handle_sse_event handles
+            # user_message / pairing_request / permission_request only). This
+            # broadcast is a placeholder so the signal is observable; it is not
+            # yet relayed to Claude Code as notifications/claude/channel/permission.
             try:
-                asyncio.run(emit_permission_verdict(request_id, behavior))
-            except RuntimeError as exc:
-                logger.warning("failed to emit permission verdict: %s", exc)
+                registry.fan_out_all(
+                    {
+                        "type": "permission_verdict",
+                        "request_id": request_id,
+                        "behavior": behavior,
+                    }
+                )
             except Exception:
-                logger.exception("unexpected error emitting permission verdict")
+                logger.exception("unexpected error fanning out permission verdict")
             return
 
-        # Normal channel notification path
+        # Normal transcript path — fan out as a voice user_message.
         try:
-            asyncio.run(
-                emit_channel_event(
-                    content=event.content,
-                    meta={
+            count = registry.fan_out_all(
+                {
+                    "type": "user_message",
+                    "content": event.content,
+                    "input_type": "voice",
+                    "role": "user",
+                    "meta": {
                         "source": "mod3-voice",
                         "speaker": self._speaker,
                         "confidence": str(round(event.confidence, 2)),
                         "speech_ratio": str(round(vad_result.speech_ratio, 2)),
                     },
-                )
+                }
             )
-        except RuntimeError as exc:
-            # MCP session not active — log but don't crash the loop
-            logger.warning("failed to emit channel event: %s", exc)
+            if count == 0:
+                logger.debug("transcript fanned out to 0 seats (no channel-client attached)")
         except Exception:
-            logger.exception("unexpected error emitting channel event")
+            logger.exception("unexpected error fanning out transcript")
