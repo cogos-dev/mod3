@@ -365,8 +365,9 @@ def encode_ogg(samples, sample_rate: int) -> bytes:
     if sample_rate not in _OPUS_VALID_RATES:
         # Resample to 24000 — nearest Opus-compatible rate to most TTS engines.
         try:
-            from scipy.signal import resample_poly
             import math
+
+            from scipy.signal import resample_poly
 
             target_rate = 24000
             gcd = math.gcd(target_rate, sample_rate)

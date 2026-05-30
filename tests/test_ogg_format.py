@@ -20,7 +20,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Schema tests
 # ---------------------------------------------------------------------------
@@ -91,7 +90,7 @@ class TestSpeakRequestHasNoFormatField:
         """
         from schemas.http.synthesize import SpeakRequest
 
-        req = SpeakRequest(**{"text": "hello", "format": "ogg"})  # type: ignore[arg-type]
+        _req = SpeakRequest(**{"text": "hello", "format": "ogg"})  # type: ignore[arg-type]
         assert "format" not in SpeakRequest.model_fields
 
 
