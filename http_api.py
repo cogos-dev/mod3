@@ -1,7 +1,7 @@
 """Mod³ HTTP API — REST interface for TTS synthesis, VAD, and dashboard.
 
 Endpoints:
-  POST /v1/synthesize  — text → audio bytes (WAV/PCM) + structured metrics
+  POST /v1/synthesize  — text → audio bytes (WAV/PCM/OGG-Opus) + structured metrics
   POST /v1/audio/speech — OpenAI-compatible TTS endpoint
   POST /v1/vad         — audio file → speech detection result
   POST /v1/filter      — text → hallucination check
@@ -343,6 +343,47 @@ def encode_wav(samples, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
+# Opus only accepts these sample rates (RFC 7587).
+_OPUS_VALID_RATES = frozenset({8000, 12000, 16000, 24000, 48000})
+
+
+def encode_ogg(samples, sample_rate: int) -> bytes:
+    """Encode float32 samples as OGG/Opus.
+
+    Mirrors encode_wav() — takes the same inputs, returns raw bytes.
+    Opus requires one of {8000, 12000, 16000, 24000, 48000} Hz; if the
+    engine produces a non-standard rate (e.g. 22050) the samples are
+    resampled to 24000 before encoding.
+
+    Target bitrate is controlled by soundfile/libopus defaults (~24 kbps
+    for speech at 24 kHz mono).
+    """
+    import numpy as np
+    import soundfile as sf
+
+    samples = np.asarray(samples, dtype=np.float32)
+    if sample_rate not in _OPUS_VALID_RATES:
+        # Resample to 24000 — nearest Opus-compatible rate to most TTS engines.
+        try:
+            from scipy.signal import resample_poly
+            import math
+
+            target_rate = 24000
+            gcd = math.gcd(target_rate, sample_rate)
+            up, down = target_rate // gcd, sample_rate // gcd
+            samples = resample_poly(samples, up, down).astype(np.float32)
+            sample_rate = target_rate
+        except ImportError:
+            raise RuntimeError(
+                f"OGG/Opus encoding requires sample_rate in {sorted(_OPUS_VALID_RATES)}; "
+                f"got {sample_rate} Hz and scipy is not available for resampling."
+            )
+
+    buf = io.BytesIO()
+    sf.write(buf, samples, sample_rate, format="OGG", subtype="OPUS")
+    return buf.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # Request / Response models — imported from schemas.http
 # (SynthesizeRequest, SpeechRequest, ShutdownRequest, SessionRegisterRequest,
@@ -600,6 +641,10 @@ def synthesize(req: SynthesizeRequest):
         pcm = (np.clip(all_samples, -1.0, 1.0) * 32767).astype(np.int16)
         audio_bytes = pcm.tobytes()
         media_type = "audio/pcm"
+        wav_for_ws = encode_wav(all_samples, sample_rate)  # dashboard always gets WAV
+    elif req.format == "ogg":
+        audio_bytes = encode_ogg(all_samples, sample_rate)
+        media_type = "audio/ogg"
         wav_for_ws = encode_wav(all_samples, sample_rate)  # dashboard always gets WAV
     else:
         audio_bytes = encode_wav(all_samples, sample_rate)

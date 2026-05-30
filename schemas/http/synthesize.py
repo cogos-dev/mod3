@@ -10,13 +10,13 @@ class _Base(BaseModel):
 
 
 class SynthesizeRequest(_Base):
-    """POST /v1/synthesize — text to audio (WAV or PCM)."""
+    """POST /v1/synthesize — text to audio (WAV, PCM, or OGG/Opus)."""
 
     text: str
     voice: str = Field(default="bm_lewis")
     speed: float = Field(default=1.25)
     emotion: float = Field(default=0.5)
-    format: str = Field(default="wav", pattern="^(wav|pcm)$")
+    format: str = Field(default="wav", pattern="^(wav|pcm|ogg)$")
     # ADR-082 Phase 1: optional session routing. When present, the
     # session's assigned_voice overrides ``voice`` (unless an explicit
     # non-default was passed), and the session is advanced in the global
@@ -55,6 +55,7 @@ class SpeakRequest(_Base):
     emotion: float = Field(default=0.5)
     session_id: str = Field(default="")
     ref_audio: str = Field(default="")
+    format: str = Field(default="wav", pattern="^(wav|pcm|ogg)$")
 
 
 __all__ = ["SpeakRequest", "SpeechRequest", "SynthesizeRequest"]
