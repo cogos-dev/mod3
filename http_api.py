@@ -644,7 +644,7 @@ def synthesize(req: SynthesizeRequest):
         wav_for_ws = encode_wav(all_samples, sample_rate)  # dashboard always gets WAV
     elif req.format == "ogg":
         audio_bytes = encode_ogg(all_samples, sample_rate)
-        media_type = "audio/ogg"
+        media_type = "audio/ogg; codecs=opus"
         wav_for_ws = encode_wav(all_samples, sample_rate)  # dashboard always gets WAV
     else:
         audio_bytes = encode_wav(all_samples, sample_rate)

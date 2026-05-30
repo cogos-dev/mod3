@@ -46,6 +46,10 @@ class SpeakRequest(_Base):
     Wraps _start_speech from server.py. Returns immediately after enqueue
     with {job_id, queue_position, status}. Mod3's drain thread owns all
     audio playback — callers do NOT manage afplay/aplay.
+
+    Note: no ``format`` field here. /v1/speak is a playback-queue endpoint;
+    the drain thread always renders WAV for the local audio device. OGG/Opus
+    output is only available via /v1/synthesize (byte-delivery path).
     """
 
     text: str
@@ -55,7 +59,6 @@ class SpeakRequest(_Base):
     emotion: float = Field(default=0.5)
     session_id: str = Field(default="")
     ref_audio: str = Field(default="")
-    format: str = Field(default="wav", pattern="^(wav|pcm|ogg)$")
 
 
 __all__ = ["SpeakRequest", "SpeechRequest", "SynthesizeRequest"]
