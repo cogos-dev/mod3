@@ -39,7 +39,7 @@ MCP surface
   instructions: channel-tag shape + outbound tools description
   tools:
     mod3_dashboard_post(text, role?)  → POST /v1/dashboard-chat
-    mod3_speak(text, voice?, speed?)  → POST /v1/speak
+    mod3_speak(text, voice?, speed?, skip_playback?, format?)  → POST /v1/speak or /v1/synthesize
 
 Usage
 -----
@@ -620,7 +620,7 @@ Pairing requests look like:
 ## Outbound tools
 
   mod3_dashboard_post(text, role?) — send text to the dashboard chat panel
-  mod3_speak(text, voice?, speed?) — synthesize text to speech and play it
+  mod3_speak(text, voice?, speed?, skip_playback?, format?) — synthesize text to speech and play it (or return base64 bytes when skip_playback=True)
 
 Always reply to user messages using mod3_dashboard_post so your response appears
 in the dashboard.  Use mod3_speak when voice output is appropriate.
@@ -674,11 +674,19 @@ def build_mcp_server(client: ChannelClient) -> FastMCP:
         voice: str = "eng_uk_m_davids",
         speed: float = 1.0,
         post_to_chat: bool = True,
+        skip_playback: bool = False,
+        format: str = "wav",
     ) -> dict:
         """Synthesize text to speech and play it through the Mod³ daemon.
 
-        Hits POST /v1/speak (queue-aware endpoint). Returns immediately with a
-        job token — the daemon's drain thread owns all audio playback.
+        When skip_playback=False (default): hits POST /v1/speak (queue-aware
+        endpoint) and returns immediately with a job token — the daemon's drain
+        thread owns all audio playback.
+
+        When skip_playback=True: hits POST /v1/synthesize directly and returns
+        the encoded audio as a base64 string under the key "audio_base64", with
+        "media_type" set to the appropriate MIME type. No audio is played.
+        Useful for retrieving OGG/Opus bytes to forward over a remote channel.
 
         By default also posts the spoken text to the dashboard chat panel as
         an ``assistant`` message so the visible transcript matches what the
@@ -695,19 +703,58 @@ def build_mcp_server(client: ChannelClient) -> FastMCP:
             post_to_chat: When True (default), also POSTs to /v1/dashboard-chat
                 under the current session_id so the spoken text appears in the
                 dashboard chat panel and is persisted to per-session history.
+            skip_playback: When True, call /v1/synthesize and return the audio
+                bytes as base64 without playing. Default: False.
+            format: Output audio format. One of "wav", "pcm", "ogg".
+                "ogg" produces OGG/Opus at ~24 kbps. Only meaningful when
+                skip_playback=True (playback always uses WAV internally).
+                Default: "wav".
 
         Returns:
-            {"job_id": str, "queue_position": int, "status": "speaking" | "queued"}
-            Poll GET /v1/jobs/{job_id} for completion. Stop via POST /v1/stop.
+            skip_playback=False:
+                {"job_id": str, "queue_position": int, "status": "speaking"|"queued"}
+                Poll GET /v1/jobs/{job_id} for completion. Stop via POST /v1/stop.
+            skip_playback=True:
+                {"audio_base64": str, "media_type": str, "format": str,
+                 "duration_sec": float, "sample_rate": int}
         """
-        speak_url = f"{client.server_url}/v1/speak"
-        speak_body: dict[str, Any] = {
-            "text": text,
-            "voice": voice,
-            "speed": speed,
-        }
+        import base64
+
         try:
             async with httpx.AsyncClient() as http:
+                if skip_playback:
+                    synth_url = f"{client.server_url}/v1/synthesize"
+                    synth_body: dict[str, Any] = {
+                        "text": text,
+                        "voice": voice,
+                        "speed": speed,
+                        "format": format,
+                    }
+                    resp = await http.post(
+                        synth_url,
+                        json=synth_body,
+                        headers=_auth_headers(client.token),
+                        timeout=60.0,
+                    )
+                    resp.raise_for_status()
+                    audio_b64 = base64.b64encode(resp.content).decode("ascii")
+                    media_type = resp.headers.get("content-type", "audio/wav").split(";")[0].strip()
+                    duration_sec = float(resp.headers.get("X-Mod3-Duration-Sec", "0"))
+                    sample_rate = int(resp.headers.get("X-Mod3-Sample-Rate", "0"))
+                    return {
+                        "audio_base64": audio_b64,
+                        "media_type": media_type,
+                        "format": format,
+                        "duration_sec": duration_sec,
+                        "sample_rate": sample_rate,
+                    }
+
+                speak_url = f"{client.server_url}/v1/speak"
+                speak_body: dict[str, Any] = {
+                    "text": text,
+                    "voice": voice,
+                    "speed": speed,
+                }
                 # Fan the same text to the dashboard chat panel first so the
                 # transcript lands at roughly the same time as audio playback
                 # begins. Best-effort: a failed post must not block speech.

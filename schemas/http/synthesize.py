@@ -10,13 +10,13 @@ class _Base(BaseModel):
 
 
 class SynthesizeRequest(_Base):
-    """POST /v1/synthesize — text to audio (WAV or PCM)."""
+    """POST /v1/synthesize — text to audio (WAV, PCM, or OGG/Opus)."""
 
     text: str
     voice: str = Field(default="bm_lewis")
     speed: float = Field(default=1.25)
     emotion: float = Field(default=0.5)
-    format: str = Field(default="wav", pattern="^(wav|pcm)$")
+    format: str = Field(default="wav", pattern="^(wav|pcm|ogg)$")
     # ADR-082 Phase 1: optional session routing. When present, the
     # session's assigned_voice overrides ``voice`` (unless an explicit
     # non-default was passed), and the session is advanced in the global
@@ -46,6 +46,10 @@ class SpeakRequest(_Base):
     Wraps _start_speech from server.py. Returns immediately after enqueue
     with {job_id, queue_position, status}. Mod3's drain thread owns all
     audio playback — callers do NOT manage afplay/aplay.
+
+    Note: no ``format`` field here. /v1/speak is a playback-queue endpoint;
+    the drain thread always renders WAV for the local audio device. OGG/Opus
+    output is only available via /v1/synthesize (byte-delivery path).
     """
 
     text: str
