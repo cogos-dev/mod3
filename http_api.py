@@ -4,6 +4,7 @@ Endpoints:
   POST /v1/synthesize  — text → audio bytes (WAV/PCM/OGG-Opus) + structured metrics
   POST /v1/audio/speech — OpenAI-compatible TTS endpoint
   POST /v1/vad         — audio file → speech detection result
+  POST /v1/transcribe  — audio file → transcript (Whisper STT)
   POST /v1/filter      — text → hallucination check
   GET  /v1/voices      — list available engines and voices
   GET  /v1/jobs        — list recent generation jobs with full metrics
@@ -232,6 +233,21 @@ except Exception:
 
 _bus = _shared_bus
 _bus_vad_lock = Lock()
+_stt_transcribe_lock = Lock()
+_stt_decoder: "WhisperDecoder | None" = None
+
+
+def _get_stt_decoder() -> "WhisperDecoder":
+    """Lazy-load WhisperDecoder with large-v3-turbo for /v1/transcribe."""
+    global _stt_decoder
+    if _stt_decoder is None:
+        from modules.voice import WhisperDecoder
+
+        _stt_decoder = WhisperDecoder(
+            model="mlx-community/whisper-large-v3-turbo",
+            load_base=False,
+        )
+    return _stt_decoder
 
 
 def _ensure_bus_modules() -> None:
@@ -927,6 +943,117 @@ async def filter_transcription(req: VadFilterRequest):
     return {
         "is_hallucination": is_hallucination(req.text),
         "text": req.text,
+    }
+
+
+@app.post("/v1/transcribe")
+async def transcribe_audio(file: UploadFile):
+    """Transcribe an audio file to text using Whisper.
+
+    Accepts WAV, OGG, MP3, M4A audio files.
+    Returns transcript with language detection and timing metrics.
+    """
+    import subprocess
+    import tempfile
+
+    import numpy as np
+
+    t_start = time.perf_counter()
+
+    content = await file.read()
+    if not content:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Empty audio file"},
+        )
+
+    # Determine format from content-type or filename extension
+    filename = file.filename or ""
+    content_type = file.content_type or ""
+
+    is_wav = (
+        filename.lower().endswith(".wav")
+        or content_type == "audio/wav"
+        or content_type == "audio/x-wav"
+        or content[:4] == b"RIFF"
+    )
+
+    try:
+        if is_wav:
+            raw_audio, sample_rate = _read_wav_as_mono_float32(content)
+            audio = np.frombuffer(raw_audio, dtype=np.float32)
+        else:
+            # Convert non-WAV to WAV using ffmpeg
+            with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as tmp_in:
+                tmp_in.write(content)
+                tmp_in_path = tmp_in.name
+
+            tmp_out_path = tmp_in_path + ".wav"
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        tmp_in_path,
+                        "-ar",
+                        "16000",
+                        "-ac",
+                        "1",
+                        "-f",
+                        "wav",
+                        tmp_out_path,
+                    ],
+                    capture_output=True,
+                    check=True,
+                    timeout=30,
+                )
+                with open(tmp_out_path, "rb") as f:
+                    wav_content = f.read()
+                raw_audio, sample_rate = _read_wav_as_mono_float32(wav_content)
+                audio = np.frombuffer(raw_audio, dtype=np.float32)
+            finally:
+                if os.path.exists(tmp_in_path):
+                    os.unlink(tmp_in_path)
+                if os.path.exists(tmp_out_path):
+                    os.unlink(tmp_out_path)
+    except Exception as e:
+        logger.warning("Failed to parse audio file: %s", e)
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Failed to parse audio: {e}"},
+        )
+
+    duration_sec = len(audio) / sample_rate if sample_rate > 0 else 0.0
+
+    # Resample to 16kHz if needed (Whisper expects 16kHz)
+    if sample_rate != 16000 and sample_rate > 0:
+        ratio = 16000 / sample_rate
+        new_len = int(len(audio) * ratio)
+        indices = np.linspace(0, len(audio) - 1, new_len)
+        audio = np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
+
+    decoder = _get_stt_decoder()
+
+    t_stt_start = time.perf_counter()
+    with _stt_transcribe_lock:
+        event = decoder.decode(b"", audio=audio)
+    t_stt_end = time.perf_counter()
+
+    stt_ms = (t_stt_end - t_stt_start) * 1000
+
+    transcript = event.content
+    language = event.metadata.get("language", "en")
+
+    # Hallucination filter already applied in decoder.decode(), but check metadata
+    if event.metadata.get("filtered"):
+        transcript = ""
+
+    return {
+        "transcript": transcript,
+        "language": language,
+        "duration_sec": round(duration_sec, 3),
+        "stt_ms": round(stt_ms, 1),
     }
 
 
