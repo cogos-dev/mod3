@@ -52,6 +52,9 @@ class PipelineState:
         self._samples_played = 0
         self._total_samples = 0
         self._last_interrupt: InterruptInfo | None = None
+        # Callbacks fired after interrupt() — for seat-event fan-out.
+        # Each callable receives (interrupt_info: InterruptInfo).
+        self._interrupt_callbacks: list = []
 
     # ------------------------------------------------------------------
     # Outbound side calls these
@@ -80,6 +83,19 @@ class PipelineState:
         with self._lock:
             self._samples_played = samples_played
             self._total_samples = total_samples
+
+    def add_interrupt_callback(self, cb) -> None:
+        """Register a callback fired after interrupt(). Receives the InterruptInfo."""
+        with self._lock:
+            self._interrupt_callbacks.append(cb)
+
+    def remove_interrupt_callback(self, cb) -> None:
+        """Remove a previously registered interrupt callback (no-op if absent)."""
+        with self._lock:
+            try:
+                self._interrupt_callbacks.remove(cb)
+            except ValueError:
+                pass
 
     # ------------------------------------------------------------------
     # Inbound side calls these
@@ -148,6 +164,14 @@ class PipelineState:
             self._text = ""
             self._samples_played = 0
             self._total_samples = 0
+            callbacks = list(self._interrupt_callbacks)
+
+        # Fire callbacks outside the lock so they cannot deadlock on re-entry.
+        for cb in callbacks:
+            try:
+                cb(info)
+            except Exception:
+                pass  # never let a callback crash the interrupt path
 
         return info
 

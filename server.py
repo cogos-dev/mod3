@@ -497,6 +497,42 @@ _bargein_thread.start()
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# OGG/Opus encoder — mirrors http_api.encode_ogg; kept here to avoid circular
+# import (http_api imports from server).
+# ---------------------------------------------------------------------------
+
+_OPUS_VALID_RATES = frozenset({8000, 12000, 16000, 24000, 48000})
+
+
+def _encode_chunk_ogg(samples, sample_rate: int) -> bytes:
+    """Encode float32 samples as OGG/Opus bytes for seat tts_chunk events."""
+    import io
+    import numpy as np
+    import soundfile as sf
+
+    samples = np.asarray(samples, dtype=np.float32)
+    if sample_rate not in _OPUS_VALID_RATES:
+        try:
+            import math
+            from scipy.signal import resample_poly
+
+            target_rate = 24000
+            gcd = math.gcd(target_rate, sample_rate)
+            up, down = target_rate // gcd, sample_rate // gcd
+            samples = resample_poly(samples, up, down).astype(np.float32)
+            sample_rate = target_rate
+        except ImportError:
+            raise RuntimeError(
+                f"OGG/Opus encoding requires sample_rate in {sorted(_OPUS_VALID_RATES)}; "
+                f"got {sample_rate} Hz and scipy is not available for resampling."
+            )
+    buf = io.BytesIO()
+    sf.write(buf, samples, sample_rate, format="OGG", subtype="OPUS")
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # Job tracking (MCP only — local speaker playback)
 # ---------------------------------------------------------------------------
 
@@ -722,6 +758,34 @@ def _run_speech_job(entry: dict) -> None:
     # Register with the reflex arc so inbound VAD can interrupt us
     pipeline_state.start_speaking(text, player)
     i_have_lock = _acquire_speaking_lock(job_id, text)
+
+    # --- Seat SSE: bargein fan-out callback ---
+    # Captured in the closure so the callback fires for this job/session only.
+    _seat_session_id = entry.get("session_id")
+
+    def _on_bargein(info):
+        if not _seat_session_id:
+            return
+        try:
+            from seats import get_seat_registry
+            get_seat_registry().fan_out(
+                _seat_session_id,
+                {
+                    "type": "bargein",
+                    "session_id": _seat_session_id,
+                    "job_id": job_id,
+                    "reason": info.reason,
+                },
+            )
+        except Exception:
+            pass  # never let seat fan-out crash the interrupt path
+
+    pipeline_state.add_interrupt_callback(_on_bargein)
+
+    import base64 as _base64
+    _chunk_index = 0
+    _last_chunk_was_final = False
+
     try:
         for chunk in engine_module.generate_audio(
             text,
@@ -751,9 +815,58 @@ def _run_speech_job(entry: dict) -> None:
             )
             # Update position after each chunk so PipelineState tracks progress
             pipeline_state.update_position(*player.get_progress())
+
+            # --- Seat SSE: tts_chunk fan-out ---
+            if _seat_session_id and chunk.samples is not None and len(chunk.samples) > 0:
+                meta = chunk.metadata or {}
+                _is_final = bool(meta.get("is_final", False))
+                _last_chunk_was_final = _is_final
+                try:
+                    _ogg_bytes = _encode_chunk_ogg(chunk.samples, chunk.sample_rate)
+                    _audio_b64 = _base64.b64encode(_ogg_bytes).decode("ascii")
+                    from seats import get_seat_registry
+                    get_seat_registry().fan_out(
+                        _seat_session_id,
+                        {
+                            "type": "tts_chunk",
+                            "job_id": job_id,
+                            "chunk_index": _chunk_index,
+                            "text": text,
+                            "audio_base64": _audio_b64,
+                            "format": "ogg",
+                            "is_final": _is_final,
+                            "session_id": _seat_session_id,
+                        },
+                    )
+                    _chunk_index += 1
+                except Exception:
+                    pass  # never let seat fan-out crash synthesis
+
+        # If the engine emitted chunks but never marked one is_final, emit a
+        # sentinel so consumers always see exactly one is_final=True event.
+        if _seat_session_id and _chunk_index > 0 and not _last_chunk_was_final:
+            try:
+                from seats import get_seat_registry
+                get_seat_registry().fan_out(
+                    _seat_session_id,
+                    {
+                        "type": "tts_chunk",
+                        "job_id": job_id,
+                        "chunk_index": _chunk_index,
+                        "text": text,
+                        "audio_base64": "",
+                        "format": "ogg",
+                        "is_final": True,
+                        "session_id": _seat_session_id,
+                    },
+                )
+            except Exception:
+                pass
+
     except Exception as e:
         _jobs[job_id]["error"] = str(e)
     finally:
+        pipeline_state.remove_interrupt_callback(_on_bargein)
         player.mark_done()
 
     metrics = player.wait(timeout=120.0)
