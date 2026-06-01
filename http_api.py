@@ -4,6 +4,7 @@ Endpoints:
   POST /v1/synthesize  — text → audio bytes (WAV/PCM/OGG-Opus) + structured metrics
   POST /v1/audio/speech — OpenAI-compatible TTS endpoint
   POST /v1/vad         — audio file → speech detection result
+  POST /v1/vad/confidence — raw PCM bytes → per-packet confidence float (ONNX, no torch)
   POST /v1/transcribe  — audio file → transcript (Whisper STT)
   POST /v1/filter      — text → hallucination check
   GET  /v1/voices      — list available engines and voices
@@ -81,6 +82,7 @@ from session_registry import (
 )
 from vad import detect_speech_file, is_hallucination
 from vad import is_model_loaded as vad_loaded
+from vad import is_pipecat_vad_available, voice_confidence
 from voice_profiles import VoiceProfileRegistry
 
 logger = logging.getLogger("mod3.http")
@@ -933,6 +935,42 @@ async def vad_check(file: UploadFile):
         "total_speech_sec": result.total_speech_sec,
         "total_audio_sec": result.total_audio_sec,
         "processing_time_sec": round(processing_time, 4),
+    }
+
+
+@app.post("/v1/vad/confidence")
+async def vad_confidence(request: Request):
+    """Per-packet voice-activity confidence via the ONNX pipecat path.
+
+    Accepts raw int16 little-endian PCM in the request body.  The caller is
+    responsible for sending exactly 512 samples (1 024 bytes) at 16 kHz, or
+    256 samples (512 bytes) at 8 kHz — these are the frame sizes the Silero
+    ONNX model requires.
+
+    Does **not** require torch; uses ``vendor/pipecat_vad`` directly.
+    Designed for tight per-packet barge-in loops (Discord voice receiver,
+    etc.) where full-utterance VAD via ``/v1/vad`` would be too heavy.
+
+    Returns:
+        {"confidence": float, "available": bool}
+
+    ``available`` is false when onnxruntime is not installed; ``confidence``
+    is 0.0 in that case.
+    """
+    t0 = time.perf_counter()
+    body = await request.body()
+    if not body:
+        return {"confidence": 0.0, "available": is_pipecat_vad_available(), "latency_ms": 0.0}
+
+    # Query string: ?sample_rate=16000 (default)
+    sample_rate = int(request.query_params.get("sample_rate", "16000"))
+
+    conf = voice_confidence(body, sample_rate=sample_rate)
+    latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+    return {
+        "confidence": conf,
+        "available": is_pipecat_vad_available(),
+        "latency_ms": latency_ms,
     }
 
 
@@ -2508,7 +2546,7 @@ def health():
             "engines": engines,
             "modalities": modalities,
             "queue": {
-                "depth": total,
+                "jobs_total": total,
                 "active_jobs": active,
             },
             "routing": "channel-client",
@@ -2614,6 +2652,7 @@ def capabilities():
             "synthesize": "POST /v1/synthesize",
             "speech": "POST /v1/audio/speech",
             "vad": "POST /v1/vad",
+            "vad_confidence": "POST /v1/vad/confidence",
             "voices": "GET /v1/voices",
             "health": "GET /health",
             "shutdown": "POST /shutdown",
