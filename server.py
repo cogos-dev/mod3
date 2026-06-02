@@ -950,6 +950,7 @@ def _run_speech_job(entry: dict) -> None:
         if _ws_tts_started and not _ws_tts_stopped:
             try:
                 _audio_subs.emit_tts_stopped(_ws_session_id)
+                _ws_tts_stopped = True
             except Exception:
                 pass
 
