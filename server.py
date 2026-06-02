@@ -821,6 +821,15 @@ def _run_speech_job(entry: dict) -> None:
     _chunk_index = 0
     _last_chunk_was_final = False
 
+    # --- /ws/audio subscriber state ---
+    # Resolved once before the loop; guarded by has_subscribers() so the
+    # common no-subscriber case exits immediately without import overhead.
+    from audio_subscribers import get_default_audio_subscribers as _get_audio_subs
+    _audio_subs = _get_audio_subs()
+    _ws_session_id = _seat_session_id  # same session key as the seat fan-out
+    _ws_tts_started = False   # True after bot-tts-started has been emitted
+    _ws_tts_stopped = False   # True after bot-tts-stopped has been emitted
+
     try:
         for chunk in engine_module.generate_audio(
             text,
@@ -878,6 +887,31 @@ def _run_speech_job(entry: dict) -> None:
                 except Exception:
                     pass  # never let seat fan-out crash synthesis
 
+            # --- /ws/audio: RTVI bot-tts-audio per chunk ---
+            # Gated on session having a live subscriber; local play is
+            # unconditional (already queued above via player.queue_audio).
+            if (
+                _ws_session_id
+                and chunk.samples is not None
+                and len(chunk.samples) > 0
+                and _audio_subs.has_subscribers(_ws_session_id)
+            ):
+                try:
+                    # float32 → int16 LE PCM bytes (no WAV header)
+                    _pcm_bytes = (
+                        np.clip(chunk.samples, -1.0, 1.0) * 32767
+                    ).astype(np.int16).tobytes()
+                    if not _ws_tts_started:
+                        _audio_subs.emit_tts_started(_ws_session_id)
+                        _ws_tts_started = True
+                    _audio_subs.emit_tts_audio_chunk(
+                        _ws_session_id,
+                        _pcm_bytes,
+                        sample_rate=chunk.sample_rate,
+                    )
+                except Exception:
+                    pass  # never let WS emit crash the drain thread
+
         # If the engine emitted chunks but never marked one is_final, emit a
         # sentinel so consumers always see exactly one is_final=True event.
         if _seat_session_id and _chunk_index > 0 and not _last_chunk_was_final:
@@ -900,11 +934,25 @@ def _run_speech_job(entry: dict) -> None:
             except Exception:
                 pass
 
+        # --- /ws/audio: emit bot-tts-stopped after final chunk ---
+        if _ws_tts_started and not _ws_tts_stopped:
+            try:
+                _audio_subs.emit_tts_stopped(_ws_session_id)
+                _ws_tts_stopped = True
+            except Exception:
+                pass  # never let WS emit crash the drain thread
+
     except Exception as e:
         _jobs[job_id]["error"] = str(e)
     finally:
         pipeline_state.remove_interrupt_callback(_on_bargein)
         player.mark_done()
+        # Ensure bot-tts-stopped is sent even if the loop errored mid-way.
+        if _ws_tts_started and not _ws_tts_stopped:
+            try:
+                _audio_subs.emit_tts_stopped(_ws_session_id)
+            except Exception:
+                pass
 
     metrics = player.wait(timeout=120.0)
     # Final position update and clear speaking state
