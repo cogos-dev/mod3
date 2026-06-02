@@ -61,27 +61,48 @@ class ChannelQueue:
         return job
 
     def _drain(self):
-        """Process jobs sequentially until queue is empty."""
-        while True:
+        """Process jobs sequentially until queue is empty.
+
+        The outer try/finally ensures ``_running`` is always reset to False
+        when this thread exits — regardless of whether the exit is normal
+        (queue emptied) or abnormal (BaseException raised by a job function or
+        a signal handler).  Without the finally, a BaseException leaves
+        ``_running = True`` permanently; the ``depth`` property then reports
+        ``len(self._queue) + 1`` forever (the ghost of the last killed job),
+        and subsequent ``submit()`` calls never start a new drain thread.
+
+        Signals (KeyboardInterrupt, SystemExit) are re-raised after cleanup.
+        """
+        try:
+            while True:
+                with self._lock:
+                    if not self._queue:
+                        self._running = False
+                        self._current = None
+                        return
+                    job, fn = self._queue.popleft()
+
+                job.status = "running"
+                job.started_at = time.time()
+                self._current = job
+
+                try:
+                    job.result = fn()
+                    job.status = "done"
+                except Exception as e:
+                    job.error = str(e)
+                    job.status = "error"
+                finally:
+                    job.finished_at = time.time()
+        except BaseException as exc:  # noqa: BLE001
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+        finally:
+            # Unconditional cleanup: reset flags so future submit() calls
+            # start a new drain thread instead of silently accumulating.
             with self._lock:
-                if not self._queue:
-                    self._running = False
-                    self._current = None
-                    return
-                job, fn = self._queue.popleft()
-
-            job.status = "running"
-            job.started_at = time.time()
-            self._current = job
-
-            try:
-                job.result = fn()
-                job.status = "done"
-            except Exception as e:
-                job.error = str(e)
-                job.status = "error"
-            finally:
-                job.finished_at = time.time()
+                self._running = False
+                self._current = None
 
 
 class OutputQueueManager:

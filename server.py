@@ -630,28 +630,59 @@ class SpeechQueue:
             return len(self._queue)
 
     def _drain(self):
-        """Process queued jobs one at a time until the queue is empty."""
-        while True:
-            with self._lock:
-                if not self._queue:
-                    self._draining = False
-                    self._active_job_id = None
-                    return
-                entry = self._queue.pop(0)
-                self._active_job_id = entry["job_id"]
+        """Process queued jobs one at a time until the queue is empty.
 
-            # Run the speech job (blocking — one at a time). A failure here
-            # must not kill the drain thread: if it does, `_draining` stays
-            # True and subsequent enqueues never start a new drain, so jobs
-            # accumulate in the queue with no processor.
-            try:
-                _run_speech_job(entry)
-            except Exception as exc:
-                logger.exception(
-                    "speech_queue: drain caught unhandled %s in _run_speech_job for %s",
-                    type(exc).__name__,
-                    entry.get("job_id"),
-                )
+        The outer try/finally ensures ``_draining`` is always reset to False
+        when this thread exits — regardless of whether the exit is normal
+        (queue emptied) or abnormal (BaseException raised by a job runner or
+        a signal handler).  Without this guarantee, any BaseException that
+        escapes the inner ``except Exception`` handler (e.g. KeyboardInterrupt,
+        SystemExit, MemoryError, or GeneratorExit from a TTS generator) leaves
+        ``_draining = True`` permanently, causing every subsequent enqueue() to
+        skip starting a new drain thread, so jobs pile up with active_jobs=0.
+
+        Signals (KeyboardInterrupt, SystemExit) are re-raised after cleanup so
+        the process can still respond to them normally.
+        """
+        try:
+            while True:
+                with self._lock:
+                    if not self._queue:
+                        self._draining = False
+                        self._active_job_id = None
+                        return
+                    entry = self._queue.pop(0)
+                    self._active_job_id = entry["job_id"]
+
+                # Run the speech job (blocking — one at a time). A failure here
+                # must not kill the drain thread: if it does, `_draining` stays
+                # True and subsequent enqueues never start a new drain, so jobs
+                # accumulate in the queue with no processor.
+                try:
+                    _run_speech_job(entry)
+                except Exception as exc:
+                    logger.exception(
+                        "speech_queue: drain caught unhandled %s in _run_speech_job for %s",
+                        type(exc).__name__,
+                        entry.get("job_id"),
+                    )
+        except BaseException as exc:  # noqa: BLE001
+            # BaseException subclasses not caught by the inner handler
+            # (KeyboardInterrupt, SystemExit, MemoryError, etc.) land here.
+            # Log at WARNING so the stall is visible in production logs, then
+            # let the finally block reset state before re-raising signals.
+            logger.warning(
+                "speech_queue: drain thread exiting on %s — queue will be reset",
+                type(exc).__name__,
+            )
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+        finally:
+            # Unconditional cleanup: reset flags so future enqueue() calls
+            # start a new drain thread instead of silently accumulating.
+            with self._lock:
+                self._draining = False
+                self._active_job_id = None
 
 
 _speech_queue = SpeechQueue()
