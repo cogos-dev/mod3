@@ -508,6 +508,7 @@ _OPUS_VALID_RATES = frozenset({8000, 12000, 16000, 24000, 48000})
 def _encode_chunk_ogg(samples, sample_rate: int) -> bytes:
     """Encode float32 samples as OGG/Opus bytes for seat tts_chunk events."""
     import io
+
     import numpy as np
     import soundfile as sf
 
@@ -515,6 +516,7 @@ def _encode_chunk_ogg(samples, sample_rate: int) -> bytes:
     if sample_rate not in _OPUS_VALID_RATES:
         try:
             import math
+
             from scipy.signal import resample_poly
 
             target_rate = 24000
@@ -768,6 +770,7 @@ def _run_speech_job(entry: dict) -> None:
             return
         try:
             from seats import get_seat_registry
+
             get_seat_registry().fan_out(
                 _seat_session_id,
                 {
@@ -783,6 +786,7 @@ def _run_speech_job(entry: dict) -> None:
     pipeline_state.add_interrupt_callback(_on_bargein)
 
     import base64 as _base64
+
     _chunk_index = 0
     _last_chunk_was_final = False
 
@@ -825,6 +829,7 @@ def _run_speech_job(entry: dict) -> None:
                     _ogg_bytes = _encode_chunk_ogg(chunk.samples, chunk.sample_rate)
                     _audio_b64 = _base64.b64encode(_ogg_bytes).decode("ascii")
                     from seats import get_seat_registry
+
                     get_seat_registry().fan_out(
                         _seat_session_id,
                         {
@@ -847,6 +852,7 @@ def _run_speech_job(entry: dict) -> None:
         if _seat_session_id and _chunk_index > 0 and not _last_chunk_was_final:
             try:
                 from seats import get_seat_registry
+
                 get_seat_registry().fan_out(
                     _seat_session_id,
                     {

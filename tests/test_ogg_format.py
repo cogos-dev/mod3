@@ -118,9 +118,7 @@ class TestEncodeOgg:
 
         samples = np.zeros(24000, dtype=np.float32)
         result = encode_ogg(samples, 24000)
-        assert result[:4] == _OGG_MAGIC, (
-            f"Expected OggS at offset 0, got {result[:4]!r}"
-        )
+        assert result[:4] == _OGG_MAGIC, f"Expected OggS at offset 0, got {result[:4]!r}"
 
     def test_standard_rate_24khz(self):
         """24000 Hz is natively Opus-compatible — no resampling path."""
@@ -211,16 +209,12 @@ class TestSynthesizeOggEndpoint:
         assert r.status_code == 200, r.text
         ct = r.headers.get("content-type", "")
         assert "audio/ogg" in ct, f"Expected audio/ogg in Content-Type, got {ct!r}"
-        assert "codecs=opus" in ct, (
-            f"Expected codecs=opus in Content-Type per RFC 7845 §9, got {ct!r}"
-        )
+        assert "codecs=opus" in ct, f"Expected codecs=opus in Content-Type per RFC 7845 §9, got {ct!r}"
 
     def test_ogg_body_has_magic_header(self, client):
         r = client.post("/v1/synthesize", json={"text": "hello", "format": "ogg"})
         assert r.status_code == 200, r.text
-        assert r.content[:4] == _OGG_MAGIC, (
-            f"Expected OggS magic at start of response body, got {r.content[:4]!r}"
-        )
+        assert r.content[:4] == _OGG_MAGIC, f"Expected OggS magic at start of response body, got {r.content[:4]!r}"
 
     def test_wav_format_still_works(self, client):
         """Regression: WAV path must be unaffected."""
@@ -231,9 +225,7 @@ class TestSynthesizeOggEndpoint:
 
     def test_invalid_format_rejected_at_schema(self, client):
         r = client.post("/v1/synthesize", json={"text": "hello", "format": "mp3"})
-        assert r.status_code == 422, (
-            f"Expected 422 Unprocessable Entity for invalid format, got {r.status_code}"
-        )
+        assert r.status_code == 422, f"Expected 422 Unprocessable Entity for invalid format, got {r.status_code}"
 
 
 # ---------------------------------------------------------------------------
@@ -299,9 +291,7 @@ class TestMcpSpeakOggPassthrough:
 
         assert "audio_base64" in result
         decoded = base64.b64decode(result["audio_base64"])
-        assert decoded[:4] == _OGG_MAGIC, (
-            f"Decoded audio must start with OggS, got {decoded[:4]!r}"
-        )
+        assert decoded[:4] == _OGG_MAGIC, f"Decoded audio must start with OggS, got {decoded[:4]!r}"
 
     @pytest.mark.asyncio
     async def test_skip_playback_ogg_media_type(self):
@@ -333,9 +323,7 @@ class TestMcpSpeakOggPassthrough:
 
         assert result.get("format") == "ogg"
         # channel_client strips the codecs= parameter from the content-type header
-        assert result["media_type"] == "audio/ogg", (
-            f"Expected media_type='audio/ogg', got {result['media_type']!r}"
-        )
+        assert result["media_type"] == "audio/ogg", f"Expected media_type='audio/ogg', got {result['media_type']!r}"
 
     @pytest.mark.asyncio
     async def test_skip_playback_ogg_calls_synthesize_not_speak(self):
@@ -411,6 +399,4 @@ class TestMcpSpeakOggPassthrough:
 
         assert captured_bodies, "Expected at least one POST body"
         body = captured_bodies[-1]
-        assert body.get("format") == "ogg", (
-            f"Expected format='ogg' in synthesize request body, got: {body}"
-        )
+        assert body.get("format") == "ogg", f"Expected format='ogg' in synthesize request body, got: {body}"
