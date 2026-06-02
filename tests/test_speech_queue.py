@@ -372,3 +372,128 @@ class TestDrainExceptionResilience:
             assert q._draining is False, "drain thread leaked _draining=True after queue empty"
         finally:
             server._run_speech_job = original_runner
+
+
+class TestDrainBaseExceptionResilience:
+    """The drain thread MUST reset _draining=False even when a BaseException
+    subclass (not caught by ``except Exception``) escapes the inner handler.
+
+    Regression target: before the fix, a SystemExit / KeyboardInterrupt / MemoryError
+    raised during _run_speech_job would exit the drain thread with _draining=True.
+    Every subsequent enqueue() would skip starting a new drain thread, causing
+    jobs to accumulate in the queue indefinitely with active_jobs=0.
+    """
+
+    def _wait_for_drain_exit(self, q, timeout=2.5):
+        """Block until q._draining goes False or timeout expires."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not q._draining:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_drain_resets_draining_after_system_exit(self):
+        """SystemExit inside _run_speech_job must reset _draining to False.
+
+        Without the fix, the drain thread exits with _draining=True and
+        subsequent enqueue() calls never start a new drain.
+        """
+        import server
+
+        original_runner = server._run_speech_job
+
+        def fake_runner_raises_systemexit(entry):
+            raise SystemExit(1)
+
+        server._run_speech_job = fake_runner_raises_systemexit
+        try:
+            from server import SpeechQueue
+
+            q = SpeechQueue()
+            q.enqueue("job1", {"text": "test"})
+
+            drained = self._wait_for_drain_exit(q)
+            assert drained, "drain thread did not exit within timeout"
+            assert q._draining is False, "_draining stayed True after SystemExit"
+            assert q._active_job_id is None, "_active_job_id not cleared after SystemExit"
+        finally:
+            server._run_speech_job = original_runner
+
+    def test_drain_resets_draining_after_memory_error(self):
+        """MemoryError (a BaseException subclass) inside _run_speech_job must
+        reset _draining to False so the queue can continue processing.
+        """
+        import server
+
+        original_runner = server._run_speech_job
+
+        def fake_runner_raises_memory_error(entry):
+            raise MemoryError("simulated OOM")
+
+        server._run_speech_job = fake_runner_raises_memory_error
+        try:
+            from server import SpeechQueue
+
+            q = SpeechQueue()
+            q.enqueue("oom_job", {"text": "test"})
+
+            drained = self._wait_for_drain_exit(q)
+            assert drained, "drain thread did not exit within timeout"
+            assert q._draining is False, "_draining stayed True after MemoryError"
+            assert q._active_job_id is None, "_active_job_id not cleared after MemoryError"
+        finally:
+            server._run_speech_job = original_runner
+
+    def test_drain_accepts_new_jobs_after_base_exception_kill(self):
+        """After a BaseException kills the drain thread, subsequent enqueue()
+        calls must successfully start a NEW drain thread and process jobs.
+
+        This is the end-to-end regression test: not just that _draining resets,
+        but that the queue actually resumes processing — which requires the next
+        enqueue() to detect _draining=False and spawn a new thread.
+        """
+        import server
+
+        original_runner = server._run_speech_job
+        completed: list[str] = []
+        calls = 0
+
+        def fake_runner(entry):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                # First call raises SystemExit to kill the drain thread
+                raise SystemExit(1)
+            # Subsequent calls succeed
+            completed.append(entry["job_id"])
+
+        server._run_speech_job = fake_runner
+        try:
+            from server import SpeechQueue
+
+            q = SpeechQueue()
+            # This job kills the drain thread
+            q.enqueue("killer", {"text": "test"})
+
+            # Wait for the drain thread to die and _draining to reset
+            drained = self._wait_for_drain_exit(q)
+            assert drained, "drain thread did not exit within timeout after SystemExit"
+            assert q._draining is False, "_draining not reset after thread death"
+
+            # Now enqueue a new job -- must start a fresh drain thread
+            q.enqueue("survivor", {"text": "after"})
+
+            # Wait for the new drain to complete
+            deadline = time.time() + 2.5
+            while time.time() < deadline:
+                if not q._draining:
+                    break
+                time.sleep(0.05)
+
+            assert "survivor" in completed, (
+                "queue did not resume processing after BaseException drain-thread death; "
+                f"completed={completed}, _draining={q._draining}"
+            )
+        finally:
+            server._run_speech_job = original_runner
