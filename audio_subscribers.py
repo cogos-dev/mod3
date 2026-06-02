@@ -204,6 +204,58 @@ class AudioSubscriberRegistry:
         return delivered
 
     # ------------------------------------------------------------------
+    # Streaming TTS emit — speak-drain path (one utterance, N chunks)
+    # ------------------------------------------------------------------
+
+    def emit_tts_started(self, session_id: str) -> int:
+        """Emit ``bot-tts-started`` to every subscriber of ``session_id``.
+
+        Call once before the first chunk of a streaming TTS job.  Mirrors the
+        first frame emitted by ``emit_wav`` but separated so the drain thread
+        can stream per-chunk audio without a full WAV blob in hand.
+
+        Returns the delivered subscriber count.
+        """
+        frame_id = str(uuid4())
+        frame = f'{{"label":"rtvi-ai","type":"bot-tts-started","id":"{frame_id}","data":{{}}}}'
+        return self._emit_single_frame(session_id, frame, label="bot-tts-started")
+
+    def emit_tts_audio_chunk(
+        self,
+        session_id: str,
+        pcm_bytes: bytes,
+        *,
+        sample_rate: int = 24000,
+    ) -> int:
+        """Emit one ``bot-tts-audio`` frame to every subscriber of ``session_id``.
+
+        ``pcm_bytes`` must be raw int16 little-endian PCM (no RIFF header).
+        Call ``emit_tts_started`` before the first chunk and
+        ``emit_tts_stopped`` after the last chunk.
+
+        Returns the delivered subscriber count.
+        """
+        audio_b64 = base64.b64encode(pcm_bytes).decode("ascii")
+        frame_id = str(uuid4())
+        frame = (
+            f'{{"label":"rtvi-ai","type":"bot-tts-audio","id":"{frame_id}",'
+            f'"data":{{"audio":"{audio_b64}","sample_rate":{sample_rate},"num_channels":1}}}}'
+        )
+        return self._emit_single_frame(session_id, frame, label="bot-tts-audio")
+
+    def emit_tts_stopped(self, session_id: str) -> int:
+        """Emit ``bot-tts-stopped`` to every subscriber of ``session_id``.
+
+        Call once after the final chunk of a streaming TTS job.  Mirrors the
+        last frame emitted by ``emit_wav``.
+
+        Returns the delivered subscriber count.
+        """
+        frame_id = str(uuid4())
+        frame = f'{{"label":"rtvi-ai","type":"bot-tts-stopped","id":"{frame_id}","data":{{}}}}'
+        return self._emit_single_frame(session_id, frame, label="bot-tts-stopped")
+
+    # ------------------------------------------------------------------
     # RTVI 1.3.0 transcript + speaking-lifecycle emit (T4 / B+ workstream)
     # ------------------------------------------------------------------
 
