@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -257,8 +257,6 @@ class TestRunSpeechJobFanOut:
 
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path, monkeypatch):
-        import numpy as np
-
         # Patch engine module
         mock_engine = MagicMock()
 
@@ -385,10 +383,7 @@ class TestRunSpeechJobFanOut:
         ):
             server._run_speech_job(entry)
 
-        tts_calls = [
-            c for c in self.mock_registry.fan_out.call_args_list
-            if c.args[1].get("type") == "tts_chunk"
-        ]
+        tts_calls = [c for c in self.mock_registry.fan_out.call_args_list if c.args[1].get("type") == "tts_chunk"]
         assert len(tts_calls) == 0
 
 
@@ -396,7 +391,6 @@ class TestRunSpeechJobBargeinFanOut:
     """Assert bargein fan_out is called when pipeline_state.interrupt() fires."""
 
     def test_bargein_fan_out_on_interrupt(self, monkeypatch):
-        import numpy as np
         import server
         from pipeline_state import PipelineState
 
@@ -449,10 +443,7 @@ class TestRunSpeechJobBargeinFanOut:
             real_state.start_speaking("Interrupt me", mock_player)
             server._run_speech_job(entry)
 
-        bargein_calls = [
-            c for c in mock_registry.fan_out.call_args_list
-            if c.args[1].get("type") == "bargein"
-        ]
+        bargein_calls = [c for c in mock_registry.fan_out.call_args_list if c.args[1].get("type") == "bargein"]
         assert len(bargein_calls) >= 1, "expected at least one bargein fan_out call"
 
         ev = bargein_calls[0].args[1]
@@ -556,10 +547,7 @@ class TestTtsChunkFinalSentinel:
         ):
             server._run_speech_job(entry)
 
-        tts_calls = [
-            c for c in mock_registry.fan_out.call_args_list
-            if c.args[1].get("type") == "tts_chunk"
-        ]
+        tts_calls = [c for c in mock_registry.fan_out.call_args_list if c.args[1].get("type") == "tts_chunk"]
         # 2 real + 1 sentinel
         assert len(tts_calls) == 3
         sentinel = tts_calls[-1].args[1]

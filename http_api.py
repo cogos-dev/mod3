@@ -40,7 +40,10 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Lock
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from modules.voice import WhisperDecoder
 
 from fastapi import FastAPI, Request, Response, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
@@ -957,8 +960,6 @@ async def transcribe_audio(file: UploadFile):
     import tempfile
 
     import numpy as np
-
-    t_start = time.perf_counter()
 
     content = await file.read()
     if not content:
