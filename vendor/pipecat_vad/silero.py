@@ -166,7 +166,8 @@ class SileroVADAnalyzer(VADAnalyzer):
                 self._model.reset_states()
                 self._last_reset_time = curr_time
 
-            return float(new_confidence)
+            # out shape is (batch, frames) — flatten to scalar
+            return float(np.squeeze(new_confidence).item())
         except Exception as e:
             logger.error(f"Error analyzing audio with Silero VAD: {e}")
             return 0.0
