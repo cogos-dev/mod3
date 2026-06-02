@@ -825,10 +825,11 @@ def _run_speech_job(entry: dict) -> None:
     # Resolved once before the loop; guarded by has_subscribers() so the
     # common no-subscriber case exits immediately without import overhead.
     from audio_subscribers import get_default_audio_subscribers as _get_audio_subs
+
     _audio_subs = _get_audio_subs()
     _ws_session_id = _seat_session_id  # same session key as the seat fan-out
-    _ws_tts_started = False   # True after bot-tts-started has been emitted
-    _ws_tts_stopped = False   # True after bot-tts-stopped has been emitted
+    _ws_tts_started = False  # True after bot-tts-started has been emitted
+    _ws_tts_stopped = False  # True after bot-tts-stopped has been emitted
 
     try:
         for chunk in engine_module.generate_audio(
@@ -898,9 +899,7 @@ def _run_speech_job(entry: dict) -> None:
             ):
                 try:
                     # float32 → int16 LE PCM bytes (no WAV header)
-                    _pcm_bytes = (
-                        np.clip(chunk.samples, -1.0, 1.0) * 32767
-                    ).astype(np.int16).tobytes()
+                    _pcm_bytes = (np.clip(chunk.samples, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
                     if not _ws_tts_started:
                         _audio_subs.emit_tts_started(_ws_session_id)
                         _ws_tts_started = True

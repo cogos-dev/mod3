@@ -23,19 +23,15 @@ import sys
 import threading
 import unittest.mock as mock
 from pathlib import Path
-from typing import Iterator
 
 import numpy as np
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from audio_subscribers import (  # noqa: E402
     AudioSubscriberRegistry,
-    get_default_audio_subscribers,
     reset_default_audio_subscribers,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers / fakes
@@ -72,7 +68,9 @@ def _run_coroutine_sync(coro):
         loop.close()
 
 
-def _make_registry_with_subscriber(session_id: str) -> tuple[AudioSubscriberRegistry, _FakeWS, asyncio.AbstractEventLoop]:
+def _make_registry_with_subscriber(
+    session_id: str,
+) -> tuple[AudioSubscriberRegistry, _FakeWS, asyncio.AbstractEventLoop]:
     """Return a registry that has one live subscriber for session_id."""
     reg = AudioSubscriberRegistry()
     ws = _FakeWS()
@@ -86,9 +84,11 @@ def _drain_loop(ws: _FakeWS, loop: asyncio.AbstractEventLoop, n: int) -> list[di
 
     Returns the parsed frames.
     """
+
     async def _wait():
         deadline = 2.0  # seconds
         import time
+
         t0 = time.monotonic()
         while len(ws.text_sent) < n and (time.monotonic() - t0) < deadline:
             await asyncio.sleep(0.01)
@@ -294,11 +294,21 @@ def _build_run_speech_job_mocks(
 
     # Patch AdaptivePlayer
     class _FakePlayer:
-        def __init__(self, **kw): pass
-        def queue_audio(self, samples, chunk_meta=None): pass
-        def flush(self): pass
-        def mark_done(self): pass
-        def get_progress(self): return (0.0, 1.0)
+        def __init__(self, **kw):
+            pass
+
+        def queue_audio(self, samples, chunk_meta=None):
+            pass
+
+        def flush(self):
+            pass
+
+        def mark_done(self):
+            pass
+
+        def get_progress(self):
+            return (0.0, 1.0)
+
         def wait(self, timeout=None):
             m = mock.MagicMock()
             m.to_dict.return_value = {}
@@ -346,6 +356,7 @@ class TestRunSpeechJobWsEmit:
         entry["session_id"] = sid
 
         import server  # noqa: PLC0415
+
         server._run_speech_job(entry)
 
         # Drain the event loop to pick up all scheduled coroutines
@@ -367,6 +378,7 @@ class TestRunSpeechJobWsEmit:
         entry["session_id"] = sid
 
         import server  # noqa: PLC0415
+
         server._run_speech_job(entry)
 
         frames = _drain_loop(ws, loop, 3)
@@ -397,18 +409,28 @@ class TestRunSpeechJobNoSubscriber:
         player_calls = []
 
         class _TrackingPlayer:
-            def __init__(self, **kw): pass
+            def __init__(self, **kw):
+                pass
+
             def queue_audio(self, samples, chunk_meta=None):
                 player_calls.append(len(samples))
-            def flush(self): pass
-            def mark_done(self): pass
-            def get_progress(self): return (0.0, 1.0)
+
+            def flush(self):
+                pass
+
+            def mark_done(self):
+                pass
+
+            def get_progress(self):
+                return (0.0, 1.0)
+
             def wait(self, timeout=None):
                 m = mock.MagicMock()
                 m.to_dict.return_value = {}
                 return m
 
         import server  # noqa: PLC0415
+
         monkeypatch.setattr(server, "_adaptive_player_class", lambda: _TrackingPlayer, raising=False)
 
         server._run_speech_job(entry)
@@ -442,6 +464,7 @@ class TestRunSpeechJobBargein:
         entry["session_id"] = sid
 
         import server  # noqa: PLC0415
+
         monkeypatch.setattr(server, "_i_own_speaking_lock", _i_own, raising=False)
 
         server._run_speech_job(entry)
@@ -470,6 +493,7 @@ class TestRunSpeechJobBargein:
         entry["session_id"] = sid
 
         import server  # noqa: PLC0415
+
         fake_engine = mock.MagicMock()
         fake_engine.generate_audio.side_effect = None
         fake_engine.generate_audio = _failing_gen
