@@ -22,8 +22,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from output_queue import ChannelQueue, OutputQueueManager, QueuedJob  # noqa: E402
-
+from output_queue import ChannelQueue, OutputQueueManager  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -179,8 +178,7 @@ class TestChannelQueueBaseExceptionResilience:
 
         # Queue is empty AND drain is no longer running — depth must be 0.
         assert q.depth == 0, (
-            f"depth should be 0 after drain exit, got {q.depth}; "
-            f"_running={q._running}, len(_queue)={len(q._queue)}"
+            f"depth should be 0 after drain exit, got {q.depth}; _running={q._running}, len(_queue)={len(q._queue)}"
         )
 
     def test_new_jobs_accepted_after_base_exception_kill(self):
@@ -212,9 +210,7 @@ class TestChannelQueueBaseExceptionResilience:
         recovered = _wait_flag(lambda: not q._running)
         assert recovered, "new drain thread did not finish within timeout"
 
-        assert results == ["job2"], (
-            f"queue did not resume after BaseException drain-thread death; results={results}"
-        )
+        assert results == ["job2"], f"queue did not resume after BaseException drain-thread death; results={results}"
 
 
 # ---------------------------------------------------------------------------

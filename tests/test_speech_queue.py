@@ -497,4 +497,3 @@ class TestDrainBaseExceptionResilience:
             )
         finally:
             server._run_speech_job = original_runner
-
