@@ -68,6 +68,9 @@ def _stub_heavy_deps():
         vad_mod.detect_speech_file = MagicMock()
         vad_mod.is_hallucination = MagicMock(return_value=False)
         vad_mod.is_model_loaded = MagicMock(return_value=False)
+        # http_api imports these two at module level (F2 pipecat wrapper)
+        vad_mod.is_pipecat_vad_available = MagicMock(return_value=False)
+        vad_mod.voice_confidence = MagicMock(return_value=0.0)
         sys.modules["vad"] = vad_mod
 
     # modality stubs
