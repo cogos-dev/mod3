@@ -28,6 +28,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# server.py hard-imports mcp at module level; skip cleanly in CI where the
+# mcp package is not installed rather than raising a collection-time ImportError.
+# Check HAS_MCP from conftest (set before stubs) so we test real availability.
+from conftest import HAS_MCP  # noqa: E402
+
+if not HAS_MCP:
+    pytest.skip("mcp package not installed", allow_module_level=True)
+
 import server  # noqa: E402
 
 

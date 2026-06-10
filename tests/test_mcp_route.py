@@ -17,6 +17,13 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# server.py requires the mcp package at module level; skip cleanly when absent.
+# Check HAS_MCP from conftest (set before stubs) so we test real availability.
+from conftest import HAS_MCP  # noqa: E402
+
+if not HAS_MCP:
+    pytest.skip("mcp package not installed", allow_module_level=True)
+
 
 @pytest.fixture(scope="module")
 def mcp_client():
