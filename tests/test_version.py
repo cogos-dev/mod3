@@ -130,11 +130,20 @@ def test_version_module_matches_pyproject():
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
-def http_app():
-    """Import http_api.app with heavy native deps stubbed out."""
+@pytest.fixture()
+def http_app(restore_sys_modules):
+    """Import http_api.app with heavy native deps stubbed out.
+
+    Uses restore_sys_modules so the stubs injected by _stub_heavy_deps() are
+    cleaned up after each test.  Without this, the fake engine/vad/etc. modules
+    linger in sys.modules for the rest of the pytest session and cause
+    ImportError in test files that later import the real modules.
+
+    Scope is function (not module) so each test gets a fresh import against a
+    clean stub set; the overhead is negligible because no heavy I/O occurs.
+    """
     _stub_heavy_deps()
-    # Force a fresh import if already cached from a different test run
+    # Force a fresh import so http_api is loaded against the current stub set
     if "http_api" in sys.modules:
         del sys.modules["http_api"]
     import http_api as _http_api
