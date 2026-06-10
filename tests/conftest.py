@@ -93,15 +93,25 @@ def _install_ci_native_stubs() -> None:
     ):
         _stub_if_missing(mod_name)
 
-    # mcp (server.py imports at module level)
+    # mcp (server.py and channel_client.py import from mcp at module level)
     if "mcp" not in sys.modules:
         try:
             import mcp  # noqa: F401
         except ImportError:
             mcp_mod = MagicMock()
             sys.modules["mcp"] = mcp_mod
-            sys.modules["mcp.server"] = MagicMock()
-            sys.modules["mcp.server.fastmcp"] = MagicMock()
+            # Register subpackages as real module objects so that dotted
+            # imports (from mcp.server.fastmcp import FastMCP, etc.) resolve.
+            for sub in (
+                "mcp.server",
+                "mcp.server.fastmcp",
+                "mcp.server.stdio",
+                "mcp.types",
+                "mcp.shared",
+                "mcp.shared.context",
+                "mcp.shared.message",
+            ):
+                sys.modules[sub] = MagicMock()
 
     # pysbd (engine.py — usually installable, but stub just in case)
     _stub_if_missing("pysbd")

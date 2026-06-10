@@ -14,6 +14,11 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from conftest import HAS_MLX  # noqa: E402
+
+if not HAS_MLX:
+    pytest.skip("mlx not available (Apple Silicon only)", allow_module_level=True)
+
 
 def _make_synthetic_conditionals():
     import mlx.core as mx
