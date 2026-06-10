@@ -19,6 +19,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from conftest import HAS_MCP  # noqa: E402
+
+# Marker for tests that call @mcp.tool()-decorated functions on server.
+needs_mcp = pytest.mark.skipif(
+    not HAS_MCP, reason="mcp package required for @mcp.tool-decorated server functions"
+)
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -101,6 +108,7 @@ class TestDashboardChatWs:
 # ---------------------------------------------------------------------------
 
 
+@needs_mcp
 class TestMod3DashboardPostTool:
     def test_returns_ok_with_no_subscribers(self):
         """mod3_dashboard_post returns ok even when no WS subscribers are connected."""

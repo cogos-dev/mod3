@@ -23,6 +23,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from conftest import HAS_MCP  # noqa: E402
+
 from bargein import BargeinRegistry, handle_bargein_start  # noqa: E402
 from bargein.providers.base import BargeinEvent, BargeinProvider  # noqa: E402
 from pipeline_state import PipelineState  # noqa: E402
@@ -66,6 +68,12 @@ def _isolate_real_bargein_signal_file():
         elif os.path.exists(real_path):
             os.remove(real_path)
 
+
+# Marker for tests that import server, whose @mcp.tool-decorated callables
+# become MagicMocks when mcp is absent.
+needs_mcp = pytest.mark.skipif(
+    not HAS_MCP, reason="mcp package required for @mcp.tool-decorated server functions"
+)
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -517,6 +525,7 @@ def test_file_mirror_subscriber_writes_event_to_path(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@needs_mcp
 def test_await_voice_input_returns_when_registry_emits_end(monkeypatch, tmp_path):
     """Regression: await_voice_input() must return when an in-process provider
     dispatches user_speaking_end through the registry.
@@ -568,6 +577,7 @@ def test_await_voice_input_returns_when_registry_emits_end(monkeypatch, tmp_path
     assert result["status"] != "timeout", f"timed out despite registry event: {result}"
 
 
+@needs_mcp
 def test_await_voice_input_returns_on_legacy_file_write(monkeypatch, tmp_path):
     """Backward-compat: out-of-process producers (e.g. integrations/bargein-producer.py)
     write ``user_speaking_end`` to ``/tmp/mod3-barge-in.json``. await_voice_input()
@@ -615,6 +625,7 @@ def test_await_voice_input_returns_on_legacy_file_write(monkeypatch, tmp_path):
     assert result["status"] != "timeout", f"timed out despite file write: {result}"
 
 
+@needs_mcp
 def test_await_voice_input_times_out_when_no_signal(monkeypatch, tmp_path):
     """If neither source fires, await_voice_input() must actually time out.
 
