@@ -23,6 +23,9 @@ exclude = ["vendor/"]
 select = ["E", "F", "W", "I"]
 ignore = ["E501"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.pyright]
 pythonVersion = "3.12"
 typeCheckingMode = "basic"
