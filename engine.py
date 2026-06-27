@@ -3,8 +3,11 @@
 No MCP or playback dependencies. Takes text + params, yields numpy audio chunks.
 """
 
+import gc
 import logging
+import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -110,6 +113,113 @@ MODELS = {
 _models: dict = {}
 _model_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Idle-unload subsystem (MOD3_TTS_IDLE_UNLOAD_SECONDS)
+# ---------------------------------------------------------------------------
+# When MOD3_TTS_IDLE_UNLOAD_SECONDS > 0 a daemon thread watches _last_use_ts.
+# After the idle threshold passes with no synthesize activity the loaded models
+# are evicted from _models, gc.collect() is called, and MLX Metal memory is
+# cleared.  The next get_model() / generate_audio() / synthesize() call
+# transparently reloads from disk.
+#
+# Default is 0 (disabled) so existing behaviour is unchanged.
+# ---------------------------------------------------------------------------
+
+_last_use_ts: float = 0.0  # epoch seconds; updated inside _model_lock on each use
+_idle_unload_enabled: bool = False
+_idle_unload_seconds: float = 0.0
+
+
+def _parse_idle_unload_seconds() -> float:
+    raw = os.environ.get("MOD3_TTS_IDLE_UNLOAD_SECONDS", "0").strip()
+    try:
+        val = float(raw)
+    except ValueError:
+        _log.warning(
+            "MOD3_TTS_IDLE_UNLOAD_SECONDS=%r is not a number; idle-unload disabled",
+            raw,
+        )
+        return 0.0
+    return max(0.0, val)
+
+
+def _free_mlx_memory() -> None:
+    """Best-effort release of MLX / Metal GPU cache."""
+    try:
+        import mlx.core as mx  # type: ignore[import-untyped]
+
+        mx.metal.clear_cache()
+    except Exception:
+        pass
+    try:
+        import mlx.core as mx  # type: ignore[import-untyped]
+
+        mx.clear_memory_pool()
+    except Exception:
+        pass
+
+
+def _unload_all_models() -> list[str]:
+    """Drop all loaded model references under the lock and free memory.
+
+    Returns the list of engine names that were evicted.
+    """
+    global _models
+    with _model_lock:
+        if not _models:
+            return []
+        evicted = list(_models.keys())
+        _models = {}
+    gc.collect()
+    _free_mlx_memory()
+    return evicted
+
+
+def _idle_unload_watcher(threshold_sec: float) -> None:
+    """Background daemon: unload models once idle exceeds *threshold_sec*."""
+    _log.info(
+        "idle-unload watcher started (threshold=%.0fs)",
+        threshold_sec,
+    )
+    poll = max(5.0, threshold_sec / 10.0)
+    while True:
+        time.sleep(poll)
+        if not _models:
+            continue
+        with _model_lock:
+            last = _last_use_ts
+        if last <= 0.0:
+            continue
+        idle = time.time() - last
+        if idle >= threshold_sec:
+            evicted = _unload_all_models()
+            if evicted:
+                _log.info(
+                    "idle-unload: evicted %s after %.0fs idle (threshold=%.0fs)",
+                    evicted,
+                    idle,
+                    threshold_sec,
+                )
+
+
+def _start_idle_unload_watcher_if_enabled() -> None:
+    """Called once at module import time to launch the watcher daemon."""
+    global _idle_unload_enabled, _idle_unload_seconds
+    _idle_unload_seconds = _parse_idle_unload_seconds()
+    if _idle_unload_seconds <= 0.0:
+        return
+    _idle_unload_enabled = True
+    t = threading.Thread(
+        target=_idle_unload_watcher,
+        args=(_idle_unload_seconds,),
+        daemon=True,
+        name="tts-idle-unload",
+    )
+    t.start()
+
+
+_start_idle_unload_watcher_if_enabled()
+
 
 def split_sentences(text: str) -> list[str]:
     """Split text into sentences using pysbd."""
@@ -188,14 +298,20 @@ def resolve_model(voice: str) -> tuple[str, str]:
 
 
 def get_model(engine: str):
-    """Load and cache an engine's model. Thread-safe."""
-    if engine not in _models:
-        with _model_lock:
-            if engine not in _models:
-                from mlx_audio.tts import load
+    """Load and cache an engine's model. Thread-safe.
 
-                _models[engine] = load(MODELS[engine]["id"])
-    return _models[engine]
+    Stamps _last_use_ts so the idle-unload watcher knows when synthesis last
+    happened. On a reload after eviction the load path runs again transparently.
+    """
+    with _model_lock:
+        if engine not in _models:
+            from mlx_audio.tts import load
+
+            _models[engine] = load(MODELS[engine]["id"])
+        if _idle_unload_enabled:
+            global _last_use_ts
+            _last_use_ts = time.time()
+        return _models[engine]
 
 
 def get_loaded_engines() -> list[str]:
