@@ -6,14 +6,9 @@ MLX or any real TTS model — all model loading is monkeypatched.
 Run: python3 -m pytest tests/test_engine_idle_unload.py -v
 """
 
-import gc
 import os
 import sys
-import threading
 import time
-import importlib
-
-import pytest
 
 # Ensure the repo root is on sys.path so `import engine` resolves.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -43,6 +38,7 @@ def _fresh_engine_module(monkeypatch, idle_seconds: str = "0"):
     # Remove cached module so the next import re-runs module-level code.
     sys.modules.pop("engine", None)
     import engine as eng
+
     return eng
 
 
