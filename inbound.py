@@ -117,6 +117,8 @@ class VADStage:
             return None
 
         ctx["vad_result"] = vad_result
+        # Real speech detected — reset the mic idle-release clock.
+        p.mark_activity()
 
         # Reflex arc: interrupt TTS if speaking.
         if p._pipeline_state.is_speaking:
@@ -247,6 +249,17 @@ class InboundPipeline:
     ModalityBus.perceive() for the VAD→STT→BoH pipeline, and the seat
     registry's fan_out_all() to deliver transcripts to channel-client
     seats (which relay them to Claude Code as notifications/claude/channel).
+
+    Mic idle-release: the input device is only useful while VAD is actively
+    listening for a real utterance. Historically the mic was acquired once
+    at pipeline start() and held open for the lifetime of the process (days,
+    across restarts) — the OS mic indicator stayed lit continuously even
+    when nothing had been said in hours, and only a full daemon restart
+    cleared it. See flight-review.md's linked incident: server uptime 3.9
+    days, mic held the entire time. ``MOD3_MIC_IDLE_RELEASE_SECONDS``
+    (default 300s / 5min) releases the AudioCapture device after that long
+    with no VAD-detected speech; the next tick transparently re-acquires it
+    on demand. Set to 0 to disable and restore the old always-open behavior.
     """
 
     # Default silence threshold for utterance endpointing.
@@ -254,6 +267,11 @@ class InboundPipeline:
     # 600ms is the sweet spot: long enough for mid-sentence pauses, short enough
     # that the user doesn't feel lag at turn-end.
     _DEFAULT_SILENCE_MS: int = 600
+
+    # Default idle-release window: release the mic after this many seconds
+    # with no VAD-detected speech. 0 (or a negative value) disables release
+    # entirely, restoring the historical always-open behavior.
+    _DEFAULT_MIC_IDLE_RELEASE_SEC: float = 300.0
 
     def __init__(
         self,
@@ -270,6 +288,7 @@ class InboundPipeline:
         use_smart_turn: bool | None = None,
         mode: ChannelMode | str = ChannelMode.INTENTIONAL,
         pipeline_stages: list[str] | None = None,
+        mic_idle_release_sec: float | None = None,
     ):
         self._bus = bus
         self._pipeline_state = pipeline_state
@@ -278,6 +297,33 @@ class InboundPipeline:
         self._vad_threshold = vad_threshold
         self._speaker = speaker
         self._sample_rate = sample_rate
+
+        # Resolve the mic idle-release window: caller > env var > class default.
+        if mic_idle_release_sec is not None:
+            self._mic_idle_release_sec = mic_idle_release_sec
+        else:
+            env_raw = os.environ.get("MOD3_MIC_IDLE_RELEASE_SECONDS", "").strip()
+            if env_raw:
+                try:
+                    self._mic_idle_release_sec = float(env_raw)
+                except ValueError:
+                    logger.warning(
+                        "MOD3_MIC_IDLE_RELEASE_SECONDS=%r is not a number; using default %.0fs",
+                        env_raw,
+                        self._DEFAULT_MIC_IDLE_RELEASE_SEC,
+                    )
+                    self._mic_idle_release_sec = self._DEFAULT_MIC_IDLE_RELEASE_SEC
+            else:
+                self._mic_idle_release_sec = self._DEFAULT_MIC_IDLE_RELEASE_SEC
+        self._mic_idle_release_enabled = self._mic_idle_release_sec > 0
+        # Last time VAD detected actual speech (or the pipeline (re)started).
+        # Monotonic clock — never affected by wall-clock adjustments.
+        self._last_activity_monotonic = time.monotonic()
+        self._mic_idle_watcher_thread: threading.Thread | None = None
+        if self._mic_idle_release_enabled:
+            logger.debug("mic idle-release enabled: window=%.0fs", self._mic_idle_release_sec)
+        else:
+            logger.debug("mic idle-release disabled (MOD3_MIC_IDLE_RELEASE_SECONDS<=0)")
         # Resolve silence duration: caller > env var > class default (600ms).
         # MOD3_VAD_SILENCE_MS is in milliseconds; stored internally as seconds.
         if min_silence_duration_sec is not None:
@@ -349,6 +395,33 @@ class InboundPipeline:
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._running = False
+        # AudioCapture.start()/stop() are not internally synchronized against
+        # concurrent calls; the idle-release watcher thread and the listen
+        # loop thread can both want to change capture state around the same
+        # moment (watcher releasing while the listen loop is about to
+        # re-acquire). Serialize all lifecycle transitions through this lock.
+        self._capture_lifecycle_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Capture lifecycle helpers (thread-safe acquire/release)
+    # ------------------------------------------------------------------
+
+    def _acquire_capture(self) -> None:
+        """Start the AudioCapture device if not already active. Thread-safe."""
+        with self._capture_lifecycle_lock:
+            if not self._capture.is_active():
+                self._capture.start()
+
+    def _release_capture(self) -> bool:
+        """Stop the AudioCapture device if active. Thread-safe.
+
+        Returns True if a running capture was actually stopped.
+        """
+        with self._capture_lifecycle_lock:
+            if not self._capture.is_active():
+                return False
+            self._capture.stop()
+            return True
 
     # ------------------------------------------------------------------
     # Public API
@@ -359,8 +432,8 @@ class InboundPipeline:
         if self._running:
             return
 
-        if not self._capture.is_active():
-            self._capture.start()
+        self._acquire_capture()
+        self._last_activity_monotonic = time.monotonic()
 
         # F5: Lazily initialise Smart Turn detector if enabled.
         if self._use_smart_turn and self._smart_turn_detector is None:
@@ -388,6 +461,15 @@ class InboundPipeline:
             daemon=True,
         )
         self._thread.start()
+
+        if self._mic_idle_release_enabled:
+            self._mic_idle_watcher_thread = threading.Thread(
+                target=self._mic_idle_watcher_loop,
+                name="inbound-mic-idle-watcher",
+                daemon=True,
+            )
+            self._mic_idle_watcher_thread.start()
+
         logger.info("inbound pipeline started")
 
     def stop(self) -> None:
@@ -399,8 +481,11 @@ class InboundPipeline:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
+        if self._mic_idle_watcher_thread is not None:
+            self._mic_idle_watcher_thread.join(timeout=5.0)
+            self._mic_idle_watcher_thread = None
 
-        self._capture.stop()
+        self._release_capture()
         self._running = False
         logger.info("inbound pipeline stopped")
 
@@ -408,6 +493,74 @@ class InboundPipeline:
     def is_running(self) -> bool:
         """Whether the listening loop is currently active."""
         return self._running and not self._stop_event.is_set()
+
+    @property
+    def mic_is_open(self) -> bool:
+        """Whether the underlying AudioCapture device is currently acquired.
+
+        False while idle-released; True whenever a real capture stream is
+        open (whether because activity is recent or release is disabled).
+        """
+        return self._capture.is_active()
+
+    def mark_activity(self) -> None:
+        """Record that real VAD-detected speech just happened.
+
+        Resets the idle clock so the mic idle-release watcher does not
+        release the device mid-conversation. Called from the VAD stage (and
+        the legacy inline tick path) on every speech-onset detection.
+        """
+        self._last_activity_monotonic = time.monotonic()
+
+    # ------------------------------------------------------------------
+    # Mic idle-release watcher (runs in background thread)
+    # ------------------------------------------------------------------
+
+    def _mic_idle_watcher_poll_interval(self) -> float:
+        """Poll interval for the idle watcher: a fraction of the window, min 5s."""
+        return max(5.0, self._mic_idle_release_sec / 10.0)
+
+    def _mic_idle_check_once(self) -> bool:
+        """Run a single idle-release decision. Returns True if a capture was released.
+
+        Factored out of the watcher loop so tests can exercise the release
+        decision directly, without depending on real poll-interval timing
+        (the loop's poll interval has a 5s floor, which would make a
+        timing-based test either slow or flaky).
+        """
+        if not self._capture.is_active():
+            return False  # already released
+        idle = time.monotonic() - self._last_activity_monotonic
+        if idle < self._mic_idle_release_sec:
+            return False
+        try:
+            released = self._release_capture()
+        except Exception:
+            logger.exception("mic idle-release: failed to stop capture")
+            return False
+        if released:
+            logger.info(
+                "mic idle-release: released input device after %.0fs idle (threshold=%.0fs)",
+                idle,
+                self._mic_idle_release_sec,
+            )
+        return released
+
+    def _mic_idle_watcher_loop(self) -> None:
+        """Background daemon: release the mic once idle exceeds the configured window.
+
+        Polls at a fraction of the idle window (min 5s) rather than busy-waiting.
+        Only ever calls ``self._capture.stop()`` — never touches ``_running`` or
+        ``_stop_event`` — so the listen loop keeps ticking and transparently
+        re-acquires the device (via ``_tick``) the moment it needs audio again.
+        """
+        poll = self._mic_idle_watcher_poll_interval()
+        logger.debug("mic idle-release watcher started (window=%.0fs, poll=%.1fs)", self._mic_idle_release_sec, poll)
+        while not self._stop_event.is_set():
+            if self._stop_event.wait(poll):
+                break
+            self._mic_idle_check_once()
+        logger.debug("mic idle-release watcher exited")
 
     # ------------------------------------------------------------------
     # Listening loop (runs in background thread)
@@ -439,6 +592,12 @@ class InboundPipeline:
         ambient mode before diarize/ecapa_match land), the legacy inline path
         runs instead so behaviour is never silently degraded.
         """
+        # 0. Re-acquire the mic on demand if idle-release let it go. The
+        # watcher only ever releases; re-acquisition always happens here,
+        # on the thread that actually needs audio next.
+        if not self._capture.is_active():
+            self._acquire_capture()
+            logger.info("mic idle-release: re-acquired input device on demand")
 
         # 1. Grab a chunk of audio from the ring buffer
         chunk = self._capture.get_audio(self._chunk_sec)
@@ -480,6 +639,9 @@ class InboundPipeline:
             # No speech — sleep briefly and loop
             self._stop_event.wait(self._loop_sleep_sec)
             return
+
+        # Real speech detected — reset the mic idle-release clock.
+        self.mark_activity()
 
         # 3. Speech detected — reflex arc: interrupt TTS if speaking
         if self._pipeline_state.is_speaking:
@@ -601,6 +763,7 @@ class InboundPipeline:
             if vad_result.has_speech:
                 chunks.append(chunk)
                 last_speech_time = time.monotonic()
+                self.mark_activity()
             else:
                 # Silence detected — check if we've exceeded the silence window
                 silence_elapsed = time.monotonic() - last_speech_time

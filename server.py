@@ -986,6 +986,87 @@ def _run_speech_job(entry: dict) -> None:
             _current_player = None
 
 
+# ---------------------------------------------------------------------------
+# Barge-in gate escalation (retry-with-backoff)
+# ---------------------------------------------------------------------------
+#
+# Both speak() and _start_speech() check the barge-in signal file before
+# committing to playback: if the user is mid-utterance, talking over them is
+# worse than a short delay. Previously a single "recording" reading returned
+# a terminal "held" status with no retry — if the caller (an LLM agent) never
+# re-sent the request, or VAD false-positived on background noise (engine hum,
+# cabin noise, etc.) and stayed "recording" indefinitely, the audio was
+# silently dropped for the rest of the session. See flight-review.md §5 fix 6:
+# voice was requested 3x on a 12+ hour flight and held 3x, never escalated.
+#
+# _MOD3_GATE_RETRY_ATTEMPTS / _MOD3_GATE_RETRY_INTERVAL_SEC give the gate a
+# real chance to clear (a genuine utterance is usually a few seconds) before
+# escalating. After the retry budget is exhausted we do NOT play over the
+# user (that risk is worse than a delay) — we return a structured signal
+# that says how many times playback has been held so far, so the calling
+# agent (and the operator, via the dashboard/response) can see that voice
+# output is being suppressed instead of it disappearing silently.
+
+_MOD3_GATE_RETRY_ATTEMPTS = int(os.environ.get("MOD3_GATE_RETRY_ATTEMPTS", "3"))
+_MOD3_GATE_RETRY_INTERVAL_SEC = float(os.environ.get("MOD3_GATE_RETRY_INTERVAL_SEC", "3.0"))
+
+# Tracks consecutive holds per logical caller so escalation messaging can
+# say "held N times in a row" even across separate speak() invocations
+# (an agent re-sending the same request after being told to retry).
+_gate_hold_streak: dict[str, int] = {}
+_gate_hold_streak_lock = threading.Lock()
+
+
+def _bargein_user_recording() -> bool:
+    """Return True if the barge-in signal file currently says the user is speaking."""
+    try:
+        if os.path.exists(_BARGEIN_SIGNAL):
+            with open(_BARGEIN_SIGNAL) as _bf:
+                _bsig = json.load(_bf)
+            return _bsig.get("event") == "user_speaking_start"
+    except Exception:
+        pass  # signal file missing or corrupt — assume idle
+    return False
+
+
+def check_bargein_gate(streak_key: str = "default") -> dict:
+    """Check the barge-in gate, retrying with backoff before giving up.
+
+    Polls the barge-in signal file up to ``_MOD3_GATE_RETRY_ATTEMPTS`` times,
+    sleeping ``_MOD3_GATE_RETRY_INTERVAL_SEC`` between checks. A real
+    utterance is usually a few seconds; this gives it a real chance to clear
+    (~10s at the defaults) before we consider the caller blocked.
+
+    Returns a dict:
+        {
+            "blocked": bool,             # True if still "recording" after retries
+            "attempts": int,             # how many checks were performed
+            "held_count": int,           # consecutive holds for this streak_key,
+                                          # including this one if blocked
+        }
+
+    On success (gate clears within the retry budget) the hold streak for
+    ``streak_key`` is reset to 0. On escalation (still blocked after retries)
+    the streak is incremented so repeated re-sends accumulate a visible count
+    rather than each looking like a fresh, unremarkable "held" reply.
+    """
+    attempts = 0
+    for attempt in range(_MOD3_GATE_RETRY_ATTEMPTS):
+        attempts = attempt + 1
+        if not _bargein_user_recording():
+            with _gate_hold_streak_lock:
+                _gate_hold_streak[streak_key] = 0
+            return {"blocked": False, "attempts": attempts, "held_count": 0}
+        if attempt < _MOD3_GATE_RETRY_ATTEMPTS - 1:
+            time.sleep(_MOD3_GATE_RETRY_INTERVAL_SEC)
+
+    with _gate_hold_streak_lock:
+        _gate_hold_streak[streak_key] = _gate_hold_streak.get(streak_key, 0) + 1
+        held_count = _gate_hold_streak[streak_key]
+
+    return {"blocked": True, "attempts": attempts, "held_count": held_count}
+
+
 def _start_speech(
     text: str,
     voice: str,
@@ -1140,19 +1221,18 @@ def speak(
             voice = session.assigned_voice
         session.state = "speaking"
 
-    # Check if user is currently speaking (barge-in signal file)
+    # Check if user is currently speaking (barge-in signal file). Retries
+    # with backoff (see check_bargein_gate) before giving up — a real
+    # utterance usually clears within a few seconds, and VAD can
+    # false-positive on background noise, so a single "recording" reading
+    # must not be terminal (see flight-review.md §5 fix 6).
     user_state = "idle"
-    try:
-        if os.path.exists(_BARGEIN_SIGNAL):
-            with open(_BARGEIN_SIGNAL) as _bf:
-                _bsig = json.load(_bf)
-            if _bsig.get("event") == "user_speaking_start":
-                user_state = "recording"
-    except Exception:
-        pass  # signal file missing or corrupt — assume idle
+    gate = check_bargein_gate(streak_key=effective_session_id or "default")
+    if gate["blocked"]:
+        user_state = "recording"
 
-    # If user is currently recording, don't play — just inform the agent.
-    # The agent is responsible for re-calling speak() after the user finishes.
+    # If the user is still (apparently) recording after the retry budget is
+    # exhausted, don't play over them — but never drop the request silently.
     # We intentionally do NOT enqueue the job or create a _jobs entry, because
     # a "held" job in the queue becomes a zombie: the drain thread tries to play
     # it immediately (ignoring the hold), and if anything goes wrong the job
@@ -1162,9 +1242,19 @@ def speak(
         return json.dumps(
             {
                 "status": "held",
-                "reason": "User is currently speaking — re-send this speak() call after user finishes.",
+                "reason": ("User is currently speaking — re-send this speak() call after user finishes."),
                 "user_state": "recording",
                 "estimated_duration_sec": round(est_duration, 1),
+                "gate_attempts": gate["attempts"],
+                "held_count": gate["held_count"],
+                "escalation": (
+                    f"Audio has been held {gate['held_count']} time(s) in a row for this "
+                    "session — VAD may be false-positiving on background noise rather than "
+                    "detecting real speech. If this keeps happening, voice output is being "
+                    "silently suppressed; consider falling back to text or checking the mic."
+                    if gate["held_count"] >= 2
+                    else None
+                ),
             }
         )
 

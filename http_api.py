@@ -1616,11 +1616,28 @@ def speak_enqueue(req: SpeakRequest):
     speech queue and returns a job token. The drain thread owns all audio
     playback — callers never spawn afplay or aplay.
 
+    Before enqueuing, checks the barge-in gate (is the user currently
+    speaking?) with retry-with-backoff — see server.check_bargein_gate. This
+    is the endpoint the mod3_speak MCP tool actually calls (via
+    clients/channel_client.py), so it must not silently drop audio the way
+    the legacy stdio speak() tool used to (flight-review.md §5 fix 6: voice
+    requested 3x, held 3x, never escalated).
+
     Returns:
         {
             "job_id": str,          # correlation handle; poll /v1/speech_status
             "queue_position": int,  # 0 = playing immediately, N = queued
             "status": str           # "speaking" | "queued"
+        }
+
+    If the gate is still blocked after the retry budget, instead returns:
+        {
+            "status": "held",
+            "reason": str,
+            "user_state": "recording",
+            "gate_attempts": int,
+            "held_count": int,          # consecutive holds for this session
+            "escalation": str | None,   # non-null once held_count >= 2
         }
 
     Poll GET /v1/jobs/{job_id} for completion status.
@@ -1629,7 +1646,25 @@ def speak_enqueue(req: SpeakRequest):
     if not req.text.strip():
         return JSONResponse(status_code=400, content={"error": "text required"})
     try:
-        from server import _start_speech
+        from server import _start_speech, check_bargein_gate
+
+        gate = check_bargein_gate(streak_key=req.session_id or "default")
+        if gate["blocked"]:
+            return {
+                "status": "held",
+                "reason": ("User is currently speaking — re-send this request after user finishes."),
+                "user_state": "recording",
+                "gate_attempts": gate["attempts"],
+                "held_count": gate["held_count"],
+                "escalation": (
+                    f"Audio has been held {gate['held_count']} time(s) in a row for this "
+                    "session — VAD may be false-positiving on background noise rather than "
+                    "detecting real speech. If this keeps happening, voice output is being "
+                    "silently suppressed; consider falling back to text or checking the mic."
+                    if gate["held_count"] >= 2
+                    else None
+                ),
+            }
 
         job_id, position = _start_speech(
             req.text,
