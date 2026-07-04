@@ -27,6 +27,46 @@ from bargein import BargeinRegistry, handle_bargein_start  # noqa: E402
 from bargein.providers.base import BargeinEvent, BargeinProvider  # noqa: E402
 from pipeline_state import PipelineState  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _isolate_real_bargein_signal_file():
+    """Restore the real /tmp/mod3-barge-in.json after every test in this module.
+
+    server.py's module-level mirror subscriber (``make_file_mirror_subscriber``,
+    registered at import time against the real ``_BARGEIN_SIGNAL`` path) closes
+    over that path directly — it does not re-read ``server._BARGEIN_SIGNAL``
+    live. So even tests here that construct their own ``BargeinRegistry`` and
+    ``monkeypatch`` ``server._BARGEIN_SIGNAL`` to a ``tmp_path`` can still end
+    up writing ``user_speaking_start``/``user_speaking_end`` into the *real*
+    file via that pre-registered subscriber, if a triggered event reaches the
+    process-global ``server._bargein_registry`` (directly, or indirectly
+    through shared module state). That leaves the real file in whatever state
+    a test happened to write, which other test modules — e.g.
+    tests/test_speak_endpoint.py, which reads the real path unmocked when
+    checking the barge-in gate — pick up as false "user is speaking" state.
+
+    Snapshot/restore the real file around every test in this module so this
+    file cannot leak barge-in state to tests that run after it in the same
+    session.
+    """
+    import server as _server
+
+    real_path = _server._BARGEIN_SIGNAL
+    original = None
+    had_original = os.path.exists(real_path)
+    if had_original:
+        with open(real_path) as f:
+            original = f.read()
+    try:
+        yield
+    finally:
+        if had_original:
+            with open(real_path, "w") as f:
+                f.write(original)
+        elif os.path.exists(real_path):
+            os.remove(real_path)
+
+
 # ---------------------------------------------------------------------------
 # Test doubles
 # ---------------------------------------------------------------------------
