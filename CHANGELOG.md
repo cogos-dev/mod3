@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed — Pinned ML-critical dependencies to prevent fresh-install drift
+
+- **`requirements.txt` now pins `transformers`, `mlx-lm`, and `mlx-audio` to exact known-working versions, and declares `torchaudio` explicitly.** A deploy-worktree cutover attempt found that a fresh install from the previously-unpinned `requirements.txt` resolved `transformers` to a version that breaks `mlx_lm`'s module-level `AutoTokenizer.register("NewlineTokenizer", ...)` call (`AttributeError: 'str' object has no attribute '__module__'`), which took down the chatterbox-turbo model-load path entirely (HTTP 500 on `/v1/speak` and `/v1/synthesize` for that voice). Separately, `torchaudio` — required by `vad.py`'s silero-vad path — was never declared in `requirements.txt` at all, so a fresh install silently reported `modalities.vad: false` instead of failing loudly. Both are now pinned to the versions verified working in the long-running dev venv (`transformers==5.9.0`, `mlx-lm==0.31.3`, `mlx-audio==0.4.3`, `torchaudio==2.10.0`). Added `tests/test_dependency_sanity.py` as a cheap, network-free regression guard (bare-import checks) so a future unpinned-floor drift fails CI instead of surfacing as a live-service HTTP 500.
+
 ### Changed — `mod3_speak` mirrors to dashboard chat by default
 
 - **Speech now appears in the chat panel + per-session history.** The MCP `mod3_speak` tool previously only hit `POST /v1/speak`: audio played, but the dashboard chat pane stayed empty and nothing landed in the per-session ring buffer. Operators going back to reread a conversation later saw their own prompts but no agent responses for any turn delivered as speech. The tool now POSTs the spoken text to `/v1/dashboard-chat` (as an `assistant` message under the seat's `session_id`) *before* invoking `/v1/speak`, so the transcript lands at roughly the same time audio begins. The chat mirror is best-effort — a failed POST logs and continues, so audio playback is never blocked. New `post_to_chat` parameter (default `True`) opts out for non-conversational audio (system sounds, UI cues).

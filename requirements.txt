@@ -1,4 +1,25 @@
-mlx-audio>=0.4.2
+# --- ML-critical set: exact pins, not floors ---
+# These packages are transitively pulled in by mlx-audio/mlx-whisper but were
+# previously undeclared/unpinned, which let a fresh install silently drift to
+# incompatible versions (deploy-cutover failure, 2026-07-02 — see the PR that
+# introduced these pins for the full incident writeup).
+#
+# transformers>=5.10 breaks mlx_lm's tokenizer_utils.py, which calls
+# AutoTokenizer.register("NewlineTokenizer", ...) with a bare string as the
+# config class. Newer transformers' register() does `key.__module__` on that
+# argument and raises `AttributeError: 'str' object has no attribute
+# '__module__'`. This breaks the chatterbox-turbo model load path (HTTP 500
+# on /v1/speak and /v1/synthesize for that voice) entirely. Do not bump
+# transformers past 5.9.x without re-verifying mlx_lm's AutoTokenizer.register
+# call site.
+transformers==5.9.0
+mlx-lm==0.31.3
+mlx-audio==0.4.3
+# torchaudio is required by vad.py's silero-vad model (torch.hub-cached) and
+# by mod3/worker/stt.py, but was entirely undeclared — present only because
+# it happened to be manually installed in older dev venvs. Without it, VAD
+# silently reports modalities.vad=false instead of failing loudly.
+torchaudio==2.10.0
 mlx-whisper>=0.4.0
 mcp>=1.20.0
 sounddevice>=0.5.0
