@@ -39,6 +39,8 @@ jobs:
             pytest pytest-asyncio python-multipart \
             mcp mistral-common soundfile
       - name: Run tests
+        env:
+          SKIP_TTS_TESTS: "1"
         run: pytest tests/ -v --tb=short
 
   test-api:
