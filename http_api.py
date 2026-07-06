@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 from fastapi import FastAPI, Request, Response, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.websockets import WebSocketState
 
 from _version import __version__
 from audio_subscribers import get_default_audio_subscribers
@@ -3026,6 +3027,17 @@ async def ws_audio(websocket: WebSocket, session_id: str):
                     elif msg_type == "websocket.disconnect":
                         # Client disconnected before handshake — fall through to finally.
                         return
+                    elif msg_type == "disconnect-bot":
+                        # Client requested graceful close before completing the
+                        # handshake (T5) — close now rather than falling into the
+                        # drain loop, where we'd block on receive() forever.
+                        logger.debug(
+                            "/ws/audio/%s: disconnect-bot received pre-handshake, closing",
+                            session_id,
+                        )
+                        if websocket.application_state == WebSocketState.CONNECTED:
+                            await websocket.close()
+                        return
                     # Any other RTVI type before handshake is silently ignored;
                     # we proceed to the drain loop.
                 except (json.JSONDecodeError, ValueError, AttributeError, IndexError):
@@ -3049,6 +3061,8 @@ async def ws_audio(websocket: WebSocket, session_id: str):
                     rtvi_type = parsed.get("type")
                     if rtvi_type == "disconnect-bot":
                         logger.debug("/ws/audio/%s: disconnect-bot received, closing", session_id)
+                        if websocket.application_state == WebSocketState.CONNECTED:
+                            await websocket.close()
                         break
                     elif rtvi_type in ("raw-audio", "raw-audio-batch"):
                         # Decode base64 int16 PCM and route to VAD/STT pipeline.
