@@ -23,6 +23,17 @@ Tests
    without error when called with wait=False (used in teardown paths).
 
 Run: python -m pytest tests/test_stt_executor_isolation.py -v
+
+Note for future test authors: do NOT import and use the shared module-level
+``channels._STT_EXECUTOR`` directly for isolation assertions. It is a
+process-global singleton that gets shut down for real by any other test
+file that runs ``with TestClient(app) as c:`` (this exercises the app's
+full lifespan, including ``shutdown_stt_executor()`` in the teardown path —
+see http_api.py's ``_lifespan``). Depending on pytest's collection order,
+the shared executor may already be shut down by the time this test runs.
+Always instantiate a local, throwaway ``ThreadPoolExecutor`` for isolation
+tests instead (see ``test_shutdown_stt_executor_is_safe`` below for the
+established pattern).
 """
 
 from __future__ import annotations
@@ -73,10 +84,16 @@ def test_stt_executor_thread_name_prefix():
 
 
 def test_slow_stt_does_not_block_default_pool():
-    """Slow STT work (on _STT_EXECUTOR) must not delay default-pool work.
+    """Slow STT work (on a dedicated single-worker pool) must not delay
+    default-pool work.
 
     Scenario:
-      - Enqueue a "slow STT" job (200ms) on _STT_EXECUTOR.
+      - Enqueue a "slow STT" job (200ms) on a dedicated single-worker
+        ThreadPoolExecutor — the same shape as channels._STT_EXECUTOR,
+        but a fresh local instance so this test is immune to any other
+        test file's TestClient(app) lifespan teardown (which shuts down
+        the real, shared, module-level _STT_EXECUTOR as a side effect —
+        see the module docstring above).
       - Concurrently enqueue a "fast default-pool" job on the asyncio
         default executor via asyncio.to_thread().
       - Assert the default-pool job completes well within the STT job's
@@ -102,22 +119,26 @@ def test_slow_stt_does_not_block_default_pool():
             time.sleep(FAST_JOB_DURATION)
             return time.monotonic()
 
-        loop = asyncio.get_event_loop()
-        # Submit STT to the dedicated executor — fire and don't await yet.
-        stt_task = loop.run_in_executor(_STT_EXECUTOR, _slow_stt)
+        local_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mod3-stt-test")
+        try:
+            loop = asyncio.get_event_loop()
+            # Submit STT to the dedicated local executor — fire and don't await yet.
+            stt_task = loop.run_in_executor(local_executor, _slow_stt)
 
-        # Dispatch a job to the DEFAULT pool (via asyncio.to_thread) and
-        # measure how long it takes from dispatch to completion.
-        t0 = time.monotonic()
-        finish_time = await asyncio.to_thread(_fast_default)
-        elapsed = finish_time - t0
+            # Dispatch a job to the DEFAULT pool (via asyncio.to_thread) and
+            # measure how long it takes from dispatch to completion.
+            t0 = time.monotonic()
+            finish_time = await asyncio.to_thread(_fast_default)
+            elapsed = finish_time - t0
 
-        assert elapsed < FAST_JOB_DEADLINE, (
-            f"Default-pool job took {elapsed:.3f}s — expected <{FAST_JOB_DEADLINE}s. STT isolation may be broken."
-        )
+            assert elapsed < FAST_JOB_DEADLINE, (
+                f"Default-pool job took {elapsed:.3f}s — expected <{FAST_JOB_DEADLINE}s. STT isolation may be broken."
+            )
 
-        # Wait for the STT task so we don't leave threads dangling.
-        await stt_task
+            # Wait for the STT task so we don't leave threads dangling.
+            await stt_task
+        finally:
+            local_executor.shutdown(wait=False)
 
     asyncio.run(_run())
     assert results.get("stt") == "done"
