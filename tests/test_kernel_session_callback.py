@@ -28,6 +28,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# FastAPI's TestClient sends "Host: testserver" by default, which the
+# app's `_localhost_csrf_guard` middleware correctly rejects (DNS-rebinding
+# protection). Tests that exercise mutating endpoints must supply an
+# allowed Host header, matching the pattern in test_localhost_csrf_guard.py.
+_GOOD_HOST = "localhost:7860"
+
 
 @pytest.fixture
 def client():
@@ -58,6 +64,7 @@ class TestKernelRegisterCallback:
             resp = client.post(
                 f"/v1/sessions/{session_id}/seats",
                 json={"client_type": "claude-code-channel", "device_uuid": session_id},
+                headers={"Host": _GOOD_HOST},
             )
 
         assert resp.status_code in (200, 201), resp.text
@@ -90,6 +97,7 @@ class TestKernelRegisterCallback:
             resp = client.post(
                 f"/v1/sessions/{session_id}/seats",
                 json={"client_type": "claude-code-channel", "device_uuid": session_id},
+                headers={"Host": _GOOD_HOST},
             )
 
         # Seat registration must succeed regardless of kernel callback failure.
@@ -120,6 +128,7 @@ class TestKernelRegisterCallback:
                     "user_iss": "https://cogos.local",
                     "user_sub": "chaz",
                 },
+                headers={"Host": _GOOD_HOST},
             )
 
         assert resp.status_code in (200, 201), resp.text
@@ -148,6 +157,7 @@ class TestKernelRegisterCallback:
             resp = client.post(
                 f"/v1/sessions/{session_id}/seats",
                 json={"client_type": "claude-code-channel", "device_uuid": session_id},
+                headers={"Host": _GOOD_HOST},
             )
 
         assert resp.status_code in (200, 201), resp.text
@@ -176,13 +186,14 @@ class TestKernelDeregisterCallback:
             reg = client.post(
                 f"/v1/sessions/{session_id}/seats",
                 json={"client_type": "claude-code-channel", "device_uuid": session_id},
+                headers={"Host": _GOOD_HOST},
             )
         assert reg.status_code in (200, 201), reg.text
         seat_id = reg.json()["seat_id"]
 
         # Now revoke and capture the kernel deregister callback.
         with patch("httpx.post", return_value=mock_response) as mock_post:
-            del_resp = client.delete(f"/v1/sessions/{session_id}/seats/{seat_id}")
+            del_resp = client.delete(f"/v1/sessions/{session_id}/seats/{seat_id}", headers={"Host": _GOOD_HOST})
 
         assert del_resp.status_code == 200, del_resp.text
 
@@ -203,13 +214,14 @@ class TestKernelDeregisterCallback:
             reg = client.post(
                 f"/v1/sessions/{session_id}/seats",
                 json={"client_type": "claude-code-channel", "device_uuid": session_id},
+                headers={"Host": _GOOD_HOST},
             )
         assert reg.status_code in (200, 201), reg.text
         seat_id = reg.json()["seat_id"]
 
         # Revoke with kernel callback failing.
         with patch("httpx.post", side_effect=Exception("kernel unreachable")):
-            del_resp = client.delete(f"/v1/sessions/{session_id}/seats/{seat_id}")
+            del_resp = client.delete(f"/v1/sessions/{session_id}/seats/{seat_id}", headers={"Host": _GOOD_HOST})
 
         assert del_resp.status_code == 200, (
             f"seat revoke must succeed even when kernel deregister callback fails; "
