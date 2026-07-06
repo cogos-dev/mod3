@@ -28,6 +28,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from conftest import skip_without_mlx  # noqa: E402
+
 
 class TestTorchaudioAvailable:
     """VAD (vad.py) lazily imports torchaudio.functional for silero-vad resampling."""
@@ -42,6 +44,7 @@ class TestTorchaudioAvailable:
         assert hasattr(F, "resample")
 
 
+@skip_without_mlx
 class TestMlxLmTokenizerRegistration:
     """mlx_lm's tokenizer_utils registers a custom tokenizer at import time.
 
