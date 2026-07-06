@@ -378,10 +378,25 @@ def generate_audio(
     sample_rate = model.sample_rate
     sentences = split_sentences(text)
     feather = int(sample_rate * 0.02)
+    cfg = MODELS[engine]
+
+    # Warn once per call (not per sentence) if speed is non-neutral but the
+    # engine will silently ignore it.  Engines that do honour speed are listed
+    # in MODELS[engine]["supports_speed"]; chatterbox, chatterbox-turbo, and
+    # voxtral accept the parameter but discard it at synthesis time.
+    _SPEED_NEUTRAL = 1.0
+    if speed != _SPEED_NEUTRAL and not cfg.get("supports_speed") and engine != "spark":
+        _log.warning(
+            "speed=%.2f has no effect on engine %r — %s does not support a speed "
+            "parameter.  Use Kokoro or Spark for speed control, or adjust "
+            "playbackRate client-side.",
+            speed,
+            engine,
+            engine,
+        )
 
     for si, sentence in enumerate(sentences):
         gen_kwargs: dict[str, object] = dict(text=sentence, verbose=False)
-        cfg = MODELS[engine]
         if engine in ("chatterbox", "chatterbox-turbo"):
             gen_kwargs["exaggeration"] = emotion
             gen_kwargs["stream"] = stream

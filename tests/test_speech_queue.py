@@ -10,8 +10,16 @@ import sys
 import threading
 import time
 
+import pytest
+
 # Ensure the project root is on the path so imports resolve
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from conftest import HAS_MCP  # noqa: E402
+
+# Marker for tests that call @mcp.tool()-decorated functions on server.
+# When mcp is absent those functions are MagicMock stubs, not real callables.
+needs_mcp = pytest.mark.skipif(not HAS_MCP, reason="mcp package required for @mcp.tool-decorated server functions")
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +189,7 @@ class TestDurationEstimation:
 # ---------------------------------------------------------------------------
 
 
+@needs_mcp
 class TestSpeakReturnFormat:
     """Test that speak() returns correctly structured JSON for queue states."""
 
@@ -205,6 +214,7 @@ class TestSpeakReturnFormat:
             assert len(result["job_id"]) == 8
 
 
+@needs_mcp
 class TestStopReturnFormat:
     """Test that stop() returns correctly structured JSON."""
 
@@ -227,6 +237,7 @@ class TestStopReturnFormat:
         assert "Unknown job" in result["error"]
 
 
+@needs_mcp
 class TestSpeechStatusReturnFormat:
     """Test that speech_status() returns correctly structured JSON."""
 

@@ -28,6 +28,14 @@ def _stub_heavy_deps():
     http_api imports engine, vad, and several audio modules that all pull in
     numpy / mlx-audio / sounddevice.  We stub them at the sys.modules level so
     that importing http_api succeeds without the native libraries.
+
+    IMPORTANT: only stub third-party / native packages here.  Local pure-Python
+    modules (bus, modality, session_registry, audio_subscribers, …) must NOT be
+    stubbed with bare MagicMock() — if server.py is imported while bus is a
+    MagicMock, server._bus becomes a MagicMock, and server.diagnostics() then
+    calls _bus.health() / _bus.hud() which return MagicMock objects that are not
+    JSON-serialisable, causing test_diagnostics_includes_bus to fail with
+    TypeError when run in the same session.
     """
     # Stub numpy (engine.py imports it at module level)
     if "numpy" not in sys.modules:
@@ -55,6 +63,8 @@ def _stub_heavy_deps():
             sys.modules[mod_name] = MagicMock()
 
     # engine module stubs — must expose MODELS, generate_audio, get_loaded_engines
+    # Use a real ModuleType (not a bare MagicMock) so that attribute access returns
+    # plain Python values that json.dumps() can serialise.
     if "engine" not in sys.modules:
         engine_mod = types.ModuleType("engine")
         engine_mod.MODELS = {}
@@ -68,18 +78,15 @@ def _stub_heavy_deps():
         vad_mod.detect_speech_file = MagicMock()
         vad_mod.is_hallucination = MagicMock(return_value=False)
         vad_mod.is_model_loaded = MagicMock(return_value=False)
+        # http_api imports these two at module level (F2 pipecat wrapper)
+        vad_mod.is_pipecat_vad_available = MagicMock(return_value=False)
+        vad_mod.voice_confidence = MagicMock(return_value=0.0)
         sys.modules["vad"] = vad_mod
 
-    # modality stubs
-    if "modality" not in sys.modules:
-        sys.modules["modality"] = MagicMock()
-
-    # remaining local modules that http_api imports
-    for local in ("audio_subscribers", "bus", "session_registry"):
-        if local not in sys.modules:
-            sys.modules[local] = MagicMock()
-
-    # modules.text / modules.voice
+    # modules.text / modules.voice — only stub if the real package is absent.
+    # These are local packages, but their sub-modules may pull in heavy native
+    # deps (mlx, sounddevice) at import time, so we stub only the submodule
+    # entries that http_api references directly, not the top-level package.
     if "modules" not in sys.modules:
         sys.modules["modules"] = MagicMock()
     for sub in ("modules.text", "modules.voice"):
@@ -106,16 +113,28 @@ def test_version_module_returns_string():
 
 def test_version_module_matches_pyproject():
     """_version.__version__ must equal the version declared in pyproject.toml."""
-    import tomllib
+    import re
     from pathlib import Path
 
     from _version import __version__
 
     pyproject = Path(__file__).parent.parent / "pyproject.toml"
-    with pyproject.open("rb") as fh:
-        data = tomllib.load(fh)
 
-    expected = data["project"]["version"]
+    try:
+        # Python 3.11+ ships tomllib in stdlib
+        import tomllib
+
+        with pyproject.open("rb") as fh:
+            data = tomllib.load(fh)
+        expected = data["project"]["version"]
+    except ImportError:
+        # Python 3.10 and earlier: parse the version line with a regex
+        # rather than pulling in a tomli dependency just for this one test.
+        text = pyproject.read_text(encoding="utf-8")
+        match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+        assert match, f'Could not find version = "..." in {pyproject}'
+        expected = match.group(1)
+
     assert __version__ == expected, (
         f"_version.__version__ is {__version__!r} but pyproject.toml declares {expected!r}. "
         "Run `pip install -e .` (or `uv pip install -e .`) so importlib.metadata is in sync."
@@ -127,13 +146,35 @@ def test_version_module_matches_pyproject():
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
-def http_app():
-    """Import http_api.app with heavy native deps stubbed out."""
+@pytest.fixture()
+def http_app(restore_sys_modules):
+    """Import http_api.app with heavy native deps stubbed out.
+
+    Uses restore_sys_modules so the stubs injected by _stub_heavy_deps() are
+    cleaned up after each test.  Without this, the fake engine/vad/etc. modules
+    linger in sys.modules for the rest of the pytest session and cause
+    ImportError in test files that later import the real modules.
+
+    Scope is function (not module) so each test gets a fresh import against a
+    clean stub set; the overhead is negligible because no heavy I/O occurs.
+
+    We also evict ``server`` from sys.modules before re-importing http_api.
+    server.py is loaded as a side-effect of ``from server import _bus`` inside
+    http_api, and it captures bus/modality bindings at import time.  If a
+    previous test left a stub-contaminated server object in sys.modules (e.g. a
+    MagicMock bus bound as server._bus), that object would survive
+    restore_sys_modules (which restores the *reference*, not a deep copy of
+    module state).  Evicting server here forces a clean reimport against
+    whatever stub set _stub_heavy_deps() just installed.
+    """
     _stub_heavy_deps()
-    # Force a fresh import if already cached from a different test run
-    if "http_api" in sys.modules:
-        del sys.modules["http_api"]
+    # Evict both http_api and server so both are freshly imported against the
+    # current stub set.  http_api's module-level code does
+    #   from server import _bus as _shared_bus
+    # so server must be evicted first to prevent a stale _bus binding.
+    for _mod in ("server", "http_api"):
+        if _mod in sys.modules:
+            del sys.modules[_mod]
     import http_api as _http_api
 
     return _http_api.app

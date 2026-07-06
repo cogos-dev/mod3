@@ -20,6 +20,15 @@ import pytest
 # Ensure the project root is on sys.path so imports resolve without install.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# make_synthetic_conditionals() imports mlx + mlx_audio at call time; skip the
+# whole module in CI where the Apple-Silicon MLX stack is absent.  Check the
+# pre-stub HAS_MLX flag from conftest rather than importorskip so we don't
+# accidentally succeed against a CI stub.
+from conftest import HAS_MLX  # noqa: E402
+
+if not HAS_MLX:
+    pytest.skip("mlx not available (Apple Silicon only)", allow_module_level=True)
+
 
 # ---------------------------------------------------------------------------
 # Helpers

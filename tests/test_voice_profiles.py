@@ -13,8 +13,19 @@ import os
 import struct
 import sys
 
+import pytest
+
 # Ensure project root is on the path so imports resolve
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# These tests require the Apple-Silicon MLX stack.  Skip the entire module in
+# CI where mlx is unavailable.  We check HAS_MLX from conftest (which was set
+# before any stubs were installed) so the check reflects real availability, not
+# whether a stub exists.
+from conftest import HAS_MLX  # noqa: E402
+
+if not HAS_MLX:
+    pytest.skip("mlx not available (Apple Silicon only)", allow_module_level=True)
 
 import mlx.core as mx
 from mlx_audio.tts.models.chatterbox.chatterbox import Conditionals
