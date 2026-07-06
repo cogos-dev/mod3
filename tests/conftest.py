@@ -33,6 +33,7 @@ import pytest
 # CI-mode stubs for unavailable native libs
 # ---------------------------------------------------------------------------
 
+
 def _stub_if_missing(name: str, mod: object | None = None) -> None:
     """Insert *mod* (default: a fresh MagicMock) into sys.modules for *name*
     if and only if the real package cannot be imported.

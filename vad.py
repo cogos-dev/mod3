@@ -6,13 +6,20 @@ to STT. Prevents Whisper hallucinations on silence/noise.
 Also includes a Bag of Hallucinations (BoH) post-filter for known
 phantom transcription phrases.
 """
-# pyright: reportGeneralTypeIssues=false
+# pyright: reportGeneralTypeIssues=false, reportOptionalMemberAccess=false
 
 import threading
 from dataclasses import dataclass
 
 import numpy as np
-import torch
+
+try:
+    import torch
+
+    HAS_TORCH = True
+except ImportError:  # pragma: no cover - exercised only when torch is absent
+    torch = None  # type: ignore[assignment]
+    HAS_TORCH = False
 
 _model = None
 _model_lock = threading.Lock()
@@ -21,6 +28,8 @@ _utils = None
 
 def _get_model():
     """Load Silero VAD model (lazy, thread-safe)."""
+    if not HAS_TORCH:
+        raise RuntimeError("torch is required for Silero VAD model loading but is not installed")
     global _model, _utils
     if _model is None:
         with _model_lock:

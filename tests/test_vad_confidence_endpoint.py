@@ -7,7 +7,6 @@ vendored pipecat ONNX SileroVADAnalyzer — no torch required.
 import os
 import struct
 import sys
-from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -29,6 +28,7 @@ def _make_client(app):
 # Happy-path: pipecat VAD available
 # ---------------------------------------------------------------------------
 
+
 class TestVadConfidenceEndpointAvailable:
     """Tests when is_pipecat_vad_available() returns True."""
 
@@ -40,7 +40,9 @@ class TestVadConfidenceEndpointAvailable:
     @pytest.fixture
     def client(self):
         import importlib
+
         import http_api
+
         importlib.reload(http_api)
         return _make_client(http_api.app)
 
@@ -99,7 +101,9 @@ class TestVadConfidenceEndpointAvailable:
         monkeypatch.setattr("vad.voice_confidence", _mock_vc)
 
         import importlib
+
         import http_api
+
         importlib.reload(http_api)
         c = _make_client(http_api.app)
 
@@ -117,7 +121,9 @@ class TestVadConfidenceEndpointAvailable:
         monkeypatch.setattr("vad.voice_confidence", lambda buf, sample_rate=16000: 0.95)
 
         import importlib
+
         import http_api
+
         importlib.reload(http_api)
         c = _make_client(http_api.app)
 
@@ -142,7 +148,9 @@ class TestVadConfidenceEndpointAvailable:
         monkeypatch.setattr("vad.voice_confidence", lambda buf, sample_rate=16000: 1.0)
 
         import importlib
+
         import http_api
+
         importlib.reload(http_api)
         c = _make_client(http_api.app)
 
@@ -159,6 +167,7 @@ class TestVadConfidenceEndpointAvailable:
 # Degraded-path: pipecat VAD unavailable (onnxruntime missing)
 # ---------------------------------------------------------------------------
 
+
 class TestVadConfidenceEndpointUnavailable:
     """Tests when is_pipecat_vad_available() returns False (onnxruntime not installed)."""
 
@@ -170,7 +179,9 @@ class TestVadConfidenceEndpointUnavailable:
     @pytest.fixture
     def client(self):
         import importlib
+
         import http_api
+
         importlib.reload(http_api)
         return _make_client(http_api.app)
 
@@ -207,6 +218,7 @@ class TestVadConfidenceEndpointUnavailable:
 # Endpoint listed in /capabilities
 # ---------------------------------------------------------------------------
 
+
 class TestCapabilitiesManifest:
     """The new endpoint should appear in GET /capabilities."""
 
@@ -218,7 +230,9 @@ class TestCapabilitiesManifest:
     @pytest.fixture
     def client(self):
         import importlib
+
         import http_api
+
         importlib.reload(http_api)
         return _make_client(http_api.app)
 

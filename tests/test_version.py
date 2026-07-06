@@ -132,7 +132,7 @@ def test_version_module_matches_pyproject():
         # rather than pulling in a tomli dependency just for this one test.
         text = pyproject.read_text(encoding="utf-8")
         match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
-        assert match, f"Could not find version = \"...\" in {pyproject}"
+        assert match, f'Could not find version = "..." in {pyproject}'
         expected = match.group(1)
 
     assert __version__ == expected, (

@@ -70,9 +70,7 @@ def _isolate_real_bargein_signal_file():
 
 # Marker for tests that import server, whose @mcp.tool-decorated callables
 # become MagicMocks when mcp is absent.
-needs_mcp = pytest.mark.skipif(
-    not HAS_MCP, reason="mcp package required for @mcp.tool-decorated server functions"
-)
+needs_mcp = pytest.mark.skipif(not HAS_MCP, reason="mcp package required for @mcp.tool-decorated server functions")
 
 # ---------------------------------------------------------------------------
 # Test doubles
