@@ -29,7 +29,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # CI-mode stubs for unavailable native libs
 # ---------------------------------------------------------------------------

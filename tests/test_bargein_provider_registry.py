@@ -23,10 +23,9 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from conftest import HAS_MCP  # noqa: E402
-
 from bargein import BargeinRegistry, handle_bargein_start  # noqa: E402
 from bargein.providers.base import BargeinEvent, BargeinProvider  # noqa: E402
+from conftest import HAS_MCP  # noqa: E402
 from pipeline_state import PipelineState  # noqa: E402
 
 

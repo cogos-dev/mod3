@@ -17,6 +17,13 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# _make_synthetic_conditionals() imports mlx at call time; skip the entire
+# module in CI where the Apple-Silicon MLX stack is absent.
+from conftest import HAS_MLX  # noqa: E402
+
+if not HAS_MLX:
+    pytest.skip("mlx not available (Apple Silicon only)", allow_module_level=True)
+
 
 # ---------------------------------------------------------------------------
 # Shared fakes (copied from test_voice_profiles_api so the two test files

@@ -37,7 +37,7 @@ jobs:
           pip install \
             fastapi uvicorn httpx pysbd numpy scipy pydantic \
             pytest pytest-asyncio python-multipart \
-            mcp mistral-common
+            mcp mistral-common soundfile
       - name: Run tests
         run: pytest tests/ -v --tb=short
 
@@ -52,7 +52,7 @@ jobs:
       - run: |
           pip install \
             fastapi uvicorn httpx pysbd numpy scipy pydantic \
-            python-multipart mcp mistral-common
+            python-multipart mcp mistral-common soundfile
       - name: Test API endpoints resolve
         run: |
           python -c "
