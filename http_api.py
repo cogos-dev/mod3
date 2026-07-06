@@ -2546,7 +2546,7 @@ def health():
             "engines": engines,
             "modalities": modalities,
             "queue": {
-                "jobs_total": total,
+                "depth": total,
                 "active_jobs": active,
             },
             "routing": "channel-client",
