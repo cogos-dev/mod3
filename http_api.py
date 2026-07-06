@@ -80,9 +80,8 @@ from session_registry import (
     get_default_registry,
     resolve_output_device,
 )
-from vad import detect_speech_file, is_hallucination
+from vad import detect_speech_file, is_hallucination, is_pipecat_vad_available, voice_confidence
 from vad import is_model_loaded as vad_loaded
-from vad import is_pipecat_vad_available, voice_confidence
 from voice_profiles import VoiceProfileRegistry
 
 logger = logging.getLogger("mod3.http")
@@ -2546,7 +2545,7 @@ def health():
             "engines": engines,
             "modalities": modalities,
             "queue": {
-                "jobs_total": total,
+                "depth": total,
                 "active_jobs": active,
             },
             "routing": "channel-client",
