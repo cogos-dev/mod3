@@ -22,6 +22,18 @@ server._MOD3_GATE_RETRY_INTERVAL_SEC directly (not the env var) to keep the
 retry loop fast, and monkeypatch server._BARGEIN_SIGNAL to a tmp_path so real
 mod3 state on the dev machine can never be read or written.
 
+Also covers the staleness fix: _bargein_user_recording() (server.py) now
+treats a user_speaking_start event older than
+server._MOD3_BARGEIN_SIGNAL_TTL_SEC as idle, so a VAD/mic writer that dies
+mid-utterance (never writing user_speaking_end) can't pin the gate open
+forever — see CHANGELOG "Barge-in signal now expires instead of holding the
+gate forever" for the 2026-07-07 incident (file stuck on user_speaking_start
+for ~3 days). `_write_signal()` below defaults its `timestamp` field to
+"now" so the pre-existing "signal currently blocks" tests keep exercising a
+fresh signal; staleness tests pass an explicit old `timestamp` instead.
+Tests monkeypatch server._MOD3_BARGEIN_SIGNAL_TTL_SEC directly, same pattern
+as the retry-budget constants above.
+
 Run: python3 -m pytest tests/test_gate_escalation.py -v
 """
 
@@ -30,6 +42,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -60,9 +73,20 @@ def fast_retries(monkeypatch, tmp_path):
     return signal_path
 
 
-def _write_signal(path: str, event: str) -> None:
+def _write_signal(path: str, event: str, timestamp: str | None = None) -> None:
+    """Write a signal file. Defaults ``timestamp`` to "now" (tz-aware UTC)
+    so callers that don't care about staleness get a signal the TTL check
+    always treats as fresh. Pass an explicit ISO-8601 string to test the
+    stale path.
+    """
+    if timestamp is None:
+        timestamp = datetime.now(timezone.utc).isoformat()
     with open(path, "w") as f:
-        json.dump({"event": event, "source": "test", "timestamp": "2026-07-03T00:00:00Z"}, f)
+        json.dump({"event": event, "source": "test", "timestamp": timestamp}, f)
+
+
+def _iso_seconds_ago(seconds: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +205,121 @@ class TestCheckBargeinGate:
 
         result = server.check_bargein_gate(streak_key="s1")
         assert result["blocked"] is False
+
+
+# ---------------------------------------------------------------------------
+# _bargein_user_recording() — signal staleness (TTL expiry)
+# ---------------------------------------------------------------------------
+#
+# Regression coverage for the 2026-07-07 incident: inbound.py's mic/VAD
+# writer died mid-utterance without ever writing user_speaking_end, leaving
+# _BARGEIN_SIGNAL pinned at user_speaking_start for ~3 days. Every reader
+# used to treat that as "user is speaking" with no staleness check at all.
+
+
+@pytest.fixture
+def short_ttl(monkeypatch, tmp_path):
+    """Isolated signal path + a small TTL so staleness tests don't depend
+    on (or need to wait out) the real 120s default.
+    """
+    import server
+
+    signal_path = str(tmp_path / "mod3-barge-in.json")
+    monkeypatch.setattr(server, "_BARGEIN_SIGNAL", signal_path)
+    monkeypatch.setattr(server, "_MOD3_BARGEIN_SIGNAL_TTL_SEC", 5.0)
+    return signal_path
+
+
+class TestBargeinSignalStaleness:
+    def test_fresh_start_event_is_blocked(self, short_ttl):
+        """A user_speaking_start signal within the TTL reads as recording."""
+        import server
+
+        _write_signal(short_ttl, "user_speaking_start", timestamp=_iso_seconds_ago(1))
+        assert server._bargein_user_recording() is True
+
+    def test_stale_start_event_is_not_blocked(self, short_ttl):
+        """A user_speaking_start signal older than the TTL reads as idle.
+
+        This is the core fix: previously any user_speaking_start reading,
+        no matter how old, blocked speak() forever.
+        """
+        import server
+
+        _write_signal(short_ttl, "user_speaking_start", timestamp=_iso_seconds_ago(10))
+        assert server._bargein_user_recording() is False
+
+    def test_stale_signal_does_not_block_check_bargein_gate(self, fast_retries, monkeypatch):
+        """End-to-end: check_bargein_gate() (and therefore speak()/`/v1/speak`)
+        must not hold on a stale signal even though the event is still
+        literally "user_speaking_start".
+        """
+        import server
+
+        monkeypatch.setattr(server, "_MOD3_BARGEIN_SIGNAL_TTL_SEC", 5.0)
+        _write_signal(fast_retries, "user_speaking_start", timestamp=_iso_seconds_ago(30))
+        result = server.check_bargein_gate(streak_key="stale-test")
+        assert result["blocked"] is False
+
+    def test_missing_timestamp_field_falls_back_to_mtime_fresh(self, short_ttl):
+        """No ``timestamp`` key at all => fall back to file mtime. A
+        just-written file has a fresh mtime, so it still blocks.
+        """
+        import server
+
+        with open(short_ttl, "w") as f:
+            json.dump({"event": "user_speaking_start", "source": "test"}, f)
+
+        assert server._bargein_user_recording() is True
+
+    def test_missing_timestamp_field_falls_back_to_mtime_stale(self, short_ttl):
+        """No ``timestamp`` key, and the file's mtime is old => idle.
+
+        Simulates a writer that predates the ``timestamp`` field, or wrote
+        a payload missing it — the staleness check must not silently treat
+        that as "always fresh" just because there's nothing to parse.
+        """
+        import server
+
+        with open(short_ttl, "w") as f:
+            json.dump({"event": "user_speaking_start", "source": "test"}, f)
+
+        old_time = datetime.now(timezone.utc).timestamp() - 30
+        os.utime(short_ttl, (old_time, old_time))
+
+        assert server._bargein_user_recording() is False
+
+    def test_unparseable_timestamp_falls_back_to_mtime(self, short_ttl):
+        """A garbage ``timestamp`` string must not raise — fall back to mtime
+        (fresh here) rather than crashing or defaulting to "never fresh".
+        """
+        import server
+
+        with open(short_ttl, "w") as f:
+            json.dump({"event": "user_speaking_start", "source": "test", "timestamp": "not-a-timestamp"}, f)
+
+        assert server._bargein_user_recording() is True
+
+    def test_corrupt_file_is_idle(self, short_ttl):
+        """Malformed JSON is idle, same as the pre-existing corrupt-file
+        behavior at the check_bargein_gate() level — staleness handling
+        must not change this.
+        """
+        import server
+
+        with open(short_ttl, "w") as f:
+            f.write("{not valid json")
+
+        assert server._bargein_user_recording() is False
+
+    def test_user_speaking_end_is_never_blocked_regardless_of_age(self, short_ttl):
+        """A user_speaking_end event is idle whether fresh or ancient —
+        staleness only matters for user_speaking_start.
+        """
+        import server
+
+        _write_signal(short_ttl, "user_speaking_end", timestamp=_iso_seconds_ago(999))
+        assert server._bargein_user_recording() is False
 
 
 # ---------------------------------------------------------------------------

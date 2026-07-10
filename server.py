@@ -251,6 +251,61 @@ _BARGEIN_SIGNAL = "/tmp/mod3-barge-in.json"
 _SPEAKING_LOCK = "/tmp/mod3-speaking.json"
 _bargein_last_mtime: float = 0.0
 
+# A ``user_speaking_start`` signal older than this is treated as idle rather
+# than as an indefinite "user is speaking" hold. Every reader of
+# _BARGEIN_SIGNAL (the gate check below and the watcher's interrupt branch)
+# applies this the same way. Without it, a VAD/mic writer that dies
+# mid-utterance — before ever writing user_speaking_end — pins the signal
+# open forever: on 2026-07-07 the file stuck at user_speaking_start for
+# ~3 days after inbound.py's mic_vad writer died, silently holding every
+# speak() request that whole time (see CHANGELOG).
+#
+# 120s, not something closer to inbound.py's ~2s VAD refresh cadence,
+# because not every producer refreshes continuously. inbound.py's
+# VADStage.process() *does* re-dispatch a fresh user_speaking_start on
+# every ~2s chunk for as long as real speech continues (verified: it has
+# no onset-only guard, so it fires on every speech-positive tick) — a short
+# TTL would be fine for that writer alone. But the SuperWhisper-family
+# producers (bargein/providers/superwhisper.py and the standalone
+# integrations/bargein-producer.py) write the start event exactly ONCE per
+# utterance and rely on their own internal 150s staleness self-check,
+# because their comments note recordings legitimately run 60s+. Since this
+# file is provider-agnostic at the read side, the TTL has to be safe for
+# the slowest/most conservative writer, not tuned to the fastest one. 120s
+# comfortably covers a long SuperWhisper dictation (and stays under that
+# producer's own 150s self-heal window) while still bounding a dead-writer
+# outage to two minutes instead of three days.
+_MOD3_BARGEIN_SIGNAL_TTL_SEC = float(os.environ.get("MOD3_BARGEIN_SIGNAL_TTL_SEC", "120"))
+
+
+def _bargein_signal_is_stale(signal: dict, mtime: float, ttl_sec: float | None = None) -> bool:
+    """True if a barge-in signal's effective age exceeds the staleness TTL.
+
+    Prefers the signal's own ``timestamp`` field (ISO-8601, tz-aware, set by
+    the emitting producer at event time — see bargein.make_file_mirror_subscriber
+    and the standalone/superwhisper producers). Falls back to the file's
+    mtime when the field is missing or unparseable; every producer writes
+    the file atomically (tmp + rename) at event time, so mtime is a
+    reasonable proxy for "when was this signal emitted".
+    """
+    if ttl_sec is None:
+        ttl_sec = _MOD3_BARGEIN_SIGNAL_TTL_SEC
+
+    signal_time: datetime | None = None
+    ts_raw = signal.get("timestamp")
+    if isinstance(ts_raw, str):
+        try:
+            parsed = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            signal_time = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            signal_time = None  # unparseable — fall back to mtime below
+
+    if signal_time is None:
+        signal_time = datetime.fromtimestamp(mtime, tz=timezone.utc)
+
+    age_sec = (datetime.now(timezone.utc) - signal_time).total_seconds()
+    return age_sec > ttl_sec
+
 
 def _pid_is_alive(pid: Any) -> bool:
     """Return True if a local process with ``pid`` is still alive."""
@@ -431,8 +486,16 @@ def _bargein_watcher():
                                 },
                             )
                         )
-                    if signal.get("event") == "user_speaking_start":
+                    if signal.get("event") == "user_speaking_start" and not _bargein_signal_is_stale(signal, mtime):
                         # Shared consumer: check is_speaking + interrupt + log
+                        #
+                        # The staleness check matters here too, not just in
+                        # _bargein_user_recording(): _bargein_last_mtime resets
+                        # to 0.0 on every process restart, so a signal file left
+                        # over from days ago reads as "new" on the very first
+                        # watcher tick after restart and would otherwise
+                        # trigger a spurious interrupt of freshly-started
+                        # playback based on stale data.
                         info = handle_bargein_start(
                             pipeline_state,
                             source=signal.get("source", "file_signal"),
@@ -1018,12 +1081,22 @@ _gate_hold_streak_lock = threading.Lock()
 
 
 def _bargein_user_recording() -> bool:
-    """Return True if the barge-in signal file currently says the user is speaking."""
+    """Return True if the barge-in signal file says the user is speaking
+    AND that signal is still fresh (within MOD3_BARGEIN_SIGNAL_TTL_SEC).
+
+    A user_speaking_start event older than the TTL is treated the same as
+    an idle/missing file — this is what stops a dead VAD/mic writer from
+    pinning the gate open forever (see _MOD3_BARGEIN_SIGNAL_TTL_SEC above
+    for the incident and the TTL-choice rationale).
+    """
     try:
         if os.path.exists(_BARGEIN_SIGNAL):
+            mtime = os.path.getmtime(_BARGEIN_SIGNAL)
             with open(_BARGEIN_SIGNAL) as _bf:
                 _bsig = json.load(_bf)
-            return _bsig.get("event") == "user_speaking_start"
+            if _bsig.get("event") != "user_speaking_start":
+                return False
+            return not _bargein_signal_is_stale(_bsig, mtime)
     except Exception:
         pass  # signal file missing or corrupt — assume idle
     return False
