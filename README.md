@@ -17,7 +17,7 @@ Mod³ is a Python MCP server that provides text-to-speech for Claude Code, Curso
 - **Multi-model routing** -- Four TTS engines behind one interface. Voice name determines which engine handles the request.
 - **Voice profile registry** -- Cloned voices are stored as named profiles under `~/.mod3/voices/` and addressable as first-class voice IDs alongside built-in engine presets.
 - **Continuous open-mic** -- Always-on VAD with auto-start barge-in and tunable endpointing; Whisper STT uses multi-strategy deduplication (Z-function, sentence-level, N-way) to eliminate phrase doubling.
-- **Adaptive buffering** -- EMA-based arrival rate tracking with dynamic startup threshold. Gapless playback under normal load, graceful degradation under GPU contention.
+- **Adaptive buffering** -- Two-loop pre-playback buffer: feedforward sizing from chunk-deficit telemetry (and an optional LMS-contention probe) at job start, feedback growth on drain starvation mid-utterance. Gapless playback under normal load, graceful degradation under GPU contention.
 - **Structured metrics** -- Every call returns TTFA, RTF, per-chunk timing, buffer health, underrun counts, and memory usage. The agent can diagnose its own audio quality.
 - **Observability** -- Per-phase wall-time instrumentation and W3C traceparent propagation through `CogOSProvider`; trace IDs flow from inbound request to every pipeline phase.
 
