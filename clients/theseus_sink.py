@@ -95,9 +95,7 @@ def _repo_lock(repo: pathlib.Path):
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"sink lock busy for {_LOCK_TIMEOUT}s: {lock_path}"
-                    )
+                    raise TimeoutError(f"sink lock busy for {_LOCK_TIMEOUT}s: {lock_path}")
                 time.sleep(0.2)
         yield
     finally:
@@ -107,9 +105,7 @@ def _repo_lock(repo: pathlib.Path):
 
 
 def _repo_path() -> pathlib.Path:
-    root = os.environ.get(
-        "MYRGIC_REPOS_ROOT", os.path.expanduser("~/workspaces/myrgic")
-    )
+    root = os.environ.get("MYRGIC_REPOS_ROOT", os.path.expanduser("~/workspaces/myrgic"))
     return pathlib.Path(
         os.environ.get(
             "MOD3_THESEUS_REPO",
@@ -184,18 +180,14 @@ def sink_turn(
             }
             rel = f"conversations/inbox/{turn_id}.json"
             path = repo / rel
-            path.write_text(
-                json.dumps(receipt, indent=2) + "\n", encoding="utf-8"
-            )
+            path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
 
             # Targeted add + commit: only the receipt, never the rest of the
             # tree.
             r = _git(repo, "add", "--", rel)
             if r.returncode != 0:
                 return {"ok": False, "error": f"git add: {r.stderr.strip()}"}
-            r = _git(
-                repo, "commit", "-m", f"chat receipt from {from_id}", "--", rel
-            )
+            r = _git(repo, "commit", "-m", f"chat receipt from {from_id}", "--", rel)
             if r.returncode != 0:
                 return {
                     "ok": False,
@@ -227,8 +219,7 @@ def sink_turn(
                             break
                 if not pushed:
                     logger.warning(
-                        "theseus_sink: push failed; receipt %s committed locally, "
-                        "rides out with the next push",
+                        "theseus_sink: push failed; receipt %s committed locally, rides out with the next push",
                         rel,
                     )
 

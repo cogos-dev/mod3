@@ -19,9 +19,7 @@ import theseus_sink  # noqa: E402
 
 
 def _git(cwd, *args):
-    return subprocess.run(
-        ["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True
-    )
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True)
 
 
 @pytest.fixture()
@@ -34,9 +32,7 @@ def repo_pair(tmp_path, monkeypatch):
         check=True,
     )
     clone = tmp_path / "clone"
-    subprocess.run(
-        ["git", "clone", str(origin), str(clone)], capture_output=True, check=True
-    )
+    subprocess.run(["git", "clone", str(origin), str(clone)], capture_output=True, check=True)
     _git(clone, "config", "user.email", "test@test")
     _git(clone, "config", "user.name", "test")
     inbox = clone / "conversations" / "inbox"
@@ -109,9 +105,7 @@ def test_sink_rebases_past_remote_movement(repo_pair, tmp_path):
     """A rejected push (remote moved) rebases and succeeds — the ingest-bot race."""
     origin, clone = repo_pair
     other = tmp_path / "other"
-    subprocess.run(
-        ["git", "clone", str(origin), str(other)], capture_output=True, check=True
-    )
+    subprocess.run(["git", "clone", str(origin), str(other)], capture_output=True, check=True)
     _git(other, "config", "user.email", "bot@test")
     _git(other, "config", "user.name", "bot")
     (other / "settled.txt").write_text("bot moved main")
@@ -173,9 +167,7 @@ def test_concurrent_sinks_all_land(repo_pair):
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         results = list(
             pool.map(
-                lambda i: theseus_sink.sink_turn(
-                    f"turn {i}", "voice", "seat-root-voice", push=False
-                ),
+                lambda i: theseus_sink.sink_turn(f"turn {i}", "voice", "seat-root-voice", push=False),
                 range(6),
             )
         )

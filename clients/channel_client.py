@@ -93,9 +93,7 @@ def _sink_fire_and_forget(text: str, thread: str, from_id: str) -> None:
         return
 
     async def _run() -> None:
-        result = await asyncio.to_thread(
-            theseus_sink.sink_turn, text, thread, from_id
-        )
+        result = await asyncio.to_thread(theseus_sink.sink_turn, text, thread, from_id)
         if not result.get("ok"):
             logger.warning("theseus sink failed: %s", result.get("error"))
         else:
@@ -107,6 +105,7 @@ def _sink_fire_and_forget(text: str, thread: str, from_id: str) -> None:
         task.add_done_callback(_SINK_TASKS.discard)
     except RuntimeError:  # no running loop (sync caller in tests)
         theseus_sink.sink_turn(text, thread, from_id)
+
 
 # ---------------------------------------------------------------------------
 # Config / constants
@@ -840,8 +839,7 @@ def build_mcp_server(client: ChannelClient) -> FastMCP:
                 if post_to_chat:
                     _sink_fire_and_forget(
                         text,
-                        ledger_thread
-                        or os.environ.get("MOD3_THESEUS_THREAD", "voice"),
+                        ledger_thread or os.environ.get("MOD3_THESEUS_THREAD", "voice"),
                         "seat-root-voice",
                     )
                 return resp.json()
@@ -891,8 +889,7 @@ async def _run_channel(server_url: str, session_id: str) -> None:
             done, still = await asyncio.wait(pending, timeout=15.0)
             if still:
                 logger.warning(
-                    "theseus sink: %d receipt(s) still in flight at shutdown "
-                    "after 15s drain — may be lost",
+                    "theseus sink: %d receipt(s) still in flight at shutdown after 15s drain — may be lost",
                     len(still),
                 )
         sse_task.cancel()
