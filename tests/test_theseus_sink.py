@@ -78,8 +78,10 @@ def test_sink_writes_receipt_and_pushes(repo_pair):
     # The two self-echo guards, both declared by the writer:
     assert turn["origin"] == "seat"
     assert turn["from"].startswith("seat-")
-    # id convention: <ms>-<from>
-    assert turn["id"].endswith("-seat-root-voice")
+    # id convention: <ms>-<from>-<entropy6>
+    import re
+
+    assert re.fullmatch(r"\d{13}-seat-root-voice-[0-9a-f]{6}", turn["id"]), turn["id"]
 
     # Pushed: origin's main carries the receipt commit.
     log = subprocess.run(
@@ -152,6 +154,35 @@ def test_same_millisecond_ids_do_not_collide(repo_pair, monkeypatch):
     r2 = theseus_sink.sink_turn("second", "voice", "seat-root-voice", push=False)
     assert r1["ok"] and r2["ok"]
     assert r1["receipt"] != r2["receipt"]
+
+
+def test_non_seat_from_refused(repo_pair):
+    """A from_id outside seat-* would re-echo the seat's voice; the sink
+    enforces the prefix itself, not by caller convention."""
+    result = theseus_sink.sink_turn("nope", "voice", "test-turn")
+    assert not result["ok"]
+    assert "seat" in result["error"]
+
+
+def test_concurrent_sinks_all_land(repo_pair):
+    """N threads sinking simultaneously into one clone: the interprocess
+    lock serializes git, so every turn lands — no index.lock casualties."""
+    import concurrent.futures
+
+    _, clone = repo_pair
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(
+            pool.map(
+                lambda i: theseus_sink.sink_turn(
+                    f"turn {i}", "voice", "seat-root-voice", push=False
+                ),
+                range(6),
+            )
+        )
+    assert all(r["ok"] for r in results), results
+    assert len({r["receipt"] for r in results}) == 6
+    log = _git(clone, "log", "--oneline").stdout
+    assert log.count("chat receipt from seat-root-voice") == 6
 
 
 def test_fire_and_forget_sync_path(repo_pair):

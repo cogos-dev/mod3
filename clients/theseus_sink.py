@@ -12,9 +12,14 @@ Mechanism — receipts, never direct ledger writes:
     a client commits a receipt {"count": N, "turns": [...]} into
     conversations/inbox/, and the conversations-ingest workflow upserts each
     turn into ledger.json by id (idempotent) and settles the receipt in the
-    same commit. Receipts are new files with unique names, so concurrent
-    writers never conflict — this sink uses that path rather than appending
-    to ledger.json directly, which WOULD race the seat and the ingest bot.
+    same commit. Receipts are new files with unique names (ms timestamp +
+    writer + entropy suffix), so writers never contend on CONTENT — and
+    local git-level contention (index.lock is fail-fast, not a queue) is
+    serialized by an interprocess flock per repo (_repo_lock), so several
+    channel-client processes and both of this process's mouths can sink
+    concurrently without losing turns. This is why the sink uses receipts
+    rather than appending to ledger.json directly, which WOULD race the
+    seat and the ingest bot on content.
 
 Identity — declared, never inferred:
     Every turn this sink writes carries origin="seat" (the field the THESEUS
@@ -46,17 +51,59 @@ CLI (for verification and manual sinking):
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
+import hashlib
 import json
 import logging
 import os
 import pathlib
 import subprocess
 import time
+import uuid
 
 logger = logging.getLogger("mod3.theseus_sink")
 
 _GIT_TIMEOUT = 30  # seconds per git subprocess
 _PUSH_RETRIES = 2  # pull --rebase && push attempts after a rejected push
+_LOCK_TIMEOUT = 45  # seconds to wait for the interprocess sink lock
+_LOCK_DIR = pathlib.Path.home() / ".mod3"
+
+
+@contextlib.contextmanager
+def _repo_lock(repo: pathlib.Path):
+    """Interprocess lock serializing the whole git sequence for one repo.
+
+    Several channel-client processes (one per Claude session) plus this
+    process's own two mouths can sink into the same clone concurrently.
+    git's index.lock is fail-fast, not a queue — an unserialized racer
+    loses its turn outright. One flock per repo path makes every sink's
+    write→add→commit→push (including any pull --rebase) atomic with
+    respect to its siblings, which also guarantees a `rebase --abort` in
+    the push-retry path can only ever abort a rebase this call started.
+    Raises TimeoutError if the lock isn't acquired in _LOCK_TIMEOUT.
+    """
+    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(str(repo.resolve()).encode()).hexdigest()[:16]
+    lock_path = _LOCK_DIR / f"theseus-sink-{digest}.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        deadline = time.monotonic() + _LOCK_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"sink lock busy for {_LOCK_TIMEOUT}s: {lock_path}"
+                    )
+                time.sleep(0.2)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def _repo_path() -> pathlib.Path:
@@ -103,76 +150,87 @@ def sink_turn(
     try:
         if not text.strip():
             return {"ok": False, "error": "empty text"}
+        if not from_id.startswith("seat"):
+            # The wake line's self-echo suppression prefix-matches seat-*;
+            # a non-seat from would re-echo the seat's own voice back at it.
+            # Enforced here, not by caller convention.
+            return {"ok": False, "error": f"from_id must start with 'seat': {from_id!r}"}
         repo = _repo_path()
         inbox = repo / "conversations" / "inbox"
         if not inbox.is_dir():
             return {"ok": False, "error": f"no inbox at {inbox}"}
 
-        ms = int(time.time() * 1000)
-        turn_id = f"{ms}-{from_id}"
-        receipt = {
-            "count": 1,
-            "turns": [
-                {
-                    "id": turn_id,
-                    "thread": thread or "voice",
-                    "from": from_id,
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "text": text,
-                    # Declared by the writer, never inferred by a reader —
-                    # the wake line's self-echo suppression keys on this.
-                    "origin": "seat",
-                }
-            ],
-        }
-        rel = f"conversations/inbox/{turn_id}.json"
-        path = repo / rel
-        # Unique-name new file: two sinks in the same millisecond from the
-        # same from_id would collide, so bump until free (bounded).
-        bump = 0
-        while path.exists() and bump < 100:
-            bump += 1
-            turn_id = f"{ms + bump}-{from_id}"
-            receipt["turns"][0]["id"] = turn_id
+        with _repo_lock(repo):
+            # id shape stays <ms>-<writer> for readability, with a short
+            # entropy suffix so two processes in the same millisecond can
+            # never mint the same id (the ingest upserts by id — a collision
+            # would silently merge two distinct utterances).
+            ms = int(time.time() * 1000)
+            turn_id = f"{ms}-{from_id}-{uuid.uuid4().hex[:6]}"
+            receipt = {
+                "count": 1,
+                "turns": [
+                    {
+                        "id": turn_id,
+                        "thread": thread or "voice",
+                        "from": from_id,
+                        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "text": text,
+                        # Declared by the writer, never inferred by a reader —
+                        # the wake line's self-echo suppression keys on this.
+                        "origin": "seat",
+                    }
+                ],
+            }
             rel = f"conversations/inbox/{turn_id}.json"
             path = repo / rel
-        path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+            path.write_text(
+                json.dumps(receipt, indent=2) + "\n", encoding="utf-8"
+            )
 
-        # Targeted add + commit: only the receipt, never the rest of the tree.
-        r = _git(repo, "add", "--", rel)
-        if r.returncode != 0:
-            return {"ok": False, "error": f"git add: {r.stderr.strip()}"}
-        r = _git(repo, "commit", "-m", f"chat receipt from {from_id}", "--", rel)
-        if r.returncode != 0:
-            return {"ok": False, "error": f"git commit: {r.stderr.strip() or r.stdout.strip()}"}
-        sha = _git(repo, "rev-parse", "--short", "HEAD").stdout.strip()
+            # Targeted add + commit: only the receipt, never the rest of the
+            # tree.
+            r = _git(repo, "add", "--", rel)
+            if r.returncode != 0:
+                return {"ok": False, "error": f"git add: {r.stderr.strip()}"}
+            r = _git(
+                repo, "commit", "-m", f"chat receipt from {from_id}", "--", rel
+            )
+            if r.returncode != 0:
+                return {
+                    "ok": False,
+                    "error": f"git commit: {r.stderr.strip() or r.stdout.strip()}",
+                }
+            sha = _git(repo, "rev-parse", "--short", "HEAD").stdout.strip()
 
-        pushed = False
-        if push:
-            for attempt in range(_PUSH_RETRIES + 1):
-                r = _git(repo, "push", "origin", "main")
-                if r.returncode == 0:
-                    pushed = True
-                    break
-                if attempt < _PUSH_RETRIES:
-                    # Receipts are new files and never conflict; a rejected
-                    # push just means the remote moved (ingest bot, the seat,
-                    # his phone). Rebase and retry.
-                    rb = _git(repo, "pull", "--rebase", "origin", "main")
-                    if rb.returncode != 0:
-                        _git(repo, "rebase", "--abort")
-                        logger.warning(
-                            "theseus_sink: rebase failed (%s); receipt %s stays local",
-                            rb.stderr.strip(),
-                            rel,
-                        )
+            pushed = False
+            if push:
+                for attempt in range(_PUSH_RETRIES + 1):
+                    r = _git(repo, "push", "origin", "main")
+                    if r.returncode == 0:
+                        pushed = True
                         break
-            if not pushed:
-                logger.warning(
-                    "theseus_sink: push failed; receipt %s committed locally, "
-                    "rides out with the next push",
-                    rel,
-                )
+                    if attempt < _PUSH_RETRIES:
+                        # Receipts are new files and never conflict; a
+                        # rejected push just means the remote moved (ingest
+                        # bot, the seat, his phone). Rebase and retry. Under
+                        # _repo_lock, any in-progress rebase is OURS, so the
+                        # abort below can never tear down a sibling's.
+                        rb = _git(repo, "pull", "--rebase", "origin", "main")
+                        if rb.returncode != 0:
+                            _git(repo, "rebase", "--abort")
+                            logger.warning(
+                                "theseus_sink: rebase failed (%s); receipt %s stays local",
+                                rb.stderr.strip(),
+                                rel,
+                            )
+                            break
+                if not pushed:
+                    logger.warning(
+                        "theseus_sink: push failed; receipt %s committed locally, "
+                        "rides out with the next push",
+                        rel,
+                    )
 
         return {"ok": True, "receipt": rel, "commit": sha, "pushed": pushed}
     except Exception as exc:  # noqa: BLE001 — fire-and-forget boundary

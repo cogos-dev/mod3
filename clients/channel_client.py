@@ -882,6 +882,19 @@ async def _run_channel(server_url: str, session_id: str) -> None:
 
     # Cleanup on exit
     async def _cleanup(signum=None):
+        # Drain in-flight ledger sinks first (bounded): a session whose FINAL
+        # tool call was mod3_speak would otherwise have its sink task swept by
+        # asyncio.run()'s shutdown cancellation before the receipt is written,
+        # silently dropping the last utterance from the ledger.
+        pending = {t for t in _SINK_TASKS if not t.done()}
+        if pending:
+            done, still = await asyncio.wait(pending, timeout=15.0)
+            if still:
+                logger.warning(
+                    "theseus sink: %d receipt(s) still in flight at shutdown "
+                    "after 15s drain — may be lost",
+                    len(still),
+                )
         sse_task.cancel()
         try:
             await sse_task
