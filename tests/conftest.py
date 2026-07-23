@@ -93,7 +93,7 @@ def _install_ci_native_stubs() -> None:
     ):
         _stub_if_missing(mod_name)
 
-    # mcp (server.py and channel_client.py import from mcp at module level)
+    # mcp (jobs_registry.py and channel_client.py import from mcp at module level)
     if "mcp" not in sys.modules:
         try:
             import mcp  # noqa: F401

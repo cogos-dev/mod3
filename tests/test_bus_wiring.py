@@ -1,6 +1,6 @@
 """Integration tests for Mod3 bus wiring.
 
-Verify that the ModalityBus singleton in server.py is correctly
+Verify that the ModalityBus singleton in jobs_registry.py is correctly
 instantiated and wired through to http_api.py, with a VoiceModule
 registered and all key APIs returning expected structures.
 
@@ -36,9 +36,9 @@ def _skip_if_import_fails(module_name: str):
 
 
 def test_bus_singleton_exists():
-    """server._bus exists and is a ModalityBus instance."""
+    """jobs_registry._bus exists and is a ModalityBus instance."""
     from bus import ModalityBus
-    from server import _bus
+    from jobs_registry import _bus
 
     assert _bus is not None, "_bus should not be None"
     assert isinstance(_bus, ModalityBus), f"_bus should be a ModalityBus, got {type(_bus).__name__}"
@@ -46,9 +46,9 @@ def test_bus_singleton_exists():
 
 def test_bus_has_voice_module():
     """The server bus has a VoiceModule registered under ModalityType.VOICE."""
+    from jobs_registry import _bus
     from modality import ModalityType
     from modules.voice import VoiceModule
-    from server import _bus
 
     modules = getattr(_bus, "_modules", {})
     assert ModalityType.VOICE in modules, "Bus should have a VOICE module registered"
@@ -64,7 +64,7 @@ def test_bus_has_voice_module():
 
 def test_bus_health_returns_dict():
     """_bus.health() returns a dict with modules, channels, queues, event_count."""
-    from server import _bus
+    from jobs_registry import _bus
 
     health = _bus.health()
     assert isinstance(health, dict), f"health() should return a dict, got {type(health).__name__}"
@@ -86,7 +86,7 @@ def test_bus_health_returns_dict():
 
 def test_bus_hud_returns_dict():
     """_bus.hud() returns a dict with modules, channels, queues, recent_events."""
-    from server import _bus
+    from jobs_registry import _bus
 
     hud = _bus.hud()
     assert isinstance(hud, dict), f"hud() should return a dict, got {type(hud).__name__}"
@@ -114,7 +114,7 @@ def test_bus_hud_returns_dict():
 
 def test_diagnostics_includes_bus():
     """The diagnostics() MCP tool response includes a 'bus' key with health and hud."""
-    from server import diagnostics
+    from jobs_registry import diagnostics
 
     raw = diagnostics()
     data = json.loads(raw)
@@ -133,9 +133,9 @@ def test_diagnostics_includes_bus():
 
 
 def test_http_api_imports_bus():
-    """http_api.py can import the bus from server without circular import errors."""
+    """http_api.py can import the bus from jobs_registry without circular import errors."""
     # This import itself is the test: http_api does
-    #   from server import _bus as _shared_bus
+    #   from jobs_registry import _bus as _shared_bus
     # If there's a circular import, this will raise ImportError.
     # http_api also imports engine which may not be available, so we
     # handle that gracefully.

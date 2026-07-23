@@ -6,7 +6,7 @@ retry and no escalation signal — the operator never heard any mod3 output
 for the entire flight because a stuck/false-positive VAD signal silently
 suppressed every speak() call.
 
-check_bargein_gate() (server.py) now:
+check_bargein_gate() (jobs_registry.py) now:
   - retries the barge-in signal file check up to MOD3_GATE_RETRY_ATTEMPTS
     times (default 3) with MOD3_GATE_RETRY_INTERVAL_SEC between checks
     (default 3.0s, ~10s total budget) before declaring the caller blocked.
@@ -17,21 +17,21 @@ check_bargein_gate() (server.py) now:
     (speak_enqueue in http_api.py), which is the endpoint mod3_speak (the
     channel_client.py tool Claude Code actually calls) hits.
 
-Tests monkeypatch server._MOD3_GATE_RETRY_ATTEMPTS /
-server._MOD3_GATE_RETRY_INTERVAL_SEC directly (not the env var) to keep the
-retry loop fast, and monkeypatch server._BARGEIN_SIGNAL to a tmp_path so real
+Tests monkeypatch jobs_registry._MOD3_GATE_RETRY_ATTEMPTS /
+jobs_registry._MOD3_GATE_RETRY_INTERVAL_SEC directly (not the env var) to keep the
+retry loop fast, and monkeypatch jobs_registry._BARGEIN_SIGNAL to a tmp_path so real
 mod3 state on the dev machine can never be read or written.
 
-Also covers the staleness fix: _bargein_user_recording() (server.py) now
+Also covers the staleness fix: _bargein_user_recording() (jobs_registry.py) now
 treats a user_speaking_start event older than
-server._MOD3_BARGEIN_SIGNAL_TTL_SEC as idle, so a VAD/mic writer that dies
+jobs_registry._MOD3_BARGEIN_SIGNAL_TTL_SEC as idle, so a VAD/mic writer that dies
 mid-utterance (never writing user_speaking_end) can't pin the gate open
 forever — see CHANGELOG "Barge-in signal now expires instead of holding the
 gate forever" for the 2026-07-07 incident (file stuck on user_speaking_start
 for ~3 days). `_write_signal()` below defaults its `timestamp` field to
 "now" so the pre-existing "signal currently blocks" tests keep exercising a
 fresh signal; staleness tests pass an explicit old `timestamp` instead.
-Tests monkeypatch server._MOD3_BARGEIN_SIGNAL_TTL_SEC directly, same pattern
+Tests monkeypatch jobs_registry._MOD3_BARGEIN_SIGNAL_TTL_SEC directly, same pattern
 as the retry-budget constants above.
 
 Run: python3 -m pytest tests/test_gate_escalation.py -v
@@ -61,15 +61,15 @@ def fast_retries(monkeypatch, tmp_path):
     3 attempts, 0.01s apart — fast enough for a unit test while still
     exercising the real retry loop shape (not a single check).
     """
-    import server
+    import jobs_registry
 
     signal_path = str(tmp_path / "mod3-barge-in.json")
-    monkeypatch.setattr(server, "_BARGEIN_SIGNAL", signal_path)
-    monkeypatch.setattr(server, "_MOD3_GATE_RETRY_ATTEMPTS", 3)
-    monkeypatch.setattr(server, "_MOD3_GATE_RETRY_INTERVAL_SEC", 0.01)
+    monkeypatch.setattr(jobs_registry, "_BARGEIN_SIGNAL", signal_path)
+    monkeypatch.setattr(jobs_registry, "_MOD3_GATE_RETRY_ATTEMPTS", 3)
+    monkeypatch.setattr(jobs_registry, "_MOD3_GATE_RETRY_INTERVAL_SEC", 0.01)
     # Hold streaks are process-global; reset so tests don't see leakage
     # from whichever test ran before them.
-    server._gate_hold_streak.clear()
+    jobs_registry._gate_hold_streak.clear()
     return signal_path
 
 
@@ -97,30 +97,30 @@ def _iso_seconds_ago(seconds: float) -> str:
 class TestCheckBargeinGate:
     def test_not_blocked_when_no_signal_file(self, fast_retries):
         """No signal file at all => idle => not blocked, single attempt."""
-        import server
+        import jobs_registry
 
-        result = server.check_bargein_gate(streak_key="s1")
+        result = jobs_registry.check_bargein_gate(streak_key="s1")
         assert result["blocked"] is False
         assert result["attempts"] == 1
         assert result["held_count"] == 0
 
     def test_not_blocked_when_signal_says_end(self, fast_retries):
         """user_speaking_end (or any non-start event) reads as idle."""
-        import server
+        import jobs_registry
 
         _write_signal(fast_retries, "user_speaking_end")
-        result = server.check_bargein_gate(streak_key="s1")
+        result = jobs_registry.check_bargein_gate(streak_key="s1")
         assert result["blocked"] is False
         assert result["held_count"] == 0
 
     def test_blocked_after_exhausting_retries(self, fast_retries):
         """Signal pinned to user_speaking_start for the whole retry window => blocked."""
-        import server
+        import jobs_registry
 
         _write_signal(fast_retries, "user_speaking_start")
-        result = server.check_bargein_gate(streak_key="s1")
+        result = jobs_registry.check_bargein_gate(streak_key="s1")
         assert result["blocked"] is True
-        assert result["attempts"] == server._MOD3_GATE_RETRY_ATTEMPTS
+        assert result["attempts"] == jobs_registry._MOD3_GATE_RETRY_ATTEMPTS
         assert result["held_count"] == 1
 
     def test_gate_clears_mid_retry_is_not_blocked(self, fast_retries, monkeypatch):
@@ -130,12 +130,12 @@ class TestCheckBargeinGate:
         loop must give it a real chance to clear rather than failing on the
         first read.
         """
-        import server
+        import jobs_registry
 
         _write_signal(fast_retries, "user_speaking_start")
 
         calls = {"n": 0}
-        real_sleep = server.time.sleep
+        real_sleep = jobs_registry.time.sleep
 
         def _clear_after_first_check(seconds):
             calls["n"] += 1
@@ -143,9 +143,9 @@ class TestCheckBargeinGate:
                 _write_signal(fast_retries, "user_speaking_end")
             real_sleep(0)  # keep it fast; just yield
 
-        monkeypatch.setattr(server.time, "sleep", _clear_after_first_check)
+        monkeypatch.setattr(jobs_registry.time, "sleep", _clear_after_first_check)
 
-        result = server.check_bargein_gate(streak_key="s1")
+        result = jobs_registry.check_bargein_gate(streak_key="s1")
         assert result["blocked"] is False
         assert result["attempts"] == 2  # first check blocked, second cleared
         assert result["held_count"] == 0
@@ -157,40 +157,40 @@ class TestCheckBargeinGate:
         after being told "held" should see the count climb, not repeat
         the same unremarkable message forever.
         """
-        import server
+        import jobs_registry
 
         _write_signal(fast_retries, "user_speaking_start")
 
-        r1 = server.check_bargein_gate(streak_key="s1")
-        r2 = server.check_bargein_gate(streak_key="s1")
-        r3 = server.check_bargein_gate(streak_key="s1")
+        r1 = jobs_registry.check_bargein_gate(streak_key="s1")
+        r2 = jobs_registry.check_bargein_gate(streak_key="s1")
+        r3 = jobs_registry.check_bargein_gate(streak_key="s1")
 
         assert [r1["held_count"], r2["held_count"], r3["held_count"]] == [1, 2, 3]
 
     def test_held_count_resets_after_gate_clears(self, fast_retries):
         """A successful (unblocked) check resets the streak back to 0."""
-        import server
+        import jobs_registry
 
         _write_signal(fast_retries, "user_speaking_start")
-        r1 = server.check_bargein_gate(streak_key="s1")
+        r1 = jobs_registry.check_bargein_gate(streak_key="s1")
         assert r1["held_count"] == 1
 
         _write_signal(fast_retries, "user_speaking_end")
-        r2 = server.check_bargein_gate(streak_key="s1")
+        r2 = jobs_registry.check_bargein_gate(streak_key="s1")
         assert r2["blocked"] is False
 
         _write_signal(fast_retries, "user_speaking_start")
-        r3 = server.check_bargein_gate(streak_key="s1")
+        r3 = jobs_registry.check_bargein_gate(streak_key="s1")
         assert r3["held_count"] == 1, "streak should have reset, not continued from 1"
 
     def test_held_count_is_independent_per_streak_key(self, fast_retries):
         """Different streak_keys (sessions) track independent hold counters."""
-        import server
+        import jobs_registry
 
         _write_signal(fast_retries, "user_speaking_start")
-        r_a1 = server.check_bargein_gate(streak_key="session-a")
-        r_b1 = server.check_bargein_gate(streak_key="session-b")
-        r_a2 = server.check_bargein_gate(streak_key="session-a")
+        r_a1 = jobs_registry.check_bargein_gate(streak_key="session-a")
+        r_b1 = jobs_registry.check_bargein_gate(streak_key="session-b")
+        r_a2 = jobs_registry.check_bargein_gate(streak_key="session-a")
 
         assert r_a1["held_count"] == 1
         assert r_b1["held_count"] == 1
@@ -198,12 +198,12 @@ class TestCheckBargeinGate:
 
     def test_corrupt_signal_file_treated_as_idle(self, fast_retries):
         """Malformed JSON in the signal file must not raise — treat as idle."""
-        import server
+        import jobs_registry
 
         with open(fast_retries, "w") as f:
             f.write("{not valid json")
 
-        result = server.check_bargein_gate(streak_key="s1")
+        result = jobs_registry.check_bargein_gate(streak_key="s1")
         assert result["blocked"] is False
 
 
@@ -222,21 +222,21 @@ def short_ttl(monkeypatch, tmp_path):
     """Isolated signal path + a small TTL so staleness tests don't depend
     on (or need to wait out) the real 120s default.
     """
-    import server
+    import jobs_registry
 
     signal_path = str(tmp_path / "mod3-barge-in.json")
-    monkeypatch.setattr(server, "_BARGEIN_SIGNAL", signal_path)
-    monkeypatch.setattr(server, "_MOD3_BARGEIN_SIGNAL_TTL_SEC", 5.0)
+    monkeypatch.setattr(jobs_registry, "_BARGEIN_SIGNAL", signal_path)
+    monkeypatch.setattr(jobs_registry, "_MOD3_BARGEIN_SIGNAL_TTL_SEC", 5.0)
     return signal_path
 
 
 class TestBargeinSignalStaleness:
     def test_fresh_start_event_is_blocked(self, short_ttl):
         """A user_speaking_start signal within the TTL reads as recording."""
-        import server
+        import jobs_registry
 
         _write_signal(short_ttl, "user_speaking_start", timestamp=_iso_seconds_ago(1))
-        assert server._bargein_user_recording() is True
+        assert jobs_registry._bargein_user_recording() is True
 
     def test_stale_start_event_is_not_blocked(self, short_ttl):
         """A user_speaking_start signal older than the TTL reads as idle.
@@ -244,33 +244,33 @@ class TestBargeinSignalStaleness:
         This is the core fix: previously any user_speaking_start reading,
         no matter how old, blocked speak() forever.
         """
-        import server
+        import jobs_registry
 
         _write_signal(short_ttl, "user_speaking_start", timestamp=_iso_seconds_ago(10))
-        assert server._bargein_user_recording() is False
+        assert jobs_registry._bargein_user_recording() is False
 
     def test_stale_signal_does_not_block_check_bargein_gate(self, fast_retries, monkeypatch):
         """End-to-end: check_bargein_gate() (and therefore speak()/`/v1/speak`)
         must not hold on a stale signal even though the event is still
         literally "user_speaking_start".
         """
-        import server
+        import jobs_registry
 
-        monkeypatch.setattr(server, "_MOD3_BARGEIN_SIGNAL_TTL_SEC", 5.0)
+        monkeypatch.setattr(jobs_registry, "_MOD3_BARGEIN_SIGNAL_TTL_SEC", 5.0)
         _write_signal(fast_retries, "user_speaking_start", timestamp=_iso_seconds_ago(30))
-        result = server.check_bargein_gate(streak_key="stale-test")
+        result = jobs_registry.check_bargein_gate(streak_key="stale-test")
         assert result["blocked"] is False
 
     def test_missing_timestamp_field_falls_back_to_mtime_fresh(self, short_ttl):
         """No ``timestamp`` key at all => fall back to file mtime. A
         just-written file has a fresh mtime, so it still blocks.
         """
-        import server
+        import jobs_registry
 
         with open(short_ttl, "w") as f:
             json.dump({"event": "user_speaking_start", "source": "test"}, f)
 
-        assert server._bargein_user_recording() is True
+        assert jobs_registry._bargein_user_recording() is True
 
     def test_missing_timestamp_field_falls_back_to_mtime_stale(self, short_ttl):
         """No ``timestamp`` key, and the file's mtime is old => idle.
@@ -279,7 +279,7 @@ class TestBargeinSignalStaleness:
         a payload missing it — the staleness check must not silently treat
         that as "always fresh" just because there's nothing to parse.
         """
-        import server
+        import jobs_registry
 
         with open(short_ttl, "w") as f:
             json.dump({"event": "user_speaking_start", "source": "test"}, f)
@@ -287,39 +287,39 @@ class TestBargeinSignalStaleness:
         old_time = datetime.now(timezone.utc).timestamp() - 30
         os.utime(short_ttl, (old_time, old_time))
 
-        assert server._bargein_user_recording() is False
+        assert jobs_registry._bargein_user_recording() is False
 
     def test_unparseable_timestamp_falls_back_to_mtime(self, short_ttl):
         """A garbage ``timestamp`` string must not raise — fall back to mtime
         (fresh here) rather than crashing or defaulting to "never fresh".
         """
-        import server
+        import jobs_registry
 
         with open(short_ttl, "w") as f:
             json.dump({"event": "user_speaking_start", "source": "test", "timestamp": "not-a-timestamp"}, f)
 
-        assert server._bargein_user_recording() is True
+        assert jobs_registry._bargein_user_recording() is True
 
     def test_corrupt_file_is_idle(self, short_ttl):
         """Malformed JSON is idle, same as the pre-existing corrupt-file
         behavior at the check_bargein_gate() level — staleness handling
         must not change this.
         """
-        import server
+        import jobs_registry
 
         with open(short_ttl, "w") as f:
             f.write("{not valid json")
 
-        assert server._bargein_user_recording() is False
+        assert jobs_registry._bargein_user_recording() is False
 
     def test_user_speaking_end_is_never_blocked_regardless_of_age(self, short_ttl):
         """A user_speaking_end event is idle whether fresh or ancient —
         staleness only matters for user_speaking_start.
         """
-        import server
+        import jobs_registry
 
         _write_signal(short_ttl, "user_speaking_end", timestamp=_iso_seconds_ago(999))
-        assert server._bargein_user_recording() is False
+        assert jobs_registry._bargein_user_recording() is False
 
 
 # ---------------------------------------------------------------------------
@@ -336,16 +336,16 @@ class TestSpeakToolGateEscalation:
         stuck gate is visible to the caller instead of silently dropping
         audio forever.
         """
-        import server
+        import jobs_registry
 
         _write_signal(fast_retries, "user_speaking_start")
 
-        first = json.loads(server.speak(text="hello once"))
+        first = json.loads(jobs_registry.speak(text="hello once"))
         assert first["status"] == "held"
         assert first["held_count"] == 1
         assert first.get("escalation") is None
 
-        second = json.loads(server.speak(text="hello twice"))
+        second = json.loads(jobs_registry.speak(text="hello twice"))
         assert second["status"] == "held"
         assert second["held_count"] == 2
         assert second["escalation"] is not None
@@ -353,21 +353,21 @@ class TestSpeakToolGateEscalation:
 
     def test_speak_proceeds_once_gate_clears(self, fast_retries):
         """Once the barge-in signal clears, speak() enqueues normally."""
-        import server
+        import jobs_registry
 
         # No signal file => idle => should proceed to _start_speech.
-        original = server._start_speech
+        original = jobs_registry._start_speech
         called = {"n": 0}
 
         def fake_start_speech(text, voice, **kwargs):
             called["n"] += 1
             return "job-abc", 0
 
-        server._start_speech = fake_start_speech
+        jobs_registry._start_speech = fake_start_speech
         try:
-            result = json.loads(server.speak(text="hello"))
+            result = json.loads(jobs_registry.speak(text="hello"))
         finally:
-            server._start_speech = original
+            jobs_registry._start_speech = original
 
         assert result["status"] == "speaking"
         assert called["n"] == 1
@@ -378,19 +378,19 @@ class TestSpeakToolGateEscalation:
         Regression guard for the original defect: the old code read the
         signal file exactly once and returned a terminal "held" reply.
         """
-        import server
+        import jobs_registry
 
         _write_signal(fast_retries, "user_speaking_start")
         sleep_calls = []
-        real_sleep = server.time.sleep
-        monkeypatch.setattr(server.time, "sleep", lambda s: (sleep_calls.append(s), real_sleep(0))[0])
+        real_sleep = jobs_registry.time.sleep
+        monkeypatch.setattr(jobs_registry.time, "sleep", lambda s: (sleep_calls.append(s), real_sleep(0))[0])
 
-        result = json.loads(server.speak(text="hello"))
+        result = json.loads(jobs_registry.speak(text="hello"))
 
         assert result["status"] == "held"
-        assert result["gate_attempts"] == server._MOD3_GATE_RETRY_ATTEMPTS
+        assert result["gate_attempts"] == jobs_registry._MOD3_GATE_RETRY_ATTEMPTS
         # 3 attempts => 2 sleeps between them
-        assert len(sleep_calls) == server._MOD3_GATE_RETRY_ATTEMPTS - 1
+        assert len(sleep_calls) == jobs_registry._MOD3_GATE_RETRY_ATTEMPTS - 1
 
 
 # ---------------------------------------------------------------------------
@@ -436,18 +436,18 @@ class TestSpeakEnqueueGateEscalation:
 
     def test_proceeds_to_start_speech_when_gate_clears(self, client, fast_retries):
         """No signal file => gate clears => /v1/speak enqueues via _start_speech."""
-        import server
+        import jobs_registry
 
-        original = server._start_speech
+        original = jobs_registry._start_speech
 
         def fake_start_speech(text, voice, **kwargs):
             return "job-xyz", 0
 
-        server._start_speech = fake_start_speech
+        jobs_registry._start_speech = fake_start_speech
         try:
             r = client.post("/v1/speak", json={"text": "hello", "session_id": "sess-3"})
         finally:
-            server._start_speech = original
+            jobs_registry._start_speech = original
 
         assert r.status_code == 200, r.text
         body = r.json()

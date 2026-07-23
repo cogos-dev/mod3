@@ -158,21 +158,22 @@ def http_app(restore_sys_modules):
     Scope is function (not module) so each test gets a fresh import against a
     clean stub set; the overhead is negligible because no heavy I/O occurs.
 
-    We also evict ``server`` from sys.modules before re-importing http_api.
-    server.py is loaded as a side-effect of ``from server import _bus`` inside
-    http_api, and it captures bus/modality bindings at import time.  If a
-    previous test left a stub-contaminated server object in sys.modules (e.g. a
-    MagicMock bus bound as server._bus), that object would survive
+    We also evict ``jobs_registry`` from sys.modules before re-importing
+    http_api. jobs_registry.py is loaded as a side-effect of
+    ``from jobs_registry import _bus`` inside http_api, and it captures
+    bus/modality bindings at import time.  If a previous test left a
+    stub-contaminated jobs_registry object in sys.modules (e.g. a MagicMock
+    bus bound as jobs_registry._bus), that object would survive
     restore_sys_modules (which restores the *reference*, not a deep copy of
-    module state).  Evicting server here forces a clean reimport against
-    whatever stub set _stub_heavy_deps() just installed.
+    module state).  Evicting jobs_registry here forces a clean reimport
+    against whatever stub set _stub_heavy_deps() just installed.
     """
     _stub_heavy_deps()
-    # Evict both http_api and server so both are freshly imported against the
-    # current stub set.  http_api's module-level code does
-    #   from server import _bus as _shared_bus
-    # so server must be evicted first to prevent a stale _bus binding.
-    for _mod in ("server", "http_api"):
+    # Evict jobs_registry, server, and http_api so all three are freshly
+    # imported against the current stub set. http_api's module-level code does
+    #   from jobs_registry import _bus as _shared_bus
+    # so jobs_registry must be evicted first to prevent a stale _bus binding.
+    for _mod in ("jobs_registry", "server", "http_api"):
         if _mod in sys.modules:
             del sys.modules[_mod]
     import http_api as _http_api

@@ -17,9 +17,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from conftest import HAS_MCP  # noqa: E402
 
-# Marker for tests that call @mcp.tool()-decorated functions on server.
+# Marker for tests that call @mcp.tool()-decorated functions in jobs_registry.
 # When mcp is absent those functions are MagicMock stubs, not real callables.
-needs_mcp = pytest.mark.skipif(not HAS_MCP, reason="mcp package required for @mcp.tool-decorated server functions")
+needs_mcp = pytest.mark.skipif(
+    not HAS_MCP, reason="mcp package required for @mcp.tool-decorated jobs_registry functions"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -31,7 +33,7 @@ class TestSpeechQueue:
     """Test the SpeechQueue class directly."""
 
     def _make_queue(self):
-        from server import SpeechQueue
+        from jobs_registry import SpeechQueue
 
         return SpeechQueue()
 
@@ -115,7 +117,7 @@ class TestSpeechQueueDrain:
 
     def test_drain_executes_jobs_serially(self):
         """Jobs execute one at a time through the drain loop."""
-        from server import SpeechQueue
+        from jobs_registry import SpeechQueue
 
         execution_order = []
         barriers = {}
@@ -163,14 +165,14 @@ class TestSpeechQueueDrain:
 
 class TestDurationEstimation:
     def test_estimate_duration_scales_with_text_length(self):
-        from server import _estimate_duration_sec
+        from jobs_registry import _estimate_duration_sec
 
         short = _estimate_duration_sec("Hello", 1.0)
         long = _estimate_duration_sec("This is a much longer sentence with many more words in it", 1.0)
         assert long > short, "Longer text should have longer estimated duration"
 
     def test_estimate_duration_scales_with_speed(self):
-        from server import _estimate_duration_sec
+        from jobs_registry import _estimate_duration_sec
 
         normal = _estimate_duration_sec("Hello world this is a test", 1.0)
         fast = _estimate_duration_sec("Hello world this is a test", 2.0)
@@ -178,7 +180,7 @@ class TestDurationEstimation:
         assert abs(fast - normal / 2.0) < 0.01, "2x speed should halve duration"
 
     def test_estimate_duration_handles_empty(self):
-        from server import _estimate_duration_sec
+        from jobs_registry import _estimate_duration_sec
 
         dur = _estimate_duration_sec("", 1.0)
         assert dur > 0, "Even empty text should give a positive estimate"
@@ -194,7 +196,7 @@ class TestSpeakReturnFormat:
     """Test that speak() returns correctly structured JSON for queue states."""
 
     def test_speak_empty_text_returns_error(self):
-        from server import speak
+        from jobs_registry import speak
 
         result = json.loads(speak("   "))
         assert result["status"] == "error"
@@ -204,7 +206,7 @@ class TestSpeakReturnFormat:
         """speak() always returns a job_id in the response."""
         # This test can only work if the engine module is available.
         # Without it, speak() will return an error, which also has a defined format.
-        from server import speak
+        from jobs_registry import speak
 
         result = json.loads(speak("test"))
         assert "status" in result
@@ -219,7 +221,7 @@ class TestStopReturnFormat:
     """Test that stop() returns correctly structured JSON."""
 
     def test_stop_when_nothing_playing(self):
-        from server import stop
+        from jobs_registry import stop
 
         result = json.loads(stop())
         assert result["status"] == "ok"
@@ -230,7 +232,7 @@ class TestStopReturnFormat:
         )
 
     def test_stop_unknown_job_returns_error(self):
-        from server import stop
+        from jobs_registry import stop
 
         result = json.loads(stop("nonexistent"))
         assert result["status"] == "error"
@@ -242,7 +244,7 @@ class TestSpeechStatusReturnFormat:
     """Test that speech_status() returns correctly structured JSON."""
 
     def test_speech_status_no_jobs(self):
-        from server import _jobs, speech_status
+        from jobs_registry import _jobs, speech_status
 
         # Clear jobs for this test
         original = dict(_jobs)
@@ -255,14 +257,14 @@ class TestSpeechStatusReturnFormat:
             _jobs.update(original)
 
     def test_speech_status_unknown_job(self):
-        from server import speech_status
+        from jobs_registry import speech_status
 
         result = json.loads(speech_status("nonexistent"))
         assert result["status"] == "error"
 
     def test_speech_status_includes_queue_info(self):
         """speech_status for a known job includes queue metadata."""
-        from server import _jobs, speech_status
+        from jobs_registry import _jobs, speech_status
 
         # Insert a fake job
         _jobs["testjob1"] = {
@@ -301,7 +303,7 @@ class TestPruneJobsInFlightProtection:
     """
 
     def test_prune_skips_speaking_and_queued_jobs(self):
-        from server import MAX_JOBS, _jobs, _prune_jobs
+        from jobs_registry import MAX_JOBS, _jobs, _prune_jobs
 
         original = dict(_jobs)
         _jobs.clear()
@@ -325,7 +327,7 @@ class TestPruneJobsInFlightProtection:
 
     def test_prune_returns_when_only_in_flight_remain(self):
         """If every entry is in-flight, prune accepts transient over-cap."""
-        from server import MAX_JOBS, _jobs, _prune_jobs
+        from jobs_registry import MAX_JOBS, _jobs, _prune_jobs
 
         original = dict(_jobs)
         _jobs.clear()
@@ -350,9 +352,9 @@ class TestDrainExceptionResilience:
     """
 
     def test_drain_continues_after_job_raises(self):
-        import server
+        import jobs_registry
 
-        original_runner = server._run_speech_job
+        original_runner = jobs_registry._run_speech_job
         completed: list[str] = []
         seen: list[str] = []
 
@@ -363,9 +365,9 @@ class TestDrainExceptionResilience:
                 raise RuntimeError("simulated job failure")
             completed.append(jid)
 
-        server._run_speech_job = fake_runner
+        jobs_registry._run_speech_job = fake_runner
         try:
-            from server import SpeechQueue
+            from jobs_registry import SpeechQueue
 
             q = SpeechQueue()
             q.enqueue("first", {})
@@ -382,7 +384,7 @@ class TestDrainExceptionResilience:
             assert "third" in completed, "drain did not run the third job after the second raised"
             assert q._draining is False, "drain thread leaked _draining=True after queue empty"
         finally:
-            server._run_speech_job = original_runner
+            jobs_registry._run_speech_job = original_runner
 
 
 class TestDrainBaseExceptionResilience:
@@ -410,16 +412,16 @@ class TestDrainBaseExceptionResilience:
         Without the fix, the drain thread exits with _draining=True and
         subsequent enqueue() calls never start a new drain.
         """
-        import server
+        import jobs_registry
 
-        original_runner = server._run_speech_job
+        original_runner = jobs_registry._run_speech_job
 
         def fake_runner_raises_systemexit(entry):
             raise SystemExit(1)
 
-        server._run_speech_job = fake_runner_raises_systemexit
+        jobs_registry._run_speech_job = fake_runner_raises_systemexit
         try:
-            from server import SpeechQueue
+            from jobs_registry import SpeechQueue
 
             q = SpeechQueue()
             q.enqueue("job1", {"text": "test"})
@@ -429,22 +431,22 @@ class TestDrainBaseExceptionResilience:
             assert q._draining is False, "_draining stayed True after SystemExit"
             assert q._active_job_id is None, "_active_job_id not cleared after SystemExit"
         finally:
-            server._run_speech_job = original_runner
+            jobs_registry._run_speech_job = original_runner
 
     def test_drain_resets_draining_after_memory_error(self):
         """MemoryError (a BaseException subclass) inside _run_speech_job must
         reset _draining to False so the queue can continue processing.
         """
-        import server
+        import jobs_registry
 
-        original_runner = server._run_speech_job
+        original_runner = jobs_registry._run_speech_job
 
         def fake_runner_raises_memory_error(entry):
             raise MemoryError("simulated OOM")
 
-        server._run_speech_job = fake_runner_raises_memory_error
+        jobs_registry._run_speech_job = fake_runner_raises_memory_error
         try:
-            from server import SpeechQueue
+            from jobs_registry import SpeechQueue
 
             q = SpeechQueue()
             q.enqueue("oom_job", {"text": "test"})
@@ -454,7 +456,7 @@ class TestDrainBaseExceptionResilience:
             assert q._draining is False, "_draining stayed True after MemoryError"
             assert q._active_job_id is None, "_active_job_id not cleared after MemoryError"
         finally:
-            server._run_speech_job = original_runner
+            jobs_registry._run_speech_job = original_runner
 
     def test_drain_accepts_new_jobs_after_base_exception_kill(self):
         """After a BaseException kills the drain thread, subsequent enqueue()
@@ -464,9 +466,9 @@ class TestDrainBaseExceptionResilience:
         but that the queue actually resumes processing — which requires the next
         enqueue() to detect _draining=False and spawn a new thread.
         """
-        import server
+        import jobs_registry
 
-        original_runner = server._run_speech_job
+        original_runner = jobs_registry._run_speech_job
         completed: list[str] = []
         calls = 0
 
@@ -479,9 +481,9 @@ class TestDrainBaseExceptionResilience:
             # Subsequent calls succeed
             completed.append(entry["job_id"])
 
-        server._run_speech_job = fake_runner
+        jobs_registry._run_speech_job = fake_runner
         try:
-            from server import SpeechQueue
+            from jobs_registry import SpeechQueue
 
             q = SpeechQueue()
             # This job kills the drain thread
@@ -507,4 +509,4 @@ class TestDrainBaseExceptionResilience:
                 f"completed={completed}, _draining={q._draining}"
             )
         finally:
-            server._run_speech_job = original_runner
+            jobs_registry._run_speech_job = original_runner

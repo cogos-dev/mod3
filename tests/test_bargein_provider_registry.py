@@ -33,14 +33,14 @@ from pipeline_state import PipelineState  # noqa: E402
 def _isolate_real_bargein_signal_file():
     """Restore the real /tmp/mod3-barge-in.json after every test in this module.
 
-    server.py's module-level mirror subscriber (``make_file_mirror_subscriber``,
+    jobs_registry.py's module-level mirror subscriber (``make_file_mirror_subscriber``,
     registered at import time against the real ``_BARGEIN_SIGNAL`` path) closes
-    over that path directly — it does not re-read ``server._BARGEIN_SIGNAL``
+    over that path directly — it does not re-read ``jobs_registry._BARGEIN_SIGNAL``
     live. So even tests here that construct their own ``BargeinRegistry`` and
-    ``monkeypatch`` ``server._BARGEIN_SIGNAL`` to a ``tmp_path`` can still end
+    ``monkeypatch`` ``jobs_registry._BARGEIN_SIGNAL`` to a ``tmp_path`` can still end
     up writing ``user_speaking_start``/``user_speaking_end`` into the *real*
     file via that pre-registered subscriber, if a triggered event reaches the
-    process-global ``server._bargein_registry`` (directly, or indirectly
+    process-global ``jobs_registry._bargein_registry`` (directly, or indirectly
     through shared module state). That leaves the real file in whatever state
     a test happened to write, which other test modules — e.g.
     tests/test_speak_endpoint.py, which reads the real path unmocked when
@@ -50,9 +50,9 @@ def _isolate_real_bargein_signal_file():
     file cannot leak barge-in state to tests that run after it in the same
     session.
     """
-    import server as _server
+    import jobs_registry as _jobs_registry
 
-    real_path = _server._BARGEIN_SIGNAL
+    real_path = _jobs_registry._BARGEIN_SIGNAL
     original = None
     had_original = os.path.exists(real_path)
     if had_original:
@@ -68,9 +68,11 @@ def _isolate_real_bargein_signal_file():
             os.remove(real_path)
 
 
-# Marker for tests that import server, whose @mcp.tool-decorated callables
-# become MagicMocks when mcp is absent.
-needs_mcp = pytest.mark.skipif(not HAS_MCP, reason="mcp package required for @mcp.tool-decorated server functions")
+# Marker for tests that import jobs_registry, whose @mcp.tool-decorated
+# callables become MagicMocks when mcp is absent.
+needs_mcp = pytest.mark.skipif(
+    not HAS_MCP, reason="mcp package required for @mcp.tool-decorated jobs_registry functions"
+)
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -533,18 +535,18 @@ def test_await_voice_input_returns_when_registry_emits_end(monkeypatch, tmp_path
     """
     import json as _json
 
-    import server  # noqa: E402
+    import jobs_registry  # noqa: E402
 
     # Isolate the file signal so we don't race with any existing /tmp state
     signal_path = str(tmp_path / "mod3-barge-in.json")
-    monkeypatch.setattr(server, "_BARGEIN_SIGNAL", signal_path)
-    monkeypatch.setattr(server, "_bargein_last_mtime", 0.0)
+    monkeypatch.setattr(jobs_registry, "_BARGEIN_SIGNAL", signal_path)
+    monkeypatch.setattr(jobs_registry, "_bargein_last_mtime", 0.0)
 
     result_box: list[str] = []
     t0 = time.monotonic()
 
     def _caller():
-        result_box.append(server.await_voice_input(timeout_sec=5.0))
+        result_box.append(jobs_registry.await_voice_input(timeout_sec=5.0))
 
     caller = threading.Thread(target=_caller, daemon=True)
     caller.start()
@@ -552,7 +554,7 @@ def test_await_voice_input_returns_when_registry_emits_end(monkeypatch, tmp_path
     # Let await_voice_input subscribe before we dispatch
     time.sleep(0.2)
 
-    server._bargein_registry._dispatch(
+    jobs_registry._bargein_registry._dispatch(
         BargeinEvent(
             source="superwhisper",
             event_type="user_speaking_end",
@@ -582,17 +584,17 @@ def test_await_voice_input_returns_on_legacy_file_write(monkeypatch, tmp_path):
     """
     import json as _json
 
-    import server  # noqa: E402
+    import jobs_registry  # noqa: E402
 
     signal_path = str(tmp_path / "mod3-barge-in.json")
-    monkeypatch.setattr(server, "_BARGEIN_SIGNAL", signal_path)
-    monkeypatch.setattr(server, "_bargein_last_mtime", 0.0)
+    monkeypatch.setattr(jobs_registry, "_BARGEIN_SIGNAL", signal_path)
+    monkeypatch.setattr(jobs_registry, "_bargein_last_mtime", 0.0)
 
     result_box: list[str] = []
     t0 = time.monotonic()
 
     def _caller():
-        result_box.append(server.await_voice_input(timeout_sec=5.0))
+        result_box.append(jobs_registry.await_voice_input(timeout_sec=5.0))
 
     caller = threading.Thread(target=_caller, daemon=True)
     caller.start()
@@ -631,14 +633,14 @@ def test_await_voice_input_times_out_when_no_signal(monkeypatch, tmp_path):
     """
     import json as _json
 
-    import server  # noqa: E402
+    import jobs_registry  # noqa: E402
 
     signal_path = str(tmp_path / "mod3-barge-in.json")
-    monkeypatch.setattr(server, "_BARGEIN_SIGNAL", signal_path)
-    monkeypatch.setattr(server, "_bargein_last_mtime", 0.0)
+    monkeypatch.setattr(jobs_registry, "_BARGEIN_SIGNAL", signal_path)
+    monkeypatch.setattr(jobs_registry, "_bargein_last_mtime", 0.0)
 
     t0 = time.monotonic()
-    raw = server.await_voice_input(timeout_sec=0.4)
+    raw = jobs_registry.await_voice_input(timeout_sec=0.4)
     elapsed = time.monotonic() - t0
 
     assert 0.3 < elapsed < 2.0, f"timeout path ran for {elapsed:.2f}s"

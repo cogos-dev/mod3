@@ -81,9 +81,9 @@ class TestSpeakEndpoint:
 
     def test_first_call_returns_queue_position_zero(self, client):
         """First enqueued job returns queue_position=0 and status=speaking."""
-        import server
+        import jobs_registry
 
-        original = server._start_speech
+        original = jobs_registry._start_speech
         call_count = [0]
 
         def fake_start_speech(
@@ -95,11 +95,11 @@ class TestSpeakEndpoint:
             position = 0  # first call, no queue
             return job_id, position
 
-        server._start_speech = fake_start_speech
+        jobs_registry._start_speech = fake_start_speech
         try:
             r = client.post("/v1/speak", json={"text": "hello world"})
         finally:
-            server._start_speech = original
+            jobs_registry._start_speech = original
 
         assert r.status_code == 200, r.text
         body = r.json()
@@ -109,9 +109,9 @@ class TestSpeakEndpoint:
 
     def test_second_call_returns_queue_position_one(self, client):
         """Second concurrent call returns queue_position=1 and status=queued."""
-        import server
+        import jobs_registry
 
-        original = server._start_speech
+        original = jobs_registry._start_speech
         call_count = [0]
 
         def fake_start_speech(
@@ -123,12 +123,12 @@ class TestSpeakEndpoint:
             position = n  # 0 for first, 1 for second, etc.
             return job_id, position
 
-        server._start_speech = fake_start_speech
+        jobs_registry._start_speech = fake_start_speech
         try:
             r1 = client.post("/v1/speak", json={"text": "first"})
             r2 = client.post("/v1/speak", json={"text": "second"})
         finally:
-            server._start_speech = original
+            jobs_registry._start_speech = original
 
         assert r1.status_code == 200, r1.text
         assert r2.status_code == 200, r2.text
@@ -157,18 +157,18 @@ class TestSpeakEndpoint:
 
     def test_response_shape(self, client):
         """Response always contains job_id, queue_position, and status."""
-        import server
+        import jobs_registry
 
-        original = server._start_speech
+        original = jobs_registry._start_speech
 
         def fake_start(text, voice, **kwargs):
             return "job-shape-test", 0
 
-        server._start_speech = fake_start
+        jobs_registry._start_speech = fake_start
         try:
             r = client.post("/v1/speak", json={"text": "shape test"})
         finally:
-            server._start_speech = original
+            jobs_registry._start_speech = original
 
         assert r.status_code == 200
         body = r.json()
@@ -179,9 +179,9 @@ class TestSpeakEndpoint:
 
     def test_voice_param_forwarded(self, client):
         """Voice parameter is forwarded to _start_speech."""
-        import server
+        import jobs_registry
 
-        original = server._start_speech
+        original = jobs_registry._start_speech
         received = {}
 
         def fake_start(text, voice, **kwargs):
@@ -189,51 +189,51 @@ class TestSpeakEndpoint:
             received["voice"] = voice
             return "job-voice-test", 0
 
-        server._start_speech = fake_start
+        jobs_registry._start_speech = fake_start
         try:
             r = client.post("/v1/speak", json={"text": "hi", "voice": "af_bella"})
         finally:
-            server._start_speech = original
+            jobs_registry._start_speech = original
 
         assert r.status_code == 200
         assert received["voice"] == "af_bella"
 
     def test_session_id_forwarded(self, client):
         """Non-empty session_id is forwarded as a non-None value."""
-        import server
+        import jobs_registry
 
-        original = server._start_speech
+        original = jobs_registry._start_speech
         received = {}
 
         def fake_start(text, voice, stream=True, speed=1.0, emotion=0.5, session_id=None, ref_audio=None, **kwargs):
             received["session_id"] = session_id
             return "job-sess-test", 0
 
-        server._start_speech = fake_start
+        jobs_registry._start_speech = fake_start
         try:
             r = client.post("/v1/speak", json={"text": "hi", "session_id": "cs-test"})
         finally:
-            server._start_speech = original
+            jobs_registry._start_speech = original
 
         assert r.status_code == 200
         assert received["session_id"] == "cs-test"
 
     def test_empty_session_id_forwarded_as_none(self, client):
         """Empty session_id string is converted to None before forwarding."""
-        import server
+        import jobs_registry
 
-        original = server._start_speech
+        original = jobs_registry._start_speech
         received = {}
 
         def fake_start(text, voice, stream=True, speed=1.0, emotion=0.5, session_id=None, ref_audio=None, **kwargs):
             received["session_id"] = session_id
             return "job-no-sess", 0
 
-        server._start_speech = fake_start
+        jobs_registry._start_speech = fake_start
         try:
             r = client.post("/v1/speak", json={"text": "hi", "session_id": ""})
         finally:
-            server._start_speech = original
+            jobs_registry._start_speech = original
 
         assert r.status_code == 200
         assert received["session_id"] is None
@@ -247,7 +247,7 @@ class TestSpeakEndpoint:
 class TestQueuePositionSemantics:
     """Verify queue_position=0 on first enqueue, position=1 on second enqueue.
 
-    These tests call server._start_speech directly (with a patched queue) to
+    These tests call jobs_registry._start_speech directly (with a patched queue) to
     validate the semantics without HTTP overhead. The HTTP endpoint is just a
     thin wrapper — if _start_speech returns the right positions, the endpoint
     will too (confirmed by TestSpeakEndpoint above).
@@ -255,7 +255,7 @@ class TestQueuePositionSemantics:
 
     def test_first_enqueue_gets_position_zero(self):
         """First enqueued job returns position 0 (plays immediately)."""
-        from server import SpeechQueue
+        from jobs_registry import SpeechQueue
 
         q = SpeechQueue()
         q._draining = True  # prevent auto-drain during test
@@ -264,7 +264,7 @@ class TestQueuePositionSemantics:
 
     def test_second_enqueue_gets_position_one(self):
         """Second enqueued job returns position 1 (queued behind first)."""
-        from server import SpeechQueue
+        from jobs_registry import SpeechQueue
 
         q = SpeechQueue()
         q._draining = True
@@ -274,7 +274,7 @@ class TestQueuePositionSemantics:
 
     def test_concurrent_enqueue_produces_distinct_positions(self):
         """Concurrent enqueues get distinct positions — no two calls get the same slot."""
-        from server import SpeechQueue
+        from jobs_registry import SpeechQueue
 
         q = SpeechQueue()
         q._draining = True
