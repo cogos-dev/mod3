@@ -279,7 +279,7 @@ class TestRunSpeechJobFanOut:
         import base64
 
         fake_b64 = base64.b64encode(ogg_bytes).decode("ascii")
-        monkeypatch.setattr("server._encode_chunk_ogg", lambda s, r: ogg_bytes)
+        monkeypatch.setattr("jobs_registry._encode_chunk_ogg", lambda s, r: ogg_bytes)
 
         # Patch seat registry fan_out
         mock_registry = MagicMock()
@@ -291,7 +291,7 @@ class TestRunSpeechJobFanOut:
         self.fake_b64 = fake_b64
 
     def _run(self, session_id="sess-test"):
-        import server
+        import jobs_registry
 
         entry = {
             "job_id": "job001",
@@ -302,17 +302,17 @@ class TestRunSpeechJobFanOut:
         }
 
         with (
-            patch("server._engine_module", return_value=self.mock_engine),
-            patch("server._adaptive_player_class", return_value=lambda **kw: self.mock_player),
-            patch("server._resolve_voice_via_bus", return_value=("kokoro", "bm_lewis")),
-            patch("server._resolve_device_for_entry", return_value=(None, None)),
-            patch("server._acquire_speaking_lock", return_value=False),
-            patch("server._release_speaking_lock"),
-            patch("server._set_bus_voice_state"),
-            patch("server._jobs", {entry["job_id"]: {"status": "speaking"}}),
+            patch("jobs_registry._engine_module", return_value=self.mock_engine),
+            patch("jobs_registry._adaptive_player_class", return_value=lambda **kw: self.mock_player),
+            patch("jobs_registry._resolve_voice_via_bus", return_value=("kokoro", "bm_lewis")),
+            patch("jobs_registry._resolve_device_for_entry", return_value=(None, None)),
+            patch("jobs_registry._acquire_speaking_lock", return_value=False),
+            patch("jobs_registry._release_speaking_lock"),
+            patch("jobs_registry._set_bus_voice_state"),
+            patch("jobs_registry._jobs", {entry["job_id"]: {"status": "speaking"}}),
             patch("seats.get_seat_registry", return_value=self.mock_registry),
         ):
-            server._run_speech_job(entry)
+            jobs_registry._run_speech_job(entry)
 
         return self.mock_registry.fan_out.call_args_list
 
@@ -361,7 +361,7 @@ class TestRunSpeechJobFanOut:
 
     def test_no_fan_out_without_session_id(self):
         """No seat events when session_id is absent."""
-        import server
+        import jobs_registry
 
         entry = {
             "job_id": "job002",
@@ -371,17 +371,17 @@ class TestRunSpeechJobFanOut:
             # no session_id
         }
         with (
-            patch("server._engine_module", return_value=self.mock_engine),
-            patch("server._adaptive_player_class", return_value=lambda **kw: self.mock_player),
-            patch("server._resolve_voice_via_bus", return_value=("kokoro", "bm_lewis")),
-            patch("server._resolve_device_for_entry", return_value=(None, None)),
-            patch("server._acquire_speaking_lock", return_value=False),
-            patch("server._release_speaking_lock"),
-            patch("server._set_bus_voice_state"),
-            patch("server._jobs", {entry["job_id"]: {"status": "speaking"}}),
+            patch("jobs_registry._engine_module", return_value=self.mock_engine),
+            patch("jobs_registry._adaptive_player_class", return_value=lambda **kw: self.mock_player),
+            patch("jobs_registry._resolve_voice_via_bus", return_value=("kokoro", "bm_lewis")),
+            patch("jobs_registry._resolve_device_for_entry", return_value=(None, None)),
+            patch("jobs_registry._acquire_speaking_lock", return_value=False),
+            patch("jobs_registry._release_speaking_lock"),
+            patch("jobs_registry._set_bus_voice_state"),
+            patch("jobs_registry._jobs", {entry["job_id"]: {"status": "speaking"}}),
             patch("seats.get_seat_registry", return_value=self.mock_registry),
         ):
-            server._run_speech_job(entry)
+            jobs_registry._run_speech_job(entry)
 
         tts_calls = [c for c in self.mock_registry.fan_out.call_args_list if c.args[1].get("type") == "tts_chunk"]
         assert len(tts_calls) == 0
@@ -391,12 +391,12 @@ class TestRunSpeechJobBargeinFanOut:
     """Assert bargein fan_out is called when pipeline_state.interrupt() fires."""
 
     def test_bargein_fan_out_on_interrupt(self, monkeypatch):
-        import server
+        import jobs_registry
         from pipeline_state import PipelineState
 
         # Use a real PipelineState so callbacks actually fire
         real_state = PipelineState()
-        monkeypatch.setattr(server, "pipeline_state", real_state)
+        monkeypatch.setattr(jobs_registry, "pipeline_state", real_state)
 
         mock_engine = MagicMock()
 
@@ -418,7 +418,7 @@ class TestRunSpeechJobBargeinFanOut:
         mock_registry = MagicMock()
         mock_registry.fan_out = MagicMock(return_value=1)
 
-        monkeypatch.setattr("server._encode_chunk_ogg", lambda s, r: b"fakeOGG")
+        monkeypatch.setattr("jobs_registry._encode_chunk_ogg", lambda s, r: b"fakeOGG")
 
         entry = {
             "job_id": "job-bargein",
@@ -429,19 +429,19 @@ class TestRunSpeechJobBargeinFanOut:
         }
 
         with (
-            patch("server._engine_module", return_value=mock_engine),
-            patch("server._adaptive_player_class", return_value=lambda **kw: mock_player),
-            patch("server._resolve_voice_via_bus", return_value=("kokoro", "bm_lewis")),
-            patch("server._resolve_device_for_entry", return_value=(None, None)),
-            patch("server._acquire_speaking_lock", return_value=False),
-            patch("server._release_speaking_lock"),
-            patch("server._set_bus_voice_state"),
-            patch("server._jobs", {entry["job_id"]: {"status": "speaking"}}),
+            patch("jobs_registry._engine_module", return_value=mock_engine),
+            patch("jobs_registry._adaptive_player_class", return_value=lambda **kw: mock_player),
+            patch("jobs_registry._resolve_voice_via_bus", return_value=("kokoro", "bm_lewis")),
+            patch("jobs_registry._resolve_device_for_entry", return_value=(None, None)),
+            patch("jobs_registry._acquire_speaking_lock", return_value=False),
+            patch("jobs_registry._release_speaking_lock"),
+            patch("jobs_registry._set_bus_voice_state"),
+            patch("jobs_registry._jobs", {entry["job_id"]: {"status": "speaking"}}),
             patch("seats.get_seat_registry", return_value=mock_registry),
         ):
             # start_speaking must be called so interrupt() actually fires
             real_state.start_speaking("Interrupt me", mock_player)
-            server._run_speech_job(entry)
+            jobs_registry._run_speech_job(entry)
 
         bargein_calls = [c for c in mock_registry.fan_out.call_args_list if c.args[1].get("type") == "bargein"]
         assert len(bargein_calls) >= 1, "expected at least one bargein fan_out call"
@@ -454,11 +454,11 @@ class TestRunSpeechJobBargeinFanOut:
 
     def test_bargein_callback_removed_after_job(self, monkeypatch):
         """Callback must be removed from pipeline_state after _run_speech_job completes."""
-        import server
+        import jobs_registry
         from pipeline_state import PipelineState
 
         real_state = PipelineState()
-        monkeypatch.setattr(server, "pipeline_state", real_state)
+        monkeypatch.setattr(jobs_registry, "pipeline_state", real_state)
 
         mock_engine = MagicMock()
         mock_engine.generate_audio.return_value = iter([_make_fake_chunk(2400, is_final=True)])
@@ -470,7 +470,7 @@ class TestRunSpeechJobBargeinFanOut:
         mock_player.get_progress.return_value = (0, 0)
         mock_player.wait.return_value = MagicMock(to_dict=lambda: {})
 
-        monkeypatch.setattr("server._encode_chunk_ogg", lambda s, r: b"fakeOGG")
+        monkeypatch.setattr("jobs_registry._encode_chunk_ogg", lambda s, r: b"fakeOGG")
 
         entry = {
             "job_id": "job-cleanup",
@@ -480,17 +480,17 @@ class TestRunSpeechJobBargeinFanOut:
             "session_id": "sess-cleanup",
         }
         with (
-            patch("server._engine_module", return_value=mock_engine),
-            patch("server._adaptive_player_class", return_value=lambda **kw: mock_player),
-            patch("server._resolve_voice_via_bus", return_value=("kokoro", "bm_lewis")),
-            patch("server._resolve_device_for_entry", return_value=(None, None)),
-            patch("server._acquire_speaking_lock", return_value=False),
-            patch("server._release_speaking_lock"),
-            patch("server._set_bus_voice_state"),
-            patch("server._jobs", {entry["job_id"]: {"status": "speaking"}}),
+            patch("jobs_registry._engine_module", return_value=mock_engine),
+            patch("jobs_registry._adaptive_player_class", return_value=lambda **kw: mock_player),
+            patch("jobs_registry._resolve_voice_via_bus", return_value=("kokoro", "bm_lewis")),
+            patch("jobs_registry._resolve_device_for_entry", return_value=(None, None)),
+            patch("jobs_registry._acquire_speaking_lock", return_value=False),
+            patch("jobs_registry._release_speaking_lock"),
+            patch("jobs_registry._set_bus_voice_state"),
+            patch("jobs_registry._jobs", {entry["job_id"]: {"status": "speaking"}}),
             patch("seats.get_seat_registry", return_value=MagicMock()),
         ):
-            server._run_speech_job(entry)
+            jobs_registry._run_speech_job(entry)
 
         # After job, pipeline_state must have no lingering callbacks
         assert len(real_state._interrupt_callbacks) == 0
@@ -505,7 +505,7 @@ class TestTtsChunkFinalSentinel:
     """When no engine chunk has is_final=True, a sentinel tts_chunk is emitted."""
 
     def test_sentinel_emitted_if_no_chunk_is_final(self, monkeypatch):
-        import server
+        import jobs_registry
 
         mock_engine = MagicMock()
 
@@ -525,7 +525,7 @@ class TestTtsChunkFinalSentinel:
         mock_registry = MagicMock()
         mock_registry.fan_out = MagicMock(return_value=1)
 
-        monkeypatch.setattr("server._encode_chunk_ogg", lambda s, r: b"OGG")
+        monkeypatch.setattr("jobs_registry._encode_chunk_ogg", lambda s, r: b"OGG")
 
         entry = {
             "job_id": "job-sentinel",
@@ -535,17 +535,17 @@ class TestTtsChunkFinalSentinel:
             "session_id": "sess-sentinel",
         }
         with (
-            patch("server._engine_module", return_value=mock_engine),
-            patch("server._adaptive_player_class", return_value=lambda **kw: mock_player),
-            patch("server._resolve_voice_via_bus", return_value=("kokoro", "bm_lewis")),
-            patch("server._resolve_device_for_entry", return_value=(None, None)),
-            patch("server._acquire_speaking_lock", return_value=False),
-            patch("server._release_speaking_lock"),
-            patch("server._set_bus_voice_state"),
-            patch("server._jobs", {entry["job_id"]: {"status": "speaking"}}),
+            patch("jobs_registry._engine_module", return_value=mock_engine),
+            patch("jobs_registry._adaptive_player_class", return_value=lambda **kw: mock_player),
+            patch("jobs_registry._resolve_voice_via_bus", return_value=("kokoro", "bm_lewis")),
+            patch("jobs_registry._resolve_device_for_entry", return_value=(None, None)),
+            patch("jobs_registry._acquire_speaking_lock", return_value=False),
+            patch("jobs_registry._release_speaking_lock"),
+            patch("jobs_registry._set_bus_voice_state"),
+            patch("jobs_registry._jobs", {entry["job_id"]: {"status": "speaking"}}),
             patch("seats.get_seat_registry", return_value=mock_registry),
         ):
-            server._run_speech_job(entry)
+            jobs_registry._run_speech_job(entry)
 
         tts_calls = [c for c in mock_registry.fan_out.call_args_list if c.args[1].get("type") == "tts_chunk"]
         # 2 real + 1 sentinel

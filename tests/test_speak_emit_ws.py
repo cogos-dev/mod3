@@ -273,24 +273,24 @@ def _build_run_speech_job_mocks(
     audio_subs: AudioSubscriberRegistry,
     monkeypatch,
 ) -> tuple[dict, dict]:
-    """Patch all server-level globals and return (jobs_dict, entry)."""
-    import server  # noqa: PLC0415
+    """Patch all jobs_registry-level globals and return (jobs_dict, entry)."""
+    import jobs_registry  # noqa: PLC0415
 
     jobs: dict = {}
     entry = _make_speak_entry(session_id="sess-abc" if audio_subs.has_subscribers("sess-abc") else None)
     jobs[entry["job_id"]] = {"status": "queued"}
 
     # Patch module globals that _run_speech_job reads/writes
-    monkeypatch.setattr(server, "_jobs", jobs, raising=False)
-    monkeypatch.setattr(server, "_last_metrics", None, raising=False)
-    monkeypatch.setattr(server, "_current_player", None, raising=False)
-    monkeypatch.setattr(server, "_current_player_lock", threading.Lock(), raising=False)
+    monkeypatch.setattr(jobs_registry, "_jobs", jobs, raising=False)
+    monkeypatch.setattr(jobs_registry, "_last_metrics", None, raising=False)
+    monkeypatch.setattr(jobs_registry, "_current_player", None, raising=False)
+    monkeypatch.setattr(jobs_registry, "_current_player_lock", threading.Lock(), raising=False)
 
     # Patch engine loader
     fake_engine = mock.MagicMock()
     fake_engine.generate_audio.return_value = iter(chunks)
     fake_engine.get_model.return_value = mock.MagicMock(sample_rate=_SAMPLE_RATE)
-    monkeypatch.setattr(server, "_engine_module", lambda: fake_engine, raising=False)
+    monkeypatch.setattr(jobs_registry, "_engine_module", lambda: fake_engine, raising=False)
 
     # Patch AdaptivePlayer
     class _FakePlayer:
@@ -314,25 +314,25 @@ def _build_run_speech_job_mocks(
             m.to_dict.return_value = {}
             return m
 
-    monkeypatch.setattr(server, "_adaptive_player_class", lambda: _FakePlayer, raising=False)
+    monkeypatch.setattr(jobs_registry, "_adaptive_player_class", lambda: _FakePlayer, raising=False)
 
     # Patch device resolution
-    monkeypatch.setattr(server, "_resolve_device_for_entry", lambda e: (None, None), raising=False)
+    monkeypatch.setattr(jobs_registry, "_resolve_device_for_entry", lambda e: (None, None), raising=False)
 
     # Patch voice resolution
-    monkeypatch.setattr(server, "_resolve_voice_via_bus", lambda v: ("test-engine", v), raising=False)
+    monkeypatch.setattr(jobs_registry, "_resolve_voice_via_bus", lambda v: ("test-engine", v), raising=False)
 
     # Patch speaking lock (always acquired, never lost)
-    monkeypatch.setattr(server, "_acquire_speaking_lock", lambda jid, txt: True, raising=False)
-    monkeypatch.setattr(server, "_i_own_speaking_lock", lambda jid: True, raising=False)
-    monkeypatch.setattr(server, "_release_speaking_lock", lambda jid: None, raising=False)
+    monkeypatch.setattr(jobs_registry, "_acquire_speaking_lock", lambda jid, txt: True, raising=False)
+    monkeypatch.setattr(jobs_registry, "_i_own_speaking_lock", lambda jid: True, raising=False)
+    monkeypatch.setattr(jobs_registry, "_release_speaking_lock", lambda jid: None, raising=False)
 
     # Patch pipeline state
     fake_pipeline = mock.MagicMock()
-    monkeypatch.setattr(server, "pipeline_state", fake_pipeline, raising=False)
+    monkeypatch.setattr(jobs_registry, "pipeline_state", fake_pipeline, raising=False)
 
     # Patch bus state
-    monkeypatch.setattr(server, "_set_bus_voice_state", mock.MagicMock(), raising=False)
+    monkeypatch.setattr(jobs_registry, "_set_bus_voice_state", mock.MagicMock(), raising=False)
 
     # Patch audio_subscribers module to use our controlled registry
     monkeypatch.setattr(
@@ -355,9 +355,9 @@ class TestRunSpeechJobWsEmit:
         jobs, entry = _build_run_speech_job_mocks(chunks, reg, monkeypatch)
         entry["session_id"] = sid
 
-        import server  # noqa: PLC0415
+        import jobs_registry  # noqa: PLC0415
 
-        server._run_speech_job(entry)
+        jobs_registry._run_speech_job(entry)
 
         # Drain the event loop to pick up all scheduled coroutines
         frames = _drain_loop(ws, loop, 4)  # started + 2 audio + stopped
@@ -377,9 +377,9 @@ class TestRunSpeechJobWsEmit:
         jobs, entry = _build_run_speech_job_mocks(chunks, reg, monkeypatch)
         entry["session_id"] = sid
 
-        import server  # noqa: PLC0415
+        import jobs_registry  # noqa: PLC0415
 
-        server._run_speech_job(entry)
+        jobs_registry._run_speech_job(entry)
 
         frames = _drain_loop(ws, loop, 3)
         audio_frame = next(f for f in frames if f["type"] == "bot-tts-audio")
@@ -429,11 +429,11 @@ class TestRunSpeechJobNoSubscriber:
                 m.to_dict.return_value = {}
                 return m
 
-        import server  # noqa: PLC0415
+        import jobs_registry  # noqa: PLC0415
 
-        monkeypatch.setattr(server, "_adaptive_player_class", lambda: _TrackingPlayer, raising=False)
+        monkeypatch.setattr(jobs_registry, "_adaptive_player_class", lambda: _TrackingPlayer, raising=False)
 
-        server._run_speech_job(entry)
+        jobs_registry._run_speech_job(entry)
 
         # No frames emitted to any WS
         assert reg.snapshot() == {}  # no subscribers ever
@@ -463,11 +463,11 @@ class TestRunSpeechJobBargein:
         jobs, entry = _build_run_speech_job_mocks(chunks, reg, monkeypatch)
         entry["session_id"] = sid
 
-        import server  # noqa: PLC0415
+        import jobs_registry  # noqa: PLC0415
 
-        monkeypatch.setattr(server, "_i_own_speaking_lock", _i_own, raising=False)
+        monkeypatch.setattr(jobs_registry, "_i_own_speaking_lock", _i_own, raising=False)
 
-        server._run_speech_job(entry)
+        jobs_registry._run_speech_job(entry)
 
         frames = _drain_loop(ws, loop, 3)  # started + 1 audio + stopped (break after 1st)
         types = [f["type"] for f in frames]
@@ -492,15 +492,15 @@ class TestRunSpeechJobBargein:
         jobs, entry = _build_run_speech_job_mocks(chunks_dummy, reg, monkeypatch)
         entry["session_id"] = sid
 
-        import server  # noqa: PLC0415
+        import jobs_registry  # noqa: PLC0415
 
         fake_engine = mock.MagicMock()
         fake_engine.generate_audio.side_effect = None
         fake_engine.generate_audio = _failing_gen
         fake_engine.get_model.return_value = mock.MagicMock(sample_rate=_SAMPLE_RATE)
-        monkeypatch.setattr(server, "_engine_module", lambda: fake_engine, raising=False)
+        monkeypatch.setattr(jobs_registry, "_engine_module", lambda: fake_engine, raising=False)
 
-        server._run_speech_job(entry)
+        jobs_registry._run_speech_job(entry)
 
         frames = _drain_loop(ws, loop, 2)  # at least started + stopped
         types = [f["type"] for f in frames]

@@ -1,0 +1,2233 @@
+"""Mod³ shared speech runtime — the single source of truth for job state,
+the speech queue, the modality bus, pipeline (barge-in) state, and the
+dashboard-chat relay, shared by both the MCP process (server.py, run as
+``__main__``) and the HTTP API (http_api.py).
+
+Why this module exists (2026-07-23 incident): server.py doubles as the MCP
+CLI entrypoint (``python server.py --http`` runs it as ``__main__``) and,
+historically, http_api.py also did ``from server import _bus`` etc. Because
+Python module identity is keyed by import name, that lazy cross-import
+caused server.py's *entire* top-level module body — including this file's
+old contents: the job registry, the speech queue, the barge-in watcher
+thread, and the ModalityBus — to execute a SECOND time under the module
+name ``"server"``, distinct from the first (``"__main__"``) execution.
+Confirmed empirically: two independent ``_bargein_watcher`` threads ended
+up running in the same process, each with its own ``pipeline_state``. The
+watcher bound to ``__main__`` never saw the real job's ``pipeline_state``
+as speaking, so it misread the other instance's live utterance as a
+"foreign" cross-process speaker and forcibly cleared the shared
+speaking-lock file out from under it — able to interrupt playback that no
+in-process signal had actually threatened, and (separately) desynchronizing
+which registry MCP tools vs. HTTP endpoints each saw.
+
+The fix: everything stateful lives here, in a module that is *never* run as
+``__main__`` and therefore is only ever imported once, under one name,
+regardless of who imports it first. ``server.py`` becomes a thin CLI
+entrypoint (argument parsing, ``_run_http``, ``install_mcp_route``) that
+imports its MCP tool surface and shared state from here; ``http_api.py``
+imports directly from here too — neither ever imports from ``server``.
+
+Tools (MCP, decorated with ``mcp.tool()`` below; mounted by server.py):
+  speak(text, voice, speed, emotion) — non-blocking speech, returns job ID
+  speech_status(job_id)              — check job or get latest metrics
+  stop()                             — interrupt current speech
+  list_voices()                      — list available voice presets
+  set_output_device(device)          — list/switch audio output
+  diagnostics()                      — engine state + last metrics
+"""
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false
+
+import asyncio
+import json
+import logging
+import os
+import threading
+import time
+import uuid
+import wave
+from collections import OrderedDict
+from datetime import datetime, timezone
+from typing import Any
+
+import numpy as np
+from mcp.server.fastmcp import FastMCP
+
+from bus import ModalityBus
+from modality import ModalityType, ModuleStatus
+from modules.voice import PlaceholderDecoder, VoiceModule
+from pipeline_state import InterruptInfo, PipelineState
+from session_registry import (
+    ResolvedOutputDevice,
+    get_default_registry,
+    resolve_output_device,
+)
+
+logger = logging.getLogger("mod3.server")
+
+_MODEL_REGISTRY = {
+    "voxtral": {
+        "id": "mlx-community/Voxtral-4B-TTS-2603-mlx-4bit",
+        "voices": [
+            "casual_male",
+            "casual_female",
+            "cheerful_female",
+            "neutral_male",
+            "neutral_female",
+            "fr_male",
+            "fr_female",
+            "es_male",
+            "es_female",
+            "de_male",
+            "de_female",
+            "it_male",
+            "it_female",
+            "pt_male",
+            "pt_female",
+            "nl_male",
+            "nl_female",
+            "ar_male",
+            "hi_male",
+            "hi_female",
+        ],
+        "default_voice": "casual_male",
+    },
+    "kokoro": {
+        "id": "mlx-community/Kokoro-82M-bf16",
+        "voices": [
+            "af_heart",
+            "af_bella",
+            "af_nicole",
+            "af_sarah",
+            "af_sky",
+            "am_adam",
+            "am_michael",
+            "bf_emma",
+            "bf_isabella",
+            "bm_george",
+            "bm_lewis",
+        ],
+        "default_voice": "af_heart",
+        "supports_speed": True,
+    },
+    "chatterbox": {
+        "id": "mlx-community/chatterbox-4bit",
+        "voices": ["chatterbox"],
+        "default_voice": "chatterbox",
+        "supports_exaggeration": True,
+    },
+    "spark": {
+        "id": "mlx-community/Spark-TTS-0.5B-bf16",
+        "voices": ["spark_male", "spark_female"],
+        "default_voice": "spark_male",
+        "supports_pitch": True,
+        "supports_speed": True,
+    },
+}
+
+
+def _create_bus() -> ModalityBus:
+    bus = ModalityBus()
+    bus.register(VoiceModule(decoder=PlaceholderDecoder()))
+    return bus
+
+
+_bus = _create_bus()
+_bus_vad_lock = threading.Lock()
+
+
+def _get_voice_module() -> VoiceModule | None:
+    module = getattr(_bus, "_modules", {}).get(ModalityType.VOICE)
+    return module if isinstance(module, VoiceModule) else None
+
+
+def _engine_module():
+    import engine
+
+    return engine
+
+
+def _try_engine_module():
+    try:
+        return _engine_module(), None
+    except Exception as exc:
+        return None, exc
+
+
+def _model_registry() -> dict[str, dict[str, Any]]:
+    engine_module, _ = _try_engine_module()
+    return engine_module.MODELS if engine_module is not None else _MODEL_REGISTRY
+
+
+def _adaptive_player_class():
+    from adaptive_player import AdaptivePlayer
+
+    return AdaptivePlayer
+
+
+def _resolve_voice_via_bus(voice: str) -> tuple[str, str]:
+    voice_module = _get_voice_module()
+    if voice_module is None or voice_module.encoder is None:
+        raise ValueError("Voice module is not registered on the ModalityBus.")
+
+    # Check the voice profile registry first so cloned voices resolve
+    # before falling through to the built-in MODELS voice list.
+    # Mirrors engine.resolve_model() which the HTTP /v1/synthesize path uses.
+    try:
+        from voice_profiles import VoiceProfileRegistry  # noqa: PLC0415
+
+        registry = VoiceProfileRegistry()
+        profile = registry.get(voice)
+        if profile is not None:
+            return profile.engine, voice
+    except Exception:
+        pass  # profile registry unavailable -- fall through to built-in list
+
+    for engine_name, cfg in _model_registry().items():
+        if voice in cfg["voices"]:
+            return engine_name, voice
+
+    raise ValueError(f"Unknown voice '{voice}'. Use list_voices() to see options.")
+
+
+def _read_wav_as_mono_float32(file_path: str) -> tuple[bytes, int]:
+    with wave.open(file_path, "rb") as wav_file:
+        sample_rate = wav_file.getframerate()
+        n_channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        frames = wav_file.readframes(wav_file.getnframes())
+
+    if sample_width == 2:
+        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        audio = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        audio = np.frombuffer(frames, dtype=np.float32)
+
+    if n_channels > 1:
+        audio = audio.reshape(-1, n_channels).mean(axis=1)
+
+    return audio.astype(np.float32).tobytes(), sample_rate
+
+
+def _set_bus_voice_state(
+    *,
+    status: ModuleStatus,
+    active_job: str | None = None,
+    current_text: str = "",
+    progress: float | None = None,
+    last_output_text: str | None = None,
+    error: str | None = None,
+) -> None:
+    voice_module = _get_voice_module()
+    if voice_module is None:
+        return
+
+    state = voice_module.state
+    state.status = status
+    state.active_job = active_job
+    state.current_text = current_text
+    state.last_activity = time.time()
+    state.error = error
+    if progress is not None:
+        state.progress = progress
+    if last_output_text is not None:
+        state.last_output_text = last_output_text
+
+
+mcp = FastMCP(
+    "mod3",
+    instructions=(
+        "Mod³ voice channel with multi-model TTS (Voxtral, Kokoro, Chatterbox, Spark) "
+        "running locally on Apple Silicon. "
+        'Voice messages arrive as <channel source="mod3" speaker="..." confidence="...">. '
+        "Use the speak tool to respond via voice. speak() is non-blocking. "
+        "Use speech_status to check completion. Use stop to interrupt. "
+        "Keep spoken text conversational and concise — this is voice, not a document. "
+        "For permission prompts, reply verbally with 'yes [code]' or 'no [code]'."
+    ),
+    # When the FastAPI app mounts streamable_http_app() at /mcp, the sub-app's
+    # internal route must live at "/" so external /mcp requests resolve.
+    streamable_http_path="/",
+)
+
+# ---------------------------------------------------------------------------
+# Reflex arc — shared pipeline state
+# ---------------------------------------------------------------------------
+
+pipeline_state = PipelineState()
+
+
+# ---------------------------------------------------------------------------
+# Barge-in file watcher — monitors /tmp/mod3-barge-in.json for pause signals
+# ---------------------------------------------------------------------------
+
+# Overridable so tests (and any other isolated invocation) can point the
+# watcher/lock at a tmp path instead of racing the real daemon's files.
+_BARGEIN_SIGNAL = os.environ.get("MOD3_BARGEIN_SIGNAL_PATH", "/tmp/mod3-barge-in.json")
+_SPEAKING_LOCK = os.environ.get("MOD3_SPEAKING_LOCK_PATH", "/tmp/mod3-speaking.json")
+_bargein_last_mtime: float = 0.0
+
+# A ``user_speaking_start`` signal older than this is treated as idle rather
+# than as an indefinite "user is speaking" hold. Every reader of
+# _BARGEIN_SIGNAL (the gate check below and the watcher's interrupt branch)
+# applies this the same way. Without it, a VAD/mic writer that dies
+# mid-utterance — before ever writing user_speaking_end — pins the signal
+# open forever: on 2026-07-07 the file stuck at user_speaking_start for
+# ~3 days after inbound.py's mic_vad writer died, silently holding every
+# speak() request that whole time (see CHANGELOG).
+#
+# 120s, not something closer to inbound.py's ~2s VAD refresh cadence,
+# because not every producer refreshes continuously. inbound.py's
+# VADStage.process() *does* re-dispatch a fresh user_speaking_start on
+# every ~2s chunk for as long as real speech continues (verified: it has
+# no onset-only guard, so it fires on every speech-positive tick) — a short
+# TTL would be fine for that writer alone. But the SuperWhisper-family
+# producers (bargein/providers/superwhisper.py and the standalone
+# integrations/bargein-producer.py) write the start event exactly ONCE per
+# utterance and rely on their own internal 150s staleness self-check,
+# because their comments note recordings legitimately run 60s+. Since this
+# file is provider-agnostic at the read side, the TTL has to be safe for
+# the slowest/most conservative writer, not tuned to the fastest one. 120s
+# comfortably covers a long SuperWhisper dictation (and stays under that
+# producer's own 150s self-heal window) while still bounding a dead-writer
+# outage to two minutes instead of three days.
+_MOD3_BARGEIN_SIGNAL_TTL_SEC = float(os.environ.get("MOD3_BARGEIN_SIGNAL_TTL_SEC", "120"))
+
+
+def _bargein_signal_is_stale(signal: dict, mtime: float, ttl_sec: float | None = None) -> bool:
+    """True if a barge-in signal's effective age exceeds the staleness TTL.
+
+    Prefers the signal's own ``timestamp`` field (ISO-8601, tz-aware, set by
+    the emitting producer at event time — see bargein.make_file_mirror_subscriber
+    and the standalone/superwhisper producers). Falls back to the file's
+    mtime when the field is missing or unparseable; every producer writes
+    the file atomically (tmp + rename) at event time, so mtime is a
+    reasonable proxy for "when was this signal emitted".
+    """
+    if ttl_sec is None:
+        ttl_sec = _MOD3_BARGEIN_SIGNAL_TTL_SEC
+
+    signal_time: datetime | None = None
+    ts_raw = signal.get("timestamp")
+    if isinstance(ts_raw, str):
+        try:
+            parsed = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            signal_time = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            signal_time = None  # unparseable — fall back to mtime below
+
+    if signal_time is None:
+        signal_time = datetime.fromtimestamp(mtime, tz=timezone.utc)
+
+    age_sec = (datetime.now(timezone.utc) - signal_time).total_seconds()
+    return age_sec > ttl_sec
+
+
+def _pid_is_alive(pid: Any) -> bool:
+    """Return True if a local process with ``pid`` is still alive."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _read_speaking_lock() -> dict | None:
+    """Read the speaking lock file. Returns None if missing or unparseable."""
+    try:
+        if not os.path.exists(_SPEAKING_LOCK):
+            return None
+        with open(_SPEAKING_LOCK) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _acquire_speaking_lock(job_id: str, text: str) -> bool:
+    """Try to claim the cross-process speaking lock for this (pid, job_id).
+
+    The lock is acquired (and overwritten) when:
+      * the file is missing,
+      * the existing holder PID is dead, or
+      * the existing holder is this same (pid, job_id) (idempotent re-acquire).
+
+    Otherwise the lock is left untouched and ``False`` is returned — a
+    different live process owns the speaker. Callers may still play audio
+    locally; they just won't be eligible for cross-process barge-in.
+    """
+    my_pid = os.getpid()
+    payload = {
+        "speaking": True,
+        "job_id": job_id,
+        "text": text,
+        "pid": my_pid,
+        "acquired_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    existing = _read_speaking_lock()
+    if existing is not None:
+        holder_pid = existing.get("pid")
+        holder_job = existing.get("job_id")
+        same_owner = holder_pid == my_pid and holder_job == job_id
+        if not same_owner and _pid_is_alive(holder_pid):
+            return False
+        # Either same owner re-acquiring, or stale lock from a dead pid —
+        # fall through and overwrite.
+
+    try:
+        tmp = _SPEAKING_LOCK + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, _SPEAKING_LOCK)
+        return True
+    except OSError:
+        return False
+
+
+def _release_speaking_lock(job_id: str | None = None) -> bool:
+    """Release the speaking lock if this process owns it.
+
+    Returns True if the lock was removed, False if the file is missing,
+    held by a different (pid, job_id), or unreadable. When ``job_id`` is
+    provided, both pid AND job_id must match; otherwise only pid is checked.
+    """
+    existing = _read_speaking_lock()
+    if existing is None:
+        return False
+    if existing.get("pid") != os.getpid():
+        return False
+    if job_id is not None and existing.get("job_id") != job_id:
+        return False
+    try:
+        os.remove(_SPEAKING_LOCK)
+        return True
+    except OSError:
+        return False
+
+
+def _i_own_speaking_lock(job_id: str) -> bool:
+    """True if the on-disk lock matches our (pid, job_id)."""
+    existing = _read_speaking_lock()
+    if existing is None:
+        return False
+    return existing.get("pid") == os.getpid() and existing.get("job_id") == job_id
+
+
+def _force_clear_speaking_lock() -> dict | None:
+    """Forcibly remove the speaking lock regardless of owner.
+
+    Used by the cross-process barge-in path: when the file watcher decides
+    another process must stop speaking, it removes the lock file. The owner
+    notices via stop-on-pid-mismatch (its own pid is no longer present) and
+    halts its generation loop.
+
+    Returns the lock contents at the moment of removal, or ``None`` if the
+    file was missing.
+    """
+    existing = _read_speaking_lock()
+    try:
+        if os.path.exists(_SPEAKING_LOCK):
+            os.remove(_SPEAKING_LOCK)
+    except OSError:
+        pass
+    return existing
+
+
+def _is_any_process_speaking() -> dict | None:
+    """Check if a live Mod³ process is currently speaking (cross-process).
+
+    Returns the lock dict if a live holder exists; ``None`` otherwise.
+    Stale locks (holder pid is dead) are removed as a side effect.
+    """
+    existing = _read_speaking_lock()
+    if existing is None:
+        return None
+    if not _pid_is_alive(existing.get("pid")):
+        try:
+            os.remove(_SPEAKING_LOCK)
+        except OSError:
+            pass
+        return None
+    return existing
+
+
+def _bargein_watcher():
+    """Background thread that watches for barge-in signal file changes.
+
+    This path is retained for the standalone ``integrations/bargein-producer.py``
+    producer (and its launchd plist). In-process providers go through
+    ``bargein.BargeinRegistry`` instead, calling the same shared
+    ``handle_bargein_start`` consumer helper.
+
+    For ``user_speaking_end`` events, the watcher also bridges the file into
+    the registry by dispatching a synthetic ``BargeinEvent`` — that lets
+    registry-side waiters (``await_voice_input``'s ``wait_for_event``) wake
+    from file-based producers without maintaining a second wait path.
+    Feedback is broken by skipping files whose ``via`` marker shows they were
+    written by our own file-mirror subscriber.
+    """
+    global _bargein_last_mtime
+    import json as _json
+
+    from bargein import handle_bargein_start
+    from bargein.providers.base import BargeinEvent
+
+    while True:
+        try:
+            import os
+
+            if os.path.exists(_BARGEIN_SIGNAL):
+                mtime = os.path.getmtime(_BARGEIN_SIGNAL)
+                if mtime > _bargein_last_mtime:
+                    _bargein_last_mtime = mtime
+                    with open(_BARGEIN_SIGNAL) as f:
+                        signal = _json.load(f)
+                    event_type = signal.get("event")
+                    # Break the file_mirror → watcher → registry feedback loop:
+                    # events the registry itself just mirrored out are marked
+                    # with via=bargein_registry and should not round-trip back.
+                    from_mirror = signal.get("via") == "bargein_registry"
+                    if event_type == "user_speaking_end" and not from_mirror:
+                        # Bridge external producers (integrations/bargein-producer.py)
+                        # into the in-process registry so wait_for_event sees them.
+                        _bargein_registry._dispatch(
+                            BargeinEvent(
+                                source=signal.get("source", "superwhisper"),
+                                event_type="user_speaking_end",
+                                metadata={
+                                    "via": "file_signal",
+                                    **{k: v for k, v in signal.items() if k not in ("event", "source", "timestamp")},
+                                },
+                            )
+                        )
+                    if signal.get("event") == "user_speaking_start" and not _bargein_signal_is_stale(signal, mtime):
+                        # Shared consumer: check is_speaking + interrupt + log
+                        #
+                        # The staleness check matters here too, not just in
+                        # _bargein_user_recording(): _bargein_last_mtime resets
+                        # to 0.0 on every process restart, so a signal file left
+                        # over from days ago reads as "new" on the very first
+                        # watcher tick after restart and would otherwise
+                        # trigger a spurious interrupt of freshly-started
+                        # playback based on stale data.
+                        info = handle_bargein_start(
+                            pipeline_state,
+                            source=signal.get("source", "file_signal"),
+                            metadata={"via": "file_signal"},
+                        )
+                        if info is not None:
+                            # Enrich the on-disk signal so cooperating consumers
+                            # can read the interrupt detail.
+                            signal["interrupted"] = {
+                                "spoken_pct": info.spoken_pct,
+                                "delivered_text": info.delivered_text,
+                                "full_text": info.full_text,
+                            }
+                            with open(_BARGEIN_SIGNAL, "w") as f:
+                                _json.dump(signal, f, indent=2)
+                        else:
+                            # Nothing speaking locally — check cross-process lock.
+                            # This path is only meaningful for the file-based IPC
+                            # (another mod3 process owns the speech); in-process
+                            # providers share pipeline_state so never land here.
+                            lock = _is_any_process_speaking()
+                            if lock:
+                                signal["interrupted"] = {
+                                    "spoken_pct": 0.0,
+                                    "delivered_text": "",
+                                    "full_text": lock.get("text", ""),
+                                    "cross_process": True,
+                                    "source_pid": lock.get("pid"),
+                                }
+                                with open(_BARGEIN_SIGNAL, "w") as f:
+                                    _json.dump(signal, f, indent=2)
+                                _force_clear_speaking_lock()
+                                logging.info(
+                                    "Barge-in: cross-process interrupt (pid=%s)",
+                                    lock.get("pid"),
+                                )
+        except Exception as e:
+            logging.debug("Barge-in watcher error: %s", e)
+        time.sleep(0.1)  # 100ms poll
+
+
+# ---------------------------------------------------------------------------
+# Barge-in provider registry — in-process providers (SuperWhisper, future:
+# silero VAD, hotkey, etc.). Opt-in via MOD3_BARGEIN_PROVIDERS. Empty default
+# preserves current behavior for users who only run the legacy file producer.
+#
+# NOTE: the registry is constructed BEFORE the watcher thread starts because
+# the watcher bridges file user_speaking_end events into the registry.
+# ---------------------------------------------------------------------------
+
+from bargein import BargeinRegistry, make_file_mirror_subscriber  # noqa: E402
+
+_bargein_registry = BargeinRegistry(pipeline_state)
+# Mirror in-process provider events into the legacy signal file so
+# out-of-process consumers (integrations watching the file)
+# keep receiving events from in-process providers like SuperWhisperProvider.
+_bargein_registry.subscribe(make_file_mirror_subscriber(_BARGEIN_SIGNAL))
+_bargein_registry.start_from_env()
+
+_bargein_thread = threading.Thread(target=_bargein_watcher, daemon=True)
+_bargein_thread.start()
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# OGG/Opus encoder — mirrors http_api.encode_ogg; kept here to avoid circular
+# import (http_api imports from server).
+# ---------------------------------------------------------------------------
+
+_OPUS_VALID_RATES = frozenset({8000, 12000, 16000, 24000, 48000})
+
+
+def _encode_chunk_ogg(samples, sample_rate: int) -> bytes:
+    """Encode float32 samples as OGG/Opus bytes for seat tts_chunk events."""
+    import io
+
+    import numpy as np
+    import soundfile as sf
+
+    samples = np.asarray(samples, dtype=np.float32)
+    if sample_rate not in _OPUS_VALID_RATES:
+        try:
+            import math
+
+            from scipy.signal import resample_poly
+
+            target_rate = 24000
+            gcd = math.gcd(target_rate, sample_rate)
+            up, down = target_rate // gcd, sample_rate // gcd
+            samples = resample_poly(samples, up, down).astype(np.float32)
+            sample_rate = target_rate
+        except ImportError:
+            raise RuntimeError(
+                f"OGG/Opus encoding requires sample_rate in {sorted(_OPUS_VALID_RATES)}; "
+                f"got {sample_rate} Hz and scipy is not available for resampling."
+            )
+    buf = io.BytesIO()
+    sf.write(buf, samples, sample_rate, format="OGG", subtype="OPUS")
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Job tracking (MCP only — local speaker playback)
+# ---------------------------------------------------------------------------
+
+# Retention: finished jobs stay in _jobs for at least JOB_RETENTION_SECONDS
+# so GET /v1/jobs/{id} stays answerable well past playback (previously a
+# fixed MAX_JOBS=20 count-based cap could evict a job seconds after launch
+# under even light concurrent traffic). MAX_JOBS is now just a safety cap
+# against unbounded growth if something floods speak() faster than the
+# retention window drains — 500 comfortably covers 10 minutes of jobs at a
+# sustained rate well beyond normal dashboard/agent chat traffic.
+JOB_RETENTION_SECONDS = 600  # 10 minutes
+MAX_JOBS = 500
+_last_metrics: dict | None = None
+_output_device: int | str | None = None
+_jobs: OrderedDict[str, dict] = OrderedDict()
+_current_player: Any | None = None
+_current_player_lock = threading.Lock()
+
+
+def _prune_jobs():
+    """Evict finished jobs older than JOB_RETENTION_SECONDS; never touch an
+    in-flight job.
+
+    Evicting a job whose `_run_speech_job` worker is still writing to it would
+    raise KeyError on the post-completion `_jobs[job_id]["metrics"] = result`
+    assignment, which then kills the SpeechQueue drain thread (it has no
+    catch-all) and leaves later jobs stuck in queue with no processor.
+
+    Simple time-based prune: a finished job (done/error/cancelled) is kept
+    until `end_time` is more than JOB_RETENTION_SECONDS in the past. MAX_JOBS
+    is a hard safety net on top of that in case retention alone lets the
+    dict grow unbounded under a sustained flood.
+    """
+    in_flight = {"queued", "speaking"}
+    now = time.time()
+    for jid in list(_jobs):
+        job = _jobs[jid]
+        if job.get("status") in in_flight:
+            continue
+        finished_at = job.get("end_time") or job.get("submitted_time", now)
+        if now - finished_at > JOB_RETENTION_SECONDS:
+            del _jobs[jid]
+
+    # Walk in insertion order; pop the oldest non-in-flight entry per iteration.
+    while len(_jobs) > MAX_JOBS:
+        for jid in list(_jobs):
+            if _jobs[jid].get("status") not in in_flight:
+                del _jobs[jid]
+                break
+        else:
+            # All remaining entries are in-flight; nothing safe to evict.
+            return
+
+
+# ---------------------------------------------------------------------------
+# Speech queue — serial playback with enriched status
+# ---------------------------------------------------------------------------
+
+
+class SpeechQueue:
+    """Thread-safe queue for serial speech playback.
+
+    When speak() is called while audio is playing, the new request is
+    queued and will play automatically when the current item finishes.
+    All queue operations are protected by a single lock.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._queue: list[dict] = []  # pending jobs (not yet playing)
+        self._active_job_id: str | None = None  # job_id currently playing
+        self._draining = False  # True while the drain thread is running
+
+    def enqueue(self, job_id: str, params: dict) -> int:
+        """Add a job to the queue. Returns the queue position (0 = will play next).
+
+        If nothing is currently playing and the queue is empty, triggers
+        drain immediately so the job starts without delay.
+        """
+        with self._lock:
+            self._queue.append({"job_id": job_id, **params})
+            position = len(self._queue) - 1
+            if not self._draining:
+                self._draining = True
+                threading.Thread(target=self._drain, daemon=True).start()
+            return position
+
+    def cancel(self, job_id: str) -> bool:
+        """Remove a queued (not yet playing) job. Returns True if found and removed."""
+        with self._lock:
+            for i, entry in enumerate(self._queue):
+                if entry["job_id"] == job_id:
+                    self._queue.pop(i)
+                    return True
+        return False
+
+    def cancel_all_queued(self) -> int:
+        """Remove all queued (not yet playing) jobs. Returns count removed."""
+        with self._lock:
+            count = len(self._queue)
+            self._queue.clear()
+            return count
+
+    def get_queue_snapshot(self) -> list[dict]:
+        """Return a snapshot of queued jobs (does not include the active job)."""
+        with self._lock:
+            return list(self._queue)
+
+    @property
+    def active_job_id(self) -> str | None:
+        with self._lock:
+            return self._active_job_id
+
+    @property
+    def depth(self) -> int:
+        """Number of jobs waiting (not including the active one)."""
+        with self._lock:
+            return len(self._queue)
+
+    def _drain(self):
+        """Process queued jobs one at a time until the queue is empty.
+
+        The outer try/finally ensures ``_draining`` is always reset to False
+        when this thread exits — regardless of whether the exit is normal
+        (queue emptied) or abnormal (BaseException raised by a job runner or
+        a signal handler).  Without this guarantee, any BaseException that
+        escapes the inner ``except Exception`` handler (e.g. KeyboardInterrupt,
+        SystemExit, MemoryError, or GeneratorExit from a TTS generator) leaves
+        ``_draining = True`` permanently, causing every subsequent enqueue() to
+        skip starting a new drain thread, so jobs pile up with active_jobs=0.
+
+        Signals (KeyboardInterrupt, SystemExit) are re-raised after cleanup so
+        the process can still respond to them normally.
+        """
+        try:
+            while True:
+                with self._lock:
+                    if not self._queue:
+                        self._draining = False
+                        self._active_job_id = None
+                        return
+                    entry = self._queue.pop(0)
+                    self._active_job_id = entry["job_id"]
+
+                # Run the speech job (blocking — one at a time). A failure here
+                # must not kill the drain thread: if it does, `_draining` stays
+                # True and subsequent enqueues never start a new drain, so jobs
+                # accumulate in the queue with no processor.
+                try:
+                    _run_speech_job(entry)
+                except Exception as exc:
+                    logger.exception(
+                        "speech_queue: drain caught unhandled %s in _run_speech_job for %s",
+                        type(exc).__name__,
+                        entry.get("job_id"),
+                    )
+        except BaseException as exc:  # noqa: BLE001
+            # BaseException subclasses not caught by the inner handler
+            # (KeyboardInterrupt, SystemExit, MemoryError, etc.) land here.
+            # Log at WARNING so the stall is visible in production logs, then
+            # let the finally block reset state before re-raising signals.
+            logger.warning(
+                "speech_queue: drain thread exiting on %s — queue will be reset",
+                type(exc).__name__,
+            )
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+        finally:
+            # Unconditional cleanup: reset flags so future enqueue() calls
+            # start a new drain thread instead of silently accumulating.
+            with self._lock:
+                self._draining = False
+                self._active_job_id = None
+
+
+_speech_queue = SpeechQueue()
+
+
+# ---------------------------------------------------------------------------
+# Adaptive playback (MCP speaker output)
+# ---------------------------------------------------------------------------
+
+
+def _estimate_duration_sec(text: str, speed: float) -> float:
+    """Rough estimate of speech duration from text length and speed.
+
+    Heuristic: ~150 words per minute at speed 1.0, average word ~5 chars.
+    """
+    words = len(text.split())
+    if words == 0:
+        words = max(1, len(text) / 5)
+    return (words / 150.0) * 60.0 / speed
+
+
+def _resolve_device_for_entry(entry: dict) -> tuple[int | str | None, ResolvedOutputDevice | None]:
+    """Resolve the output device for a speech job, live.
+
+    Priority (per the ADR-082 2026-04-22 amendment):
+      1. If the job's session has a preferred_output_device, re-query live —
+         "system-default" always reads the current OS default, and named
+         devices are enumerated per dispatch.
+      2. Otherwise fall back to the legacy ``_output_device`` module global
+         set by set_output_device() so existing callers keep working.
+    """
+    session_id = entry.get("session_id")
+    if session_id:
+        try:
+            registry = get_default_registry()
+            resolved = registry.resolve_device(session_id)
+            entry["resolved_device"] = resolved
+            return resolved.index, resolved
+        except Exception as exc:  # noqa: BLE001 — never fail synthesis on resolution
+            logger.warning("device resolution failed for session %s: %s", session_id, exc)
+    return _output_device, None
+
+
+def _run_speech_job(entry: dict) -> None:
+    """Execute a single speech job (blocking). Called from the drain thread."""
+    global _last_metrics, _current_player
+
+    job_id = entry["job_id"]
+    text = entry["text"]
+    voice = entry["voice"]
+    stream = entry.get("stream", True)
+    streaming_interval = entry.get("streaming_interval", 1.0)
+    speed = entry.get("speed", 1.0)
+    emotion = entry.get("emotion", 0.5)
+    ref_audio = entry.get("ref_audio")
+
+    try:
+        engine_module = _engine_module()
+        AdaptivePlayer = _adaptive_player_class()
+        engine, resolved_voice = _resolve_voice_via_bus(voice)
+        model = engine_module.get_model(engine)
+        device, _resolved = _resolve_device_for_entry(entry)
+
+        # Feedforward buffer sizing (operator two-loop policy): read mod3's
+        # own recent chunk-deficit telemetry, optionally corroborated by a
+        # ≤100ms-timeboxed probe of the LMS lane (GPU contention proxy —
+        # Metal is shared between local TTS and a local LLM; measured 1.26x
+        # wall-clock cost under one concurrent LMS call). See
+        # adaptive_player.compute_initial_buffer_ms for the pure policy math.
+        from adaptive_player import compute_initial_buffer_ms, get_deficit_ema, probe_lms_contention
+
+        deficit_ema = get_deficit_ema()
+        if os.environ.get("MOD3_ADAPTIVE_BUFFER_PROBE", "1") != "0":
+            probe_latency_ms, probe_timed_out = probe_lms_contention()
+        else:
+            probe_latency_ms, probe_timed_out = None, True
+        initial_buffer_ms = compute_initial_buffer_ms(deficit_ema, probe_latency_ms, probe_timed_out)
+
+        player = AdaptivePlayer(sample_rate=model.sample_rate, device=device, initial_buffer_ms=initial_buffer_ms)
+    except Exception as e:
+        _jobs[job_id]["status"] = "error"
+        _jobs[job_id]["error"] = str(e)
+        _jobs[job_id]["end_time"] = time.time()
+        _set_bus_voice_state(
+            status=ModuleStatus.ERROR,
+            active_job=None,
+            current_text="",
+            error=str(e),
+        )
+        with _current_player_lock:
+            if _current_player is not None:
+                pass  # leave existing player alone on setup error
+        return
+
+    with _current_player_lock:
+        _current_player = player
+
+    _jobs[job_id]["status"] = "speaking"
+    _jobs[job_id]["start_time"] = time.time()
+    _jobs[job_id]["engine"] = engine
+    _jobs[job_id]["voice"] = resolved_voice
+    _jobs[job_id]["player"] = player
+
+    # Update last_used_at for registered voice profiles (fire-and-forget;
+    # update_last_used_at is a no-op for built-in voices).
+    try:
+        from voice_profiles import VoiceProfileRegistry  # noqa: PLC0415
+
+        VoiceProfileRegistry().update_last_used_at(resolved_voice)
+    except Exception:  # noqa: BLE001
+        pass
+
+    _set_bus_voice_state(
+        status=ModuleStatus.ENCODING,
+        active_job=job_id,
+        current_text=text[:100],
+        progress=0.0,
+        error=None,
+    )
+
+    # Register with the reflex arc so inbound VAD can interrupt us
+    pipeline_state.start_speaking(text, player)
+    i_have_lock = _acquire_speaking_lock(job_id, text)
+
+    # --- Seat SSE: bargein fan-out callback ---
+    # Captured in the closure so the callback fires for this job/session only.
+    _seat_session_id = entry.get("session_id")
+
+    # Barge-in finalization (2026-07-23 incident): pipeline_state.interrupt()
+    # calls player.flush() directly, which silences audio immediately, but by
+    # itself never signals *this* generation loop to stop calling the engine
+    # for more chunks — the loop's only prior stop signal was the file-based
+    # speaking-lock check below, which a same-process in-process interrupt
+    # never touches. Left unfixed, the loop kept synthesizing the rest of the
+    # (unheard) text and the job stayed "speaking" until that finished —
+    # observed in production as a job wedged at status "speaking"/HUD
+    # "encoding" for minutes after a real barge-in. `_interrupt_state["info"]`
+    # is the single source of truth the loop and the finalizer both check.
+    _interrupt_state: dict[str, InterruptInfo | None] = {"info": None}
+
+    def _on_bargein(info):
+        _interrupt_state["info"] = info
+        if not _seat_session_id:
+            return
+        try:
+            from seats import get_seat_registry
+
+            get_seat_registry().fan_out(
+                _seat_session_id,
+                {
+                    "type": "bargein",
+                    "session_id": _seat_session_id,
+                    "job_id": job_id,
+                    "reason": info.reason,
+                },
+            )
+        except Exception:
+            pass  # never let seat fan-out crash the interrupt path
+
+    pipeline_state.add_interrupt_callback(_on_bargein)
+
+    import base64 as _base64
+
+    _chunk_index = 0
+    _last_chunk_was_final = False
+
+    # --- /ws/audio subscriber state ---
+    # Resolved once before the loop; guarded by has_subscribers() so the
+    # common no-subscriber case exits immediately without import overhead.
+    from audio_subscribers import get_default_audio_subscribers as _get_audio_subs
+
+    _audio_subs = _get_audio_subs()
+    _ws_session_id = _seat_session_id  # same session key as the seat fan-out
+    _ws_tts_started = False  # True after bot-tts-started has been emitted
+    _ws_tts_stopped = False  # True after bot-tts-stopped has been emitted
+
+    try:
+        for chunk in engine_module.generate_audio(
+            text,
+            voice=resolved_voice,
+            stream=stream,
+            streaming_interval=streaming_interval,
+            speed=speed,
+            emotion=emotion,
+            ref_audio=ref_audio,
+        ):
+            # If we held the cross-process lock and lost it (file gone or
+            # pid no longer matches), the bargein watcher decided we should
+            # stop. Without our own lock, we don't gate on this signal —
+            # another process owns the speaker and we're playing locally.
+            if _interrupt_state["info"] is None and i_have_lock and not _i_own_speaking_lock(job_id):
+                logging.info(
+                    "Speaking lock no longer ours (job %s) — stopping generation",
+                    job_id,
+                )
+                # Synthesize an InterruptInfo so this path finalizes the job
+                # identically to an in-process bargein (see below) instead of
+                # falling through and being mislabeled "done".
+                _interrupt_state["info"] = InterruptInfo(
+                    timestamp=time.time(),
+                    spoken_pct=0.0,
+                    delivered_text="",
+                    full_text=text,
+                    reason="cross_process_lock_lost",
+                )
+            if _interrupt_state["info"] is not None:
+                player.flush()
+                break
+            player.queue_audio(chunk.samples, chunk_meta=chunk.metadata if chunk.metadata else None)
+            _set_bus_voice_state(
+                status=ModuleStatus.ENCODING,
+                active_job=job_id,
+                current_text=text[:100],
+            )
+            # Update position after each chunk so PipelineState tracks progress
+            pipeline_state.update_position(*player.get_progress())
+
+            # --- Seat SSE: tts_chunk fan-out ---
+            if _seat_session_id and chunk.samples is not None and len(chunk.samples) > 0:
+                meta = chunk.metadata or {}
+                _is_final = bool(meta.get("is_final", False))
+                _last_chunk_was_final = _is_final
+                try:
+                    _ogg_bytes = _encode_chunk_ogg(chunk.samples, chunk.sample_rate)
+                    _audio_b64 = _base64.b64encode(_ogg_bytes).decode("ascii")
+                    from seats import get_seat_registry
+
+                    get_seat_registry().fan_out(
+                        _seat_session_id,
+                        {
+                            "type": "tts_chunk",
+                            "job_id": job_id,
+                            "chunk_index": _chunk_index,
+                            "text": text,
+                            "audio_base64": _audio_b64,
+                            "format": "ogg",
+                            "is_final": _is_final,
+                            "session_id": _seat_session_id,
+                        },
+                    )
+                    _chunk_index += 1
+                except Exception:
+                    pass  # never let seat fan-out crash synthesis
+
+            # --- /ws/audio: RTVI bot-tts-audio per chunk ---
+            # Gated on session having a live subscriber; local play is
+            # unconditional (already queued above via player.queue_audio).
+            if (
+                _ws_session_id
+                and chunk.samples is not None
+                and len(chunk.samples) > 0
+                and _audio_subs.has_subscribers(_ws_session_id)
+            ):
+                try:
+                    # float32 → int16 LE PCM bytes (no WAV header)
+                    _pcm_bytes = (np.clip(chunk.samples, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                    if not _ws_tts_started:
+                        _audio_subs.emit_tts_started(_ws_session_id)
+                        _ws_tts_started = True
+                    _audio_subs.emit_tts_audio_chunk(
+                        _ws_session_id,
+                        _pcm_bytes,
+                        sample_rate=chunk.sample_rate,
+                    )
+                except Exception:
+                    pass  # never let WS emit crash the drain thread
+
+        # If the engine emitted chunks but never marked one is_final, emit a
+        # sentinel so consumers always see exactly one is_final=True event.
+        if _seat_session_id and _chunk_index > 0 and not _last_chunk_was_final:
+            try:
+                from seats import get_seat_registry
+
+                get_seat_registry().fan_out(
+                    _seat_session_id,
+                    {
+                        "type": "tts_chunk",
+                        "job_id": job_id,
+                        "chunk_index": _chunk_index,
+                        "text": text,
+                        "audio_base64": "",
+                        "format": "ogg",
+                        "is_final": True,
+                        "session_id": _seat_session_id,
+                    },
+                )
+            except Exception:
+                pass
+
+        # --- /ws/audio: emit bot-tts-stopped after final chunk ---
+        if _ws_tts_started and not _ws_tts_stopped:
+            try:
+                _audio_subs.emit_tts_stopped(_ws_session_id)
+                _ws_tts_stopped = True
+            except Exception:
+                pass  # never let WS emit crash the drain thread
+
+    except Exception as e:
+        _jobs[job_id]["error"] = str(e)
+    finally:
+        pipeline_state.remove_interrupt_callback(_on_bargein)
+        player.mark_done()
+        # Ensure bot-tts-stopped is sent even if the loop errored mid-way.
+        if _ws_tts_started and not _ws_tts_stopped:
+            try:
+                _audio_subs.emit_tts_stopped(_ws_session_id)
+                _ws_tts_stopped = True
+            except Exception:
+                pass
+
+    metrics = player.wait(timeout=120.0)
+    # Final position update and clear speaking state
+    pipeline_state.update_position(*player.get_progress())
+    pipeline_state.stop_speaking()
+    _release_speaking_lock(job_id)
+
+    result = metrics.to_dict()
+    result["engine"] = engine
+    result["voice"] = resolved_voice
+    _last_metrics = result
+    interrupt_info = _interrupt_state["info"]
+    # _prune_jobs skips in-flight entries, so the job_id should still be here.
+    # Guard anyway: if some other path removes the job mid-run, finalize bus
+    # state but skip the dict updates instead of crashing the drain thread.
+    job = _jobs.get(job_id)
+    error = job.get("error") if job else None
+    if job is not None:
+        job["metrics"] = result
+        if error:
+            job["status"] = "error"
+        elif interrupt_info is not None:
+            # Barge-in (or lock loss) stopped generation before the text
+            # finished — a terminal status distinct from "done" so pollers
+            # can tell a genuine completion from an interrupted one, plus
+            # the partial-delivery metrics the log already computes.
+            job["status"] = "interrupted"
+            job["interrupted"] = {
+                "spoken_pct": round(interrupt_info.spoken_pct, 3),
+                "delivered_text": interrupt_info.delivered_text,
+                "full_text": interrupt_info.full_text,
+                "reason": interrupt_info.reason,
+            }
+        else:
+            job["status"] = "done"
+        job["end_time"] = time.time()
+    _set_bus_voice_state(
+        status=ModuleStatus.ERROR if error else ModuleStatus.IDLE,
+        active_job=None,
+        current_text="",
+        progress=1.0 if not error else 0.0,
+        last_output_text=text[:100],
+        error=error,
+    )
+
+    with _current_player_lock:
+        if _current_player is player:
+            _current_player = None
+
+
+# ---------------------------------------------------------------------------
+# Barge-in gate escalation (retry-with-backoff)
+# ---------------------------------------------------------------------------
+#
+# Both speak() and _start_speech() check the barge-in signal file before
+# committing to playback: if the user is mid-utterance, talking over them is
+# worse than a short delay. Previously a single "recording" reading returned
+# a terminal "held" status with no retry — if the caller (an LLM agent) never
+# re-sent the request, or VAD false-positived on background noise (engine hum,
+# cabin noise, etc.) and stayed "recording" indefinitely, the audio was
+# silently dropped for the rest of the session. See flight-review.md §5 fix 6:
+# voice was requested 3x on a 12+ hour flight and held 3x, never escalated.
+#
+# _MOD3_GATE_RETRY_ATTEMPTS / _MOD3_GATE_RETRY_INTERVAL_SEC give the gate a
+# real chance to clear (a genuine utterance is usually a few seconds) before
+# escalating. After the retry budget is exhausted we do NOT play over the
+# user (that risk is worse than a delay) — we return a structured signal
+# that says how many times playback has been held so far, so the calling
+# agent (and the operator, via the dashboard/response) can see that voice
+# output is being suppressed instead of it disappearing silently.
+
+_MOD3_GATE_RETRY_ATTEMPTS = int(os.environ.get("MOD3_GATE_RETRY_ATTEMPTS", "3"))
+_MOD3_GATE_RETRY_INTERVAL_SEC = float(os.environ.get("MOD3_GATE_RETRY_INTERVAL_SEC", "3.0"))
+
+# Tracks consecutive holds per logical caller so escalation messaging can
+# say "held N times in a row" even across separate speak() invocations
+# (an agent re-sending the same request after being told to retry).
+_gate_hold_streak: dict[str, int] = {}
+_gate_hold_streak_lock = threading.Lock()
+
+
+def _bargein_user_recording() -> bool:
+    """Return True if the barge-in signal file says the user is speaking
+    AND that signal is still fresh (within MOD3_BARGEIN_SIGNAL_TTL_SEC).
+
+    A user_speaking_start event older than the TTL is treated the same as
+    an idle/missing file — this is what stops a dead VAD/mic writer from
+    pinning the gate open forever (see _MOD3_BARGEIN_SIGNAL_TTL_SEC above
+    for the incident and the TTL-choice rationale).
+    """
+    try:
+        if os.path.exists(_BARGEIN_SIGNAL):
+            mtime = os.path.getmtime(_BARGEIN_SIGNAL)
+            with open(_BARGEIN_SIGNAL) as _bf:
+                _bsig = json.load(_bf)
+            if _bsig.get("event") != "user_speaking_start":
+                return False
+            return not _bargein_signal_is_stale(_bsig, mtime)
+    except Exception:
+        pass  # signal file missing or corrupt — assume idle
+    return False
+
+
+def check_bargein_gate(streak_key: str = "default") -> dict:
+    """Check the barge-in gate, retrying with backoff before giving up.
+
+    Polls the barge-in signal file up to ``_MOD3_GATE_RETRY_ATTEMPTS`` times,
+    sleeping ``_MOD3_GATE_RETRY_INTERVAL_SEC`` between checks. A real
+    utterance is usually a few seconds; this gives it a real chance to clear
+    (~10s at the defaults) before we consider the caller blocked.
+
+    Returns a dict:
+        {
+            "blocked": bool,             # True if still "recording" after retries
+            "attempts": int,             # how many checks were performed
+            "held_count": int,           # consecutive holds for this streak_key,
+                                          # including this one if blocked
+        }
+
+    On success (gate clears within the retry budget) the hold streak for
+    ``streak_key`` is reset to 0. On escalation (still blocked after retries)
+    the streak is incremented so repeated re-sends accumulate a visible count
+    rather than each looking like a fresh, unremarkable "held" reply.
+    """
+    attempts = 0
+    for attempt in range(_MOD3_GATE_RETRY_ATTEMPTS):
+        attempts = attempt + 1
+        if not _bargein_user_recording():
+            with _gate_hold_streak_lock:
+                _gate_hold_streak[streak_key] = 0
+            return {"blocked": False, "attempts": attempts, "held_count": 0}
+        if attempt < _MOD3_GATE_RETRY_ATTEMPTS - 1:
+            time.sleep(_MOD3_GATE_RETRY_INTERVAL_SEC)
+
+    with _gate_hold_streak_lock:
+        _gate_hold_streak[streak_key] = _gate_hold_streak.get(streak_key, 0) + 1
+        held_count = _gate_hold_streak[streak_key]
+
+    return {"blocked": True, "attempts": attempts, "held_count": held_count}
+
+
+def _start_speech(
+    text: str,
+    voice: str,
+    stream: bool = True,
+    streaming_interval: float = 1.0,
+    speed: float = 1.0,
+    emotion: float = 0.5,
+    session_id: str | None = None,
+    ref_audio: str | None = None,
+) -> tuple[str, int]:
+    """Submit speech to the queue. Returns (job_id, queue_position).
+
+    queue_position is 0 if playing immediately, >0 if queued behind others.
+
+    When ``session_id`` is provided, the job is tagged with it so the drain
+    thread can live-resolve the session's preferred output device before
+    playback. Voice selection still uses the explicit ``voice`` argument —
+    callers should pass the session's assigned_voice when registering a job
+    against a session.
+    """
+    job_id = uuid.uuid4().hex[:8]
+    _jobs[job_id] = {
+        "type": "speak",
+        "status": "queued",
+        "engine": None,
+        "voice": voice,
+        "text": text[:100],
+        "full_text": text,
+        "submitted_time": time.time(),
+        "start_time": None,
+        "end_time": None,
+        "metrics": None,
+        "error": None,
+        "player": None,
+        "speed": speed,
+        "estimated_duration_sec": round(_estimate_duration_sec(text, speed), 1),
+        "session_id": session_id,
+    }
+    _prune_jobs()
+
+    entry = {
+        "text": text,
+        "voice": voice,
+        "stream": stream,
+        "streaming_interval": streaming_interval,
+        "speed": speed,
+        "emotion": emotion,
+    }
+    if session_id:
+        entry["session_id"] = session_id
+    if ref_audio:
+        entry["ref_audio"] = ref_audio
+    position = _speech_queue.enqueue(job_id, entry)
+    return job_id, position
+
+
+# ---------------------------------------------------------------------------
+# MCP Tools
+# ---------------------------------------------------------------------------
+
+
+def _get_currently_playing_info() -> dict | None:
+    """Return info about the currently playing job, or None if idle."""
+    with _current_player_lock:
+        if _current_player is None:
+            return None
+
+    active_id = _speech_queue.active_job_id
+    if active_id is None:
+        return None
+
+    job = _jobs.get(active_id)
+    if job is None or job["status"] != "speaking":
+        return None
+
+    start_time = job.get("start_time")
+    elapsed = round(time.time() - start_time, 1) if start_time else 0.0
+    estimated = job.get("estimated_duration_sec", 0.0)
+    remaining = max(0.0, round(estimated - elapsed, 1))
+
+    return {
+        "job_id": active_id,
+        "text_preview": job.get("text", "")[:50],
+        "elapsed_sec": elapsed,
+        "remaining_sec": remaining,
+    }
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def speak(
+    text: str,
+    voice: str = "bm_lewis",
+    stream: bool = True,
+    speed: float = 1.25,
+    emotion: float = 0.5,
+    session_id: str = "",
+    ref_audio: str = "",
+) -> str:
+    """Synthesize text to speech and play it through the user's speakers.
+
+    Non-blocking: returns immediately with a job ID while audio plays or is
+    queued. If nothing is playing, starts immediately. If audio is already
+    playing, the new request is queued and will play automatically when the
+    current item finishes.
+
+    The response always includes the current queue state so the agent knows
+    exactly what's happening on the output channel without a separate status call.
+
+    Args:
+        text: The text to speak aloud. Keep it conversational.
+        voice: Voice preset. Use list_voices() to see options.
+               Defaults to "bm_lewis" (Kokoro).
+        stream: If True, plays audio chunks as they generate (lower latency).
+                If False, generates all audio first then plays (better prosody).
+        speed: Speed multiplier (engines with speed support). Default 1.25.
+        emotion: Emotion/exaggeration intensity 0.0-1.0 (Chatterbox only). Default 0.5.
+        session_id: Optional ADR-082 session id. When provided and the session
+                    is registered (see register_session), the job is routed
+                    through the per-session queue and the session's assigned
+                    voice + preferred_output_device are used. When empty,
+                    falls back to today's global-queue behavior for backward
+                    compatibility.
+    """
+    if not text.strip():
+        return json.dumps({"status": "error", "error": "Nothing to say"})
+
+    # Route through the session registry when session_id is provided.
+    # If the session is registered, its assigned_voice overrides the ``voice``
+    # argument unless the caller explicitly passed a non-default voice — the
+    # ADR treats voice as a session identity attribute, not a per-call knob.
+    effective_session_id: str | None = session_id or None
+    if effective_session_id:
+        registry = get_default_registry()
+        session = registry.get(effective_session_id)
+        if session is None:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": f"session '{effective_session_id}' is not registered — call register_session first",
+                }
+            )
+        # If caller did not pass an explicit non-default voice, use the
+        # session's assigned voice. "bm_lewis" is the old default so we can't
+        # distinguish "explicit bm_lewis" from "unspecified"; tolerate that
+        # and only override when the caller asks for the default.
+        if voice == "bm_lewis" and session.assigned_voice != "bm_lewis":
+            voice = session.assigned_voice
+        session.state = "speaking"
+
+    # Check if user is currently speaking (barge-in signal file). Retries
+    # with backoff (see check_bargein_gate) before giving up — a real
+    # utterance usually clears within a few seconds, and VAD can
+    # false-positive on background noise, so a single "recording" reading
+    # must not be terminal (see flight-review.md §5 fix 6).
+    user_state = "idle"
+    gate = check_bargein_gate(streak_key=effective_session_id or "default")
+    if gate["blocked"]:
+        user_state = "recording"
+
+    # If the user is still (apparently) recording after the retry budget is
+    # exhausted, don't play over them — but never drop the request silently.
+    # We intentionally do NOT enqueue the job or create a _jobs entry, because
+    # a "held" job in the queue becomes a zombie: the drain thread tries to play
+    # it immediately (ignoring the hold), and if anything goes wrong the job
+    # can't be cleared by stop().
+    if user_state == "recording":
+        est_duration = _estimate_duration_sec(text, speed)
+        return json.dumps(
+            {
+                "status": "held",
+                "reason": ("User is currently speaking — re-send this speak() call after user finishes."),
+                "user_state": "recording",
+                "estimated_duration_sec": round(est_duration, 1),
+                "gate_attempts": gate["attempts"],
+                "held_count": gate["held_count"],
+                "escalation": (
+                    f"Audio has been held {gate['held_count']} time(s) in a row for this "
+                    "session — VAD may be false-positiving on background noise rather than "
+                    "detecting real speech. If this keeps happening, voice output is being "
+                    "silently suppressed; consider falling back to text or checking the mic."
+                    if gate["held_count"] >= 2
+                    else None
+                ),
+            }
+        )
+
+    try:
+        job_id, position = _start_speech(
+            text,
+            voice,
+            stream=stream,
+            speed=speed,
+            emotion=emotion,
+            session_id=effective_session_id,
+            ref_audio=ref_audio or None,
+        )
+    except ValueError as e:
+        return json.dumps({"status": "error", "error": str(e)})
+    except Exception as e:
+        return json.dumps({"status": "error", "error": str(e)})
+
+    # If position is 0 and nothing else was playing, it starts immediately
+    currently_playing = _get_currently_playing_info()
+
+    if currently_playing is None or currently_playing["job_id"] == job_id:
+        # Playing immediately (no queue ahead)
+        result = {"status": "speaking", "job_id": job_id}
+        return json.dumps(result)
+
+    # Something is already playing — return enriched queue status
+    queue_snapshot = _speech_queue.get_queue_snapshot()
+    queue_ahead = []
+    for entry in queue_snapshot:
+        qid = entry["job_id"]
+        if qid == job_id:
+            break  # don't include self or anything after self
+        qjob = _jobs.get(qid)
+        est = qjob.get("estimated_duration_sec", 0.0) if qjob else 0.0
+        preview = qjob.get("text", "")[:50] if qjob else entry.get("text", "")[:50]
+        queue_ahead.append(
+            {
+                "job_id": qid,
+                "text_preview": preview,
+                "estimated_sec": est,
+            }
+        )
+
+    # Compute estimated wait: remaining on current + all queued ahead
+    wait = currently_playing.get("remaining_sec", 0.0)
+    for item in queue_ahead:
+        wait += item.get("estimated_sec", 0.0)
+    wait = round(wait, 1)
+
+    # The queue_position as seen by the user: 1-indexed position in the
+    # overall playback order (1 = next after currently playing)
+    queue_position = len(queue_ahead) + 1
+
+    result = {
+        "status": "queued",
+        "job_id": job_id,
+        "queue_position": queue_position,
+        "currently_playing": currently_playing,
+        "queue_ahead": queue_ahead,
+        "estimated_wait_sec": wait,
+        "actions": (
+            f"To cancel this queued item, call stop(job_id='{job_id}'). "
+            "To cancel all and speak immediately, call stop() then speak()."
+        ),
+    }
+    if user_state != "idle":
+        result["user_state"] = user_state
+    return json.dumps(result)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def speech_status(job_id: str = "", verbose: bool = False) -> str:
+    """Check status of a speech job, or get the most recent result.
+
+    Always includes queue state so the agent has full output channel awareness.
+
+    Args:
+        job_id: The job ID returned by speak(). If empty, returns the latest job.
+        verbose: If True, include per-chunk metrics. Default False (summary only).
+    """
+    if not job_id:
+        if not _jobs:
+            return json.dumps({"status": "idle", "message": "No speech jobs", "queue_depth": 0})
+        job_id = next(reversed(_jobs))
+
+    job = _jobs.get(job_id)
+    if not job:
+        return json.dumps({"status": "error", "error": f"Unknown job '{job_id}'"})
+
+    result = {"job_id": job_id, "status": job["status"]}
+    if job["status"] == "speaking":
+        start = job.get("start_time")
+        if start:
+            result["elapsed_sec"] = round(time.time() - start, 1)
+    elif job["status"] == "queued":
+        # Find this job's position in the queue
+        queue_snapshot = _speech_queue.get_queue_snapshot()
+        for i, entry in enumerate(queue_snapshot):
+            if entry["job_id"] == job_id:
+                result["queue_position"] = i + 1
+                break
+    if job.get("metrics"):
+        metrics = job["metrics"]
+        if not verbose and "chunks" in metrics:
+            chunks = metrics["chunks"]["per_chunk"]
+            rtfs = [c["rtf"] for c in chunks if c.get("rtf")]
+            metrics = {
+                **metrics,
+                "chunks": {
+                    "count": metrics["chunks"]["count"],
+                    "avg_rtf": round(sum(rtfs) / len(rtfs), 2) if rtfs else 0,
+                    "min_rtf": round(min(rtfs), 2) if rtfs else 0,
+                },
+            }
+        result["metrics"] = metrics
+    if job.get("error"):
+        result["error"] = job["error"]
+
+    # Always include queue state
+    currently_playing = _get_currently_playing_info()
+    queue_depth = _speech_queue.depth
+    result["queue"] = {
+        "depth": queue_depth,
+        "currently_playing": currently_playing,
+    }
+
+    return json.dumps(result)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def stop(job_id: str = "") -> str:
+    """Stop current speech or cancel a specific queued item.
+
+    Args:
+        job_id: If provided, cancels that specific queued job (not yet playing).
+                If the job_id is the currently playing job, interrupts playback.
+                If empty, interrupts current playback AND clears the entire queue.
+    """
+    if job_id:
+        # Try to cancel a specific queued (not yet playing) job
+        if _speech_queue.cancel(job_id):
+            if job_id in _jobs:
+                _jobs[job_id]["status"] = "cancelled"
+                _jobs[job_id]["end_time"] = time.time()
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "message": f"Cancelled queued job '{job_id}'",
+                    "queue_depth": _speech_queue.depth,
+                }
+            )
+
+        # Check if it's the currently playing job
+        active = _speech_queue.active_job_id
+        if active == job_id:
+            with _current_player_lock:
+                player = _current_player
+            if player is not None:
+                # Route through pipeline_state.interrupt() (not a bare
+                # player.flush()) so the generation loop's interrupt callback
+                # fires and the job finalizes as "interrupted" with partial
+                # metrics instead of grinding through the rest of the text
+                # unheard — see the 2026-07-23 barge-in-finalization fix in
+                # _run_speech_job. Falls back to a direct flush if
+                # pipeline_state didn't think anything was speaking (a rare
+                # timing edge case) so a manual stop() always silences audio.
+                if pipeline_state.interrupt(reason="manual_stop") is None:
+                    player.flush()
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "message": f"Interrupted playing job '{job_id}'",
+                    "queue_depth": _speech_queue.depth,
+                }
+            )
+
+        # Job exists but already done
+        if job_id in _jobs:
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "message": f"Job '{job_id}' already finished (status: {_jobs[job_id]['status']})",
+                }
+            )
+
+        return json.dumps({"status": "error", "error": f"Unknown job '{job_id}'"})
+
+    # No job_id: stop everything — interrupt current + clear queue
+    cleared = _speech_queue.cancel_all_queued()
+    # Mark all cleared queued and held jobs as cancelled
+    for jid, jdata in _jobs.items():
+        if jdata["status"] in ("queued", "held"):
+            jdata["status"] = "cancelled"
+            jdata["end_time"] = time.time()
+
+    with _current_player_lock:
+        player = _current_player
+    if player is None and cleared == 0:
+        return json.dumps({"status": "ok", "message": "Nothing playing"})
+
+    if player is not None:
+        # See the comment above for why this goes through pipeline_state
+        # rather than a bare player.flush().
+        if pipeline_state.interrupt(reason="manual_stop") is None:
+            player.flush()
+
+    parts = []
+    if player is not None:
+        parts.append("interrupted current playback")
+    if cleared > 0:
+        parts.append(f"cancelled {cleared} queued item{'s' if cleared != 1 else ''}")
+
+    return json.dumps({"status": "ok", "message": "; ".join(parts).capitalize()})
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def vad_check(file_path: str, threshold: float = 0.5) -> str:
+    """Check if an audio file contains speech using Silero VAD.
+
+    Use this before transcription to avoid Whisper hallucinations on
+    silence or ambient noise.
+
+    Args:
+        file_path: Path to a WAV audio file.
+        threshold: Speech probability threshold 0-1 (default 0.5). Higher = stricter.
+    """
+    try:
+        voice_module = _get_voice_module()
+        if voice_module is None or voice_module.gate is None:
+            from vad import detect_speech_file
+
+            result = detect_speech_file(file_path, threshold=threshold)
+            return json.dumps(
+                {
+                    "has_speech": result.has_speech,
+                    "confidence": result.confidence,
+                    "speech_ratio": result.speech_ratio,
+                    "num_segments": result.num_segments,
+                    "total_speech_sec": result.total_speech_sec,
+                    "total_audio_sec": result.total_audio_sec,
+                }
+            )
+
+        raw_audio, sample_rate = _read_wav_as_mono_float32(file_path)
+        with _bus_vad_lock:
+            previous_threshold = getattr(voice_module.gate, "threshold", threshold)
+            voice_module.gate.threshold = threshold
+            gate_result = voice_module.gate.check(raw_audio, sample_rate=sample_rate, sample_width=4)
+            _bus.perceive(
+                raw_audio,
+                modality=ModalityType.VOICE,
+                channel="mcp:vad_check",
+                sample_rate=sample_rate,
+                sample_width=4,
+                transcript="speech detected",
+            )
+            voice_module.gate.threshold = previous_threshold
+
+        return json.dumps(
+            {
+                "has_speech": gate_result.passed,
+                "confidence": gate_result.confidence,
+                "speech_ratio": gate_result.metadata.get("speech_ratio", 0.0),
+                "num_segments": gate_result.metadata.get("num_segments", 0),
+                "total_speech_sec": gate_result.metadata.get("total_speech_sec", 0.0),
+                "total_audio_sec": gate_result.metadata.get("total_audio_sec", 0.0),
+            }
+        )
+    except Exception as e:
+        return json.dumps({"status": "error", "error": str(e)})
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def list_voices() -> str:
+    """List all available voice presets grouped by engine."""
+    if _get_voice_module() is None:
+        logger.warning("list_voices called without a registered bus voice module")
+
+    models = _model_registry()
+    lines = []
+    for engine, cfg in models.items():
+        extras = []
+        if cfg.get("supports_speed"):
+            extras.append("speed")
+        if cfg.get("supports_exaggeration"):
+            extras.append("emotion")
+        if cfg.get("supports_pitch"):
+            extras.append("pitch")
+        tag = f" ({', '.join(extras)})" if extras else ""
+        lines.append(f"  {engine}{tag}: {', '.join(cfg['voices'])}")
+    return "Available voices:\n" + "\n".join(lines)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+def await_voice_input(timeout_sec: float = 180.0) -> str:
+    """Block until the user finishes a SuperWhisper recording, then return the transcript.
+
+    This closes the voice input loop: instead of waiting for the user to paste
+    their transcribed text, you can directly receive what they said. Use this
+    when speak() returns "held" (user is recording) or when you want to listen
+    for the next voice input.
+
+    Single wait path: ``BargeinRegistry.wait_for_event("user_speaking_end", ...)``.
+    Out-of-process producers (``integrations/bargein-producer.py``) write to
+    ``/tmp/mod3-barge-in.json``; the module-level ``_bargein_watcher`` bridges
+    those writes into the registry as synthetic events, so both in-process
+    and out-of-process sources funnel through one wait.
+
+    After the wait unblocks, reads the transcript from SuperWhisper's
+    recordings directory (meta.json) or SQLite DB as a fallback.
+
+    Args:
+        timeout_sec: Maximum seconds to wait for recording to finish. Default 180 (3 minutes).
+    """
+    import sqlite3 as _sqlite3
+
+    _sw_db = os.path.expanduser("~/Library/Application Support/SuperWhisper/database/superwhisper.sqlite")
+    _rec_dir = os.environ.get(
+        "MOD3_SUPERWHISPER_RECORDINGS_DIR",
+        os.path.expanduser("~/Documents/superwhisper/recordings"),
+    )
+
+    event = _bargein_registry.wait_for_event("user_speaking_end", timeout=timeout_sec)
+    if event is None:
+        return json.dumps({"status": "timeout", "error": f"No recording completed within {timeout_sec}s"})
+
+    # Recording finished — find the latest transcript
+    # Method 1: Check the most recent recording folder's meta.json
+    try:
+        folders = sorted(
+            [d for d in os.listdir(_rec_dir) if d.isdigit()],
+            key=int,
+            reverse=True,
+        )
+        if folders:
+            meta_path = os.path.join(_rec_dir, folders[0], "meta.json")
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                raw = meta.get("rawResult", "").strip()
+                result = meta.get("result", raw).strip()
+                duration_ms = meta.get("duration", 0)
+                return json.dumps(
+                    {
+                        "status": "ok",
+                        "transcript": result if result else raw,
+                        "raw_transcript": raw,
+                        "duration_sec": round(duration_ms / 1000, 1),
+                        "folder": folders[0],
+                        "source": "superwhisper",
+                    }
+                )
+    except Exception as e:
+        logger.warning("await_voice_input meta.json fallback failed: %s", e)
+
+    # Method 2: Query SuperWhisper SQLite DB
+    try:
+        conn = _sqlite3.connect(f"file:{_sw_db}?mode=ro", uri=True, timeout=2.0)
+        row = conn.execute("SELECT folderName, duration FROM recording ORDER BY datetime DESC LIMIT 1").fetchone()
+        conn.close()
+        if row:
+            folder_name, duration = row
+            meta_path = os.path.join(_rec_dir, folder_name, "meta.json")
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                raw = meta.get("rawResult", "").strip()
+                result = meta.get("result", raw).strip()
+                return json.dumps(
+                    {
+                        "status": "ok",
+                        "transcript": result if result else raw,
+                        "raw_transcript": raw,
+                        "duration_sec": round(duration / 1000, 1),
+                        "folder": folder_name,
+                        "source": "superwhisper_db",
+                    }
+                )
+    except Exception as e:
+        logger.warning("await_voice_input DB fallback failed: %s", e)
+
+    return json.dumps({"status": "error", "error": "Could not retrieve transcript"})
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def diagnostics() -> str:
+    """Return engine state and last generation metrics for debugging."""
+    engine_module, engine_error = _try_engine_module()
+    models = engine_module.MODELS if engine_module is not None else _MODEL_REGISTRY
+    loaded_engines = engine_module.get_loaded_engines() if engine_module is not None else []
+    engines = {}
+    for name, cfg in models.items():
+        engines[name] = {
+            "loaded": name in loaded_engines,
+            "model_id": cfg["id"],
+            "voices": len(cfg["voices"]),
+        }
+    info = {
+        "engines": engines,
+        "bus": {
+            "health": _bus.health(),
+            "hud": _bus.hud(),
+        },
+        "active_jobs": sum(1 for j in _jobs.values() if j["status"] == "speaking"),
+        "queued_jobs": sum(1 for j in _jobs.values() if j["status"] == "queued"),
+        "total_jobs": len(_jobs),
+        "queue_depth": _speech_queue.depth,
+        "output_device": _output_device,
+        "last_metrics": _last_metrics,
+    }
+    if engine_error is not None:
+        info["engine_import_error"] = str(engine_error)
+    return json.dumps(info, indent=2)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def set_output_device(device: str = "") -> str:
+    """List audio output devices, or set the active one.
+
+    Args:
+        device: Device index (e.g. "3"), name substring (e.g. "AirPods"),
+                or "default" to track the system default automatically.
+                If empty, lists available devices without changing anything.
+    """
+    import sounddevice as sd
+
+    global _output_device
+
+    outputs = []
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_output_channels"] > 0:
+            is_default = i == sd.default.device[1]
+            is_active = (
+                (_output_device is None and is_default)
+                or _output_device == i
+                or (isinstance(_output_device, str) and _output_device in d["name"])
+            )
+            outputs.append({"index": i, "name": d["name"], "active": is_active, "default": is_default})
+
+    if not device:
+        lines = [
+            f"  [{'*' if d['active'] else ' '}] {d['index']}: {d['name']}{' (system default)' if d['default'] else ''}"
+            for d in outputs
+        ]
+        return "Audio output devices (* = active):\n" + "\n".join(lines)
+
+    if device.lower() == "default":
+        _output_device = None
+        return json.dumps(
+            {"status": "ok", "device": "system_default", "note": "Now tracking system default output device"}
+        )
+
+    if device.isdigit():
+        _output_device = int(device)
+    else:
+        _output_device = device
+
+    return json.dumps({"status": "ok", "device": _output_device})
+
+
+# ---------------------------------------------------------------------------
+# Session registry (ADR-082 Phase 1)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def register_session(
+    session_id: str,
+    participant_id: str,
+    participant_type: str = "agent",
+    preferred_voice: str = "",
+    preferred_output_device: str = "system-default",
+) -> str:
+    """Register a session with the Mod3 communication bus (ADR-082).
+
+    Each registered session gets its own output queue, an assigned voice
+    from the ranked pool, and a preferred output device. The global
+    serializer interleaves speech across sessions (round-robin by default)
+    so two concurrent agents do not collide on the shared speaker.
+
+    Args:
+        session_id: Caller-chosen id (e.g., the Claude Code session id).
+        participant_id: Identity of the speaker (e.g., 'cog', 'sandy', 'alice').
+        participant_type: 'agent' or 'user'. Free-form beyond that.
+        preferred_voice: Optional voice preset. If taken, voice_conflict=true
+                         is returned but assignment still succeeds.
+        preferred_output_device: 'system-default' (re-queried per playback),
+                                 a device-name substring, or a numeric index.
+    """
+    registry = get_default_registry()
+    result = registry.register(
+        session_id=session_id,
+        participant_id=participant_id,
+        participant_type=participant_type,
+        preferred_voice=preferred_voice or None,
+        preferred_output_device=preferred_output_device or "system-default",
+    )
+    payload = result.session.to_dict(device_resolver=resolve_output_device)
+    payload["status"] = "ok"
+    payload["created"] = result.created
+    # Also expose a live-resolved device at the top level for convenience —
+    # callers can log or display it without walking nested keys.
+    live = registry.resolve_device(result.session.session_id)
+    payload["output_device"] = live.to_dict()
+    return json.dumps(payload)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def deregister_session(session_id: str) -> str:
+    """Release a session's voice and drop its pending jobs."""
+    registry = get_default_registry()
+    result = registry.deregister(session_id)
+    return json.dumps(result)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+def list_sessions() -> str:
+    """List all registered sessions with live device resolution."""
+    registry = get_default_registry()
+    return json.dumps(
+        {
+            "status": "ok",
+            "sessions": registry.list_serialized(),
+            "serializer": registry.serializer.snapshot(),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dashboard chat pub/sub — symmetric outbound channel (Path B)
+# ---------------------------------------------------------------------------
+
+# Thread-safe set of (asyncio.Queue, asyncio.AbstractEventLoop) pairs.
+# Each /ws/dashboard-chat subscriber registers a queue here; mod3_dashboard_post
+# fans out to all live queues. Registration/unregistration happen on the event
+# loop thread (WS accept/close); broadcast happens from any thread via
+# run_coroutine_threadsafe.
+_dashboard_chat_lock = threading.Lock()
+_dashboard_chat_queues: list[tuple[asyncio.Queue, asyncio.AbstractEventLoop]] = []
+
+
+def _dashboard_chat_register(q: asyncio.Queue, loop: asyncio.AbstractEventLoop) -> None:
+    with _dashboard_chat_lock:
+        _dashboard_chat_queues.append((q, loop))
+
+
+def _dashboard_chat_unregister(q: asyncio.Queue) -> None:
+    with _dashboard_chat_lock:
+        _dashboard_chat_queues[:] = [(sq, sl) for (sq, sl) in _dashboard_chat_queues if sq is not q]
+
+
+def _dashboard_chat_broadcast(message: dict) -> int:
+    """Fan the message out to all registered subscribers. Returns delivery count."""
+    with _dashboard_chat_lock:
+        snapshot = list(_dashboard_chat_queues)
+    delivered = 0
+    dead: list[asyncio.Queue] = []
+    for q, loop in snapshot:
+        try:
+            asyncio.run_coroutine_threadsafe(q.put(message), loop)
+            delivered += 1
+        except Exception:  # noqa: BLE001 — dead loop, remove on next iteration
+            dead.append(q)
+    if dead:
+        with _dashboard_chat_lock:
+            _dashboard_chat_queues[:] = [(sq, sl) for (sq, sl) in _dashboard_chat_queues if sq not in dead]
+    return delivered
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+def output(
+    text: str,
+    mode: str = "audio",
+    stream: bool = True,
+    session_id: str = "",
+    voice: str = "bm_lewis",
+    speed: float = 1.25,
+    emotion: float = 0.5,
+) -> str:
+    """Unified output tool — route text to audio, text chat, or both.
+
+    Use this as the primary output surface. Pick mode based on content type:
+      - mode="audio"  — synthesize and play via TTS (conversational replies)
+      - mode="text"   — send to the dashboard chat panel (code, lists, links)
+      - mode="both"   — TTS audio AND dashboard chat bubble simultaneously
+
+    Args:
+        text:       The content to output. Required.
+        mode:       Delivery mode: "audio" | "text" | "both". Default "audio".
+        stream:     For audio: stream chunks as generated (True, lower latency)
+                    or generate fully then play (False, better prosody). Default True.
+        session_id: Optional ADR-082 session id for session-scoped routing.
+        voice:      TTS voice preset (audio modes only). Default "bm_lewis".
+        speed:      TTS speed multiplier (engines that support it). Default 1.25.
+        emotion:    TTS emotion/exaggeration 0.0–1.0 (Chatterbox only). Default 0.5.
+
+    Returns a JSON object with "status" and mode-specific fields.
+    When mode="both", includes both "audio" and "text" result blocks.
+    """
+    if not text.strip():
+        return json.dumps({"status": "error", "error": "text must not be empty"})
+
+    valid_modes = {"audio", "text", "both"}
+    if mode not in valid_modes:
+        return json.dumps({"status": "error", "error": f"mode must be one of {sorted(valid_modes)}, got {mode!r}"})
+
+    results: dict = {"status": "ok", "mode": mode}
+
+    # ── Text path ─────────────────────────────────────────────────────────────
+    if mode in ("text", "both"):
+        message = {
+            "type": "chat",
+            "role": "assistant",
+            "text": text,
+            "session_id": session_id or "",
+        }
+        delivered = _dashboard_chat_broadcast(message)
+        results["text"] = {
+            "status": "ok",
+            "delivered_to": delivered,
+            "text_preview": text[:80],
+        }
+
+    # ── Audio path ────────────────────────────────────────────────────────────
+    if mode in ("audio", "both"):
+        # Reuse the speak() logic directly so session routing, hold-detection,
+        # and queue state all apply identically.
+        speak_raw = speak(
+            text=text,
+            voice=voice,
+            stream=stream,
+            speed=speed,
+            emotion=emotion,
+            session_id=session_id,
+        )
+        try:
+            speak_result = json.loads(speak_raw)
+        except Exception:
+            speak_result = {"raw": speak_raw}
+        results["audio"] = speak_result
+
+        # Propagate error status if audio failed and we're not also delivering text
+        if speak_result.get("status") == "error" and mode == "audio":
+            results["status"] = "error"
+            results["error"] = speak_result.get("error", "audio error")
+
+    return json.dumps(results)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+def send_text(
+    content: str,
+    session_id: str = "",
+    role: str = "assistant",
+) -> str:
+    """[DEPRECATED] Send text to the dashboard chat panel.
+
+    Deprecated: use output(text=..., mode="text") instead.
+    This alias is preserved for backwards compatibility and will be removed
+    in a future release.
+    """
+    import warnings as _warnings
+
+    _warnings.warn(
+        "send_text() is deprecated — use output(text=..., mode='text') instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    logger.warning("send_text() called — deprecated, use output(text=..., mode='text')")
+    return mod3_dashboard_post(text=content, session_id=session_id, role=role)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+def mod3_dashboard_post(
+    text: str,
+    session_id: str = "",
+    role: str = "assistant",
+) -> str:
+    """Send response text from Claude Code to the mod3 dashboard chat panel.
+
+    This is the symmetric outbound path (Path B): while speak() routes text
+    through TTS to the speaker, mod3_dashboard_post routes text directly to
+    the dashboard's visual chat panel so the user can read Claude's reply in
+    real time without waiting for audio synthesis.
+
+    All connected /ws/dashboard-chat subscribers receive a JSON frame:
+      {"type": "chat", "role": <role>, "text": <text>, "session_id": <sid>}
+
+    Args:
+        text: The message text to display in the chat panel.
+        session_id: Optional session identifier for multi-session tracking.
+                    Defaults to empty string (global broadcast).
+        role: Speaker role tag rendered in the UI. Defaults to "assistant".
+    """
+    if not text.strip():
+        return json.dumps({"status": "error", "error": "text must not be empty"})
+
+    message = {
+        "type": "chat",
+        "role": role,
+        "text": text,
+        "session_id": session_id or "",
+    }
+    delivered = _dashboard_chat_broadcast(message)
+    return json.dumps(
+        {
+            "status": "ok",
+            "delivered_to": delivered,
+            "role": role,
+            "text_preview": text[:80],
+        }
+    )

@@ -34,6 +34,7 @@ import logging
 import os
 import signal
 import struct
+import sys
 import time
 import uuid
 import wave
@@ -232,7 +233,7 @@ app = FastAPI(
 
 
 try:
-    from server import _bus as _shared_bus
+    from jobs_registry import _bus as _shared_bus
 except Exception:
     _shared_bus = ModalityBus()
 
@@ -1101,16 +1102,23 @@ async def transcribe_audio(file: UploadFile):
 # ---------------------------------------------------------------------------
 #
 # Two registries feed this: this module's own _jobs (above — /v1/synthesize,
-# /v1/audio/speech, /v1/vad, recorded via _record_job) and server.py's
-# queue-based _jobs (/v1/speak, via _start_speech; server.py doubles as the
-# MCP process, which is why it tracks its own jobs for speech_status()).
-# Before this, GET /v1/jobs and /v1/jobs/{id} only ever looked at the former,
-# so a job launched via /v1/speak — the only endpoint that actually plays
-# audio — was always "not found", even mid-playback. Both are merged here.
+# /v1/audio/speech, /v1/vad, recorded via _record_job) and jobs_registry's
+# queue-based _jobs (/v1/speak, via _start_speech; also the registry the MCP
+# tools speak()/speech_status()/diagnostics() use — see jobs_registry.py's
+# module docstring for why this lives in a module neither server.py nor
+# http_api.py doubles as an entrypoint for). Before this, GET /v1/jobs and
+# /v1/jobs/{id} only ever looked at the former, so a job launched via
+# /v1/speak — the only HTTP endpoint that actually plays audio — was always
+# "not found", even mid-playback. Both are merged here.
+
+try:
+    from jobs_registry import _jobs as _speak_jobs
+except ImportError:
+    _speak_jobs = {}
 
 
 def _speak_job_view(job_id: str, job: dict) -> dict:
-    """JSON-safe view of one server.py (/v1/speak) job entry.
+    """JSON-safe view of one jobs_registry (/v1/speak) job entry.
 
     Drops the live `player` (an AdaptivePlayer instance — not serializable
     and not part of the HTTP contract); everything else, including the
@@ -1123,16 +1131,7 @@ def _speak_job_view(job_id: str, job: dict) -> dict:
 
 
 def _speak_jobs_snapshot() -> list[dict]:
-    """Recent /v1/speak jobs from server.py's queue-based registry.
-
-    Returns [] in HTTP-only mode, where server.py (and its MCP/audio deps)
-    isn't importable — same guard used elsewhere in this file for the
-    queue-aware endpoints.
-    """
-    try:
-        from server import _jobs as _speak_jobs
-    except ImportError:
-        return []
+    """Recent /v1/speak jobs from jobs_registry's queue-based registry."""
     return [_speak_job_view(jid, job) for jid, job in _speak_jobs.items()]
 
 
@@ -1140,7 +1139,7 @@ def _speak_jobs_snapshot() -> list[dict]:
 def list_jobs(limit: int = 20, type: str = ""):
     """List recent generation jobs with metrics. Optionally filter by type.
 
-    Merges this module's job ledger with server.py's /v1/speak registry
+    Merges this module's job ledger with jobs_registry's /v1/speak registry
     (see the module note above), newest first by whichever request
     timestamp each entry carries.
     """
@@ -1161,10 +1160,6 @@ def get_job(job_id: str):
     if job:
         return job
 
-    try:
-        from server import _jobs as _speak_jobs
-    except ImportError:
-        _speak_jobs = {}
     speak_job = _speak_jobs.get(job_id)
     if speak_job:
         return _speak_job_view(job_id, speak_job)
@@ -1669,7 +1664,7 @@ def stop_speech(job_id: str = ""):
     Returns interruption context for barge-in support.
     """
     try:
-        from server import _speech_queue, pipeline_state
+        from jobs_registry import _speech_queue, pipeline_state
 
         if job_id:
             cancelled = _speech_queue.cancel(job_id)
@@ -1735,7 +1730,7 @@ def speak_enqueue(req: SpeakRequest):
     if not req.text.strip():
         return JSONResponse(status_code=400, content={"error": "text required"})
     try:
-        from server import _start_speech, check_bargein_gate
+        from jobs_registry import _start_speech, check_bargein_gate
 
         gate = check_bargein_gate(streak_key=req.session_id or "default")
         if gate["blocked"]:
@@ -2409,13 +2404,13 @@ async def dashboard_chat_post(request: Request):
     # and trigger an echo loop.
     originating_seat = body.get("seat_id") or None
 
-    # Fan to WebSocket dashboard-chat subscribers (existing server.py mechanism)
+    # Fan to WebSocket dashboard-chat subscribers (jobs_registry mechanism)
     try:
-        from server import _dashboard_chat_broadcast
+        from jobs_registry import _dashboard_chat_broadcast
 
         _dashboard_chat_broadcast({"type": "chat", "role": role, "text": text, "session_id": session_id})
     except (ImportError, AttributeError):
-        logger.debug("_dashboard_chat_broadcast not available (server.py not loaded or renamed)")
+        logger.debug("_dashboard_chat_broadcast not available (jobs_registry not loaded or renamed)")
 
     # Also fan to any seat SSE streams in the session, skipping the sender.
     if session_id:
@@ -2719,10 +2714,18 @@ def capabilities():
 
 @app.get("/diagnostics")
 def diagnostics():
-    """Diagnostics snapshot with bus state."""
+    """Diagnostics snapshot with bus state.
+
+    "jobs" combines this module's own ledger (/v1/synthesize, /v1/audio/speech,
+    /v1/vad) with jobs_registry's /v1/speak registry — previously this only
+    ever reported the former, so a job actually playing via /v1/speak showed
+    up here as {"total": 0} even while GET /v1/jobs/{id} found it.
+    """
     with _jobs_lock:
-        total = len(_jobs)
-        active = sum(1 for j in _jobs.values() if j.get("status") in ("generating", "processing"))
+        native_jobs = list(_jobs.values())
+    all_jobs = native_jobs + list(_speak_jobs.values())
+    total = len(all_jobs)
+    active = sum(1 for j in all_jobs if j.get("status") in ("generating", "processing", "speaking", "queued"))
     return {
         "engines_loaded": get_loaded_engines(),
         "vad_loaded": vad_loaded(),
@@ -2733,6 +2736,18 @@ def diagnostics():
         "bus": {
             "health": _bus.health(),
             "hud": _bus.hud(),
+        },
+        "topology": {
+            # In production server.py runs as __main__; jobs_registry.py is the
+            # neutral module that both it and http_api.py import from, so it
+            # is only ever imported once. If "server" ever shows up as its own
+            # key in sys.modules, something (re-)introduced a lazy `from
+            # server import ...` somewhere reachable at runtime — that used to
+            # silently re-execute server.py's entire module body a second
+            # time, with its own job registry, speech queue, and barge-in
+            # watcher thread (2026-07-23 incident; see jobs_registry.py's
+            # module docstring). Should always be False.
+            "server_reimported": "server" in sys.modules,
         },
     }
 
@@ -3498,7 +3513,7 @@ async def ws_dashboard_chat(websocket: WebSocket):
     Client → server frames are not processed in v0. The connection stays open
     until the client disconnects; no heartbeat is required.
     """
-    from server import (
+    from jobs_registry import (
         _dashboard_chat_register,
         _dashboard_chat_unregister,
     )

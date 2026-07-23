@@ -21,8 +21,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from conftest import HAS_MCP  # noqa: E402
 
-# Marker for tests that call @mcp.tool()-decorated functions on server.
-needs_mcp = pytest.mark.skipif(not HAS_MCP, reason="mcp package required for @mcp.tool-decorated server functions")
+# Marker for tests that call @mcp.tool()-decorated functions in jobs_registry.
+needs_mcp = pytest.mark.skipif(
+    not HAS_MCP, reason="mcp package required for @mcp.tool-decorated jobs_registry functions"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +49,7 @@ def client():
 class TestDashboardChatWs:
     def test_connect_and_receive_broadcast(self, client):
         """Connecting to /ws/dashboard-chat and broadcasting should deliver the frame."""
-        from server import _dashboard_chat_broadcast
+        from jobs_registry import _dashboard_chat_broadcast
 
         received = []
 
@@ -110,7 +112,7 @@ class TestDashboardChatWs:
 class TestMod3DashboardPostTool:
     def test_returns_ok_with_no_subscribers(self):
         """mod3_dashboard_post returns ok even when no WS subscribers are connected."""
-        from server import mod3_dashboard_post
+        from jobs_registry import mod3_dashboard_post
 
         raw = mod3_dashboard_post(text="hello from Claude")
         result = json.loads(raw)
@@ -122,7 +124,7 @@ class TestMod3DashboardPostTool:
 
     def test_empty_text_returns_error(self):
         """mod3_dashboard_post rejects empty text."""
-        from server import mod3_dashboard_post
+        from jobs_registry import mod3_dashboard_post
 
         raw = mod3_dashboard_post(text="   ")
         result = json.loads(raw)
@@ -130,7 +132,7 @@ class TestMod3DashboardPostTool:
 
     def test_custom_role(self):
         """mod3_dashboard_post respects custom role parameter."""
-        from server import mod3_dashboard_post
+        from jobs_registry import mod3_dashboard_post
 
         raw = mod3_dashboard_post(text="user typed this", role="user", session_id="sid-abc")
         result = json.loads(raw)
@@ -139,7 +141,7 @@ class TestMod3DashboardPostTool:
 
     def test_round_trip_via_ws(self, client):
         """Full round-trip: call mod3_dashboard_post, subscriber receives the frame."""
-        from server import mod3_dashboard_post
+        from jobs_registry import mod3_dashboard_post
 
         received = []
         ready = threading.Event()
