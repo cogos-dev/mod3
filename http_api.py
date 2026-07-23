@@ -1099,13 +1099,55 @@ async def transcribe_audio(file: UploadFile):
 # ---------------------------------------------------------------------------
 # Job introspection
 # ---------------------------------------------------------------------------
+#
+# Two registries feed this: this module's own _jobs (above — /v1/synthesize,
+# /v1/audio/speech, /v1/vad, recorded via _record_job) and server.py's
+# queue-based _jobs (/v1/speak, via _start_speech; server.py doubles as the
+# MCP process, which is why it tracks its own jobs for speech_status()).
+# Before this, GET /v1/jobs and /v1/jobs/{id} only ever looked at the former,
+# so a job launched via /v1/speak — the only endpoint that actually plays
+# audio — was always "not found", even mid-playback. Both are merged here.
+
+
+def _speak_job_view(job_id: str, job: dict) -> dict:
+    """JSON-safe view of one server.py (/v1/speak) job entry.
+
+    Drops the live `player` (an AdaptivePlayer instance — not serializable
+    and not part of the HTTP contract); everything else, including the
+    adaptive-buffer fields recorded in `metrics` (initial_buffer_ms,
+    final_buffer_ms, starvation_count), passes through unchanged.
+    """
+    view = {k: v for k, v in job.items() if k != "player"}
+    view["job_id"] = job_id
+    return view
+
+
+def _speak_jobs_snapshot() -> list[dict]:
+    """Recent /v1/speak jobs from server.py's queue-based registry.
+
+    Returns [] in HTTP-only mode, where server.py (and its MCP/audio deps)
+    isn't importable — same guard used elsewhere in this file for the
+    queue-aware endpoints.
+    """
+    try:
+        from server import _jobs as _speak_jobs
+    except ImportError:
+        return []
+    return [_speak_job_view(jid, job) for jid, job in _speak_jobs.items()]
 
 
 @app.get("/v1/jobs")
 def list_jobs(limit: int = 20, type: str = ""):
-    """List recent generation jobs with metrics. Optionally filter by type."""
+    """List recent generation jobs with metrics. Optionally filter by type.
+
+    Merges this module's job ledger with server.py's /v1/speak registry
+    (see the module note above), newest first by whichever request
+    timestamp each entry carries.
+    """
     with _jobs_lock:
-        jobs = list(reversed(_jobs.values()))
+        jobs = list(_jobs.values())
+    jobs.extend(_speak_jobs_snapshot())
+    jobs.sort(key=lambda j: j.get("requested_at") or j.get("submitted_time") or 0, reverse=True)
     if type:
         jobs = [j for j in jobs if j.get("type") == type]
     return {"jobs": jobs[:limit], "total": len(jobs)}
@@ -1113,12 +1155,21 @@ def list_jobs(limit: int = 20, type: str = ""):
 
 @app.get("/v1/jobs/{job_id}")
 def get_job(job_id: str):
-    """Get full details for a specific job."""
+    """Get full details for a specific job, from either registry."""
     with _jobs_lock:
         job = _jobs.get(job_id)
-    if not job:
-        return JSONResponse(status_code=404, content={"error": f"Job '{job_id}' not found"})
-    return job
+    if job:
+        return job
+
+    try:
+        from server import _jobs as _speak_jobs
+    except ImportError:
+        _speak_jobs = {}
+    speak_job = _speak_jobs.get(job_id)
+    if speak_job:
+        return _speak_job_view(job_id, speak_job)
+
+    return JSONResponse(status_code=404, content={"error": f"Job '{job_id}' not found"})
 
 
 # ---------------------------------------------------------------------------

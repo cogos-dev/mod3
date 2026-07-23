@@ -1,10 +1,25 @@
-"""Adaptive audio player with EMA buffering and per-session metrics.
+"""Adaptive audio player with a two-loop pre-playback buffer and per-session metrics.
 
 Adapted from mlx_audio's AudioPlayer but with full instrumentation:
 - Underrun counting (empty buffer during active playback)
 - Per-callback buffer depth tracking
 - TTFA measurement (time from first queued audio to first audible output)
 - Structured PlaybackMetrics returned on completion
+
+Buffer policy (operator-designed, two loops):
+- FEEDFORWARD: initial_buffer_ms is computed once at job start from load
+  signals — primarily mod3's own recent chunk-deficit telemetry (an EMA of
+  synth_time/audio_duration across recently generated chunks, process-wide),
+  optionally corroborated by a timeboxed probe of the LMS lane (GPU
+  contention proxy: Metal is shared between local TTS and a local LLM).
+  See compute_initial_buffer_ms().
+- FEEDBACK: during playback, a true starvation event (buffer empty while
+  the generator is still producing) grows the target buffer for the rest
+  of the utterance and holds output silent until the cushion rebuilds.
+  The target never shrinks mid-utterance. See grow_target_buffer_ms().
+
+The policy math above is pure (inputs -> buffer_ms); AdaptivePlayer's
+runtime wiring only gathers inputs and calls it.
 """
 
 import sys
@@ -13,8 +28,141 @@ from collections import deque
 from dataclasses import dataclass, field
 from threading import Event, Lock
 
+import httpx
 import numpy as np
 import sounddevice as sd
+
+# ---------------------------------------------------------------------------
+# Buffer policy — pure functions (inputs -> buffer_ms). Unit-tested in
+# tests/test_buffer_policy.py; nothing here touches audio hardware or state.
+# ---------------------------------------------------------------------------
+
+# Defaults per the operator's design: quiet/elevated/heavy anchors.
+QUIET_BUFFER_MS = 150.0
+ELEVATED_BUFFER_MS = 500.0
+HEAVY_BUFFER_MS_CAP = 2000.0
+
+# Chunk-deficit EMA anchors (ratio of synth_time to audio_duration). At/below
+# 1.05x synthesis is keeping pace with real time (quiet). 1.3x brackets the
+# measured 1.26x wall-clock cost of one concurrent LMS call sharing Metal
+# with TTS (elevated). At/above 2.0x is clamped at the cap (heavy).
+_QUIET_DEFICIT = 1.05
+_ELEVATED_DEFICIT = 1.3
+_HEAVY_DEFICIT = 2.0
+
+# LMS contention probe (GET /v1/models) — a fast reply means the lane is
+# idle; a slow one corroborates contention already inferred from the
+# deficit EMA. The probe is timeboxed to PROBE_TIMEOUT_MS; a timeout means
+# "assume quiet" (no LMS running is not contention).
+PROBE_BUSY_MS = 50.0
+PROBE_TIMEOUT_MS = 100.0
+_LMS_MODELS_URL = "http://localhost:1234/v1/models"
+
+# Feedback growth increment per starvation event (mid-utterance, monotonic).
+STARVATION_GROWTH_MS = 300.0
+
+
+def _lerp(x: float, x0: float, x1: float, y0: float, y1: float) -> float:
+    """Linearly interpolate y at x within [x0, x1], clamped to [y0, y1]."""
+    if x1 <= x0:
+        return y1
+    t = max(0.0, min(1.0, (x - x0) / (x1 - x0)))
+    return y0 + t * (y1 - y0)
+
+
+def deficit_ema_to_buffer_ms(deficit_ema: float) -> float:
+    """Map the chunk-deficit EMA to a target startup buffer (primary signal).
+
+    Piecewise-linear over the three anchors above: quiet at/under 1.05x
+    realtime, elevated at 1.3x, heavy at/beyond 2.0x.
+    """
+    if deficit_ema <= _QUIET_DEFICIT:
+        return QUIET_BUFFER_MS
+    if deficit_ema <= _ELEVATED_DEFICIT:
+        return _lerp(deficit_ema, _QUIET_DEFICIT, _ELEVATED_DEFICIT, QUIET_BUFFER_MS, ELEVATED_BUFFER_MS)
+    if deficit_ema <= _HEAVY_DEFICIT:
+        return _lerp(deficit_ema, _ELEVATED_DEFICIT, _HEAVY_DEFICIT, ELEVATED_BUFFER_MS, HEAVY_BUFFER_MS_CAP)
+    return HEAVY_BUFFER_MS_CAP
+
+
+def probe_latency_to_buffer_ms(probe_latency_ms: float) -> float:
+    """Map a corroborating LMS-probe latency to a buffer floor (secondary signal)."""
+    if probe_latency_ms <= PROBE_BUSY_MS:
+        return QUIET_BUFFER_MS
+    return _lerp(probe_latency_ms, PROBE_BUSY_MS, PROBE_TIMEOUT_MS, ELEVATED_BUFFER_MS, HEAVY_BUFFER_MS_CAP)
+
+
+def compute_initial_buffer_ms(
+    deficit_ema: float,
+    probe_latency_ms: float | None = None,
+    probe_timed_out: bool = False,
+) -> float:
+    """Feedforward policy: initial_buffer_ms from load signals at job start.
+
+    The primary signal is mod3's own recent chunk-deficit EMA. The optional
+    LMS probe only ever raises the estimate — a timeout (or no probe at all)
+    means "assume quiet", contributing nothing beyond the primary signal.
+    """
+    buffer_ms = deficit_ema_to_buffer_ms(deficit_ema)
+    if probe_timed_out or probe_latency_ms is None:
+        return buffer_ms
+    probe_component = probe_latency_to_buffer_ms(probe_latency_ms)
+    return min(HEAVY_BUFFER_MS_CAP, max(buffer_ms, probe_component))
+
+
+def grow_target_buffer_ms(current_target_ms: float) -> float:
+    """Feedback policy: on drain starvation, grow the target buffer.
+
+    Monotonic non-decreasing (never shrinks mid-utterance), capped at
+    HEAVY_BUFFER_MS_CAP.
+    """
+    return min(HEAVY_BUFFER_MS_CAP, current_target_ms + STARVATION_GROWTH_MS)
+
+
+def probe_lms_contention(
+    url: str = _LMS_MODELS_URL, timeout_sec: float = PROBE_TIMEOUT_MS / 1000.0
+) -> tuple[float | None, bool]:
+    """Best-effort GET latency to the LMS lane, as a contention proxy.
+
+    Returns (latency_ms, timed_out). Any failure — timeout, connection
+    refused, LMS not running — is treated as timed_out=True/latency_ms=None,
+    which compute_initial_buffer_ms() reads as "assume quiet".
+    """
+    start = time.perf_counter()
+    try:
+        with httpx.Client(timeout=timeout_sec) as client:
+            client.get(url)
+        return (time.perf_counter() - start) * 1000.0, False
+    except Exception:  # noqa: BLE001 — probe is best-effort, never fails the job
+        return None, True
+
+
+# ---------------------------------------------------------------------------
+# Cross-job chunk-deficit telemetry — process-wide, feeds the feedforward
+# signal above. Updated once per generated chunk (see AdaptivePlayer.
+# queue_audio); read at the *next* job's start, before any of that job's
+# own chunks have arrived.
+# ---------------------------------------------------------------------------
+
+_DEFICIT_EMA_ALPHA = 0.3
+_deficit_ema = 1.0  # 1.0 = synthesis exactly at realtime; no deficit
+_deficit_ema_lock = Lock()
+
+
+def record_chunk_deficit(synth_time_sec: float, audio_duration_sec: float) -> None:
+    """Update the process-wide chunk-deficit EMA. Called once per chunk."""
+    global _deficit_ema
+    if audio_duration_sec <= 0:
+        return
+    ratio = synth_time_sec / audio_duration_sec
+    with _deficit_ema_lock:
+        _deficit_ema = _DEFICIT_EMA_ALPHA * ratio + (1 - _DEFICIT_EMA_ALPHA) * _deficit_ema
+
+
+def get_deficit_ema() -> float:
+    """Current process-wide chunk-deficit EMA (read at job start)."""
+    with _deficit_ema_lock:
+        return _deficit_ema
 
 
 @dataclass
@@ -40,6 +188,11 @@ class PlaybackMetrics:
     peak_buffer_samples: int = 0
     min_buffer_samples: int = 0
     underrun_count: int = 0
+
+    # Adaptive pre-playback buffer (two-loop policy — see module docstring)
+    initial_buffer_ms: float = 0.0
+    final_buffer_ms: float = 0.0
+    starvation_count: int = 0
 
     # Memory
     peak_memory_gb: float = 0.0
@@ -69,16 +222,19 @@ class PlaybackMetrics:
                 "peak_samples": self.peak_buffer_samples,
                 "min_samples": self.min_buffer_samples,
                 "underruns": self.underrun_count,
+                "initial_buffer_ms": round(self.initial_buffer_ms, 1),
+                "final_buffer_ms": round(self.final_buffer_ms, 1),
+                "starvation_count": self.starvation_count,
             },
             "memory_peak_gb": round(self.peak_memory_gb, 2),
         }
 
 
 class AdaptivePlayer:
-    """Callback-based audio player with EMA-adaptive startup buffering.
+    """Callback-based audio player with a two-loop adaptive pre-playback buffer.
 
     Usage:
-        player = AdaptivePlayer(sample_rate=24000)
+        player = AdaptivePlayer(sample_rate=24000, initial_buffer_ms=150)
         # In a background thread:
         for chunk in generate(...):
             player.queue_audio(chunk_audio, chunk_meta={...})
@@ -87,12 +243,13 @@ class AdaptivePlayer:
         metrics = player.wait()
     """
 
-    # EMA parameters (same as mlx_audio AudioPlayer)
-    EMA_ALPHA = 0.25
-    MEASURE_WINDOW = 0.25  # seconds between rate measurements
-    MIN_BUFFER_SECONDS = 1.5  # startup threshold = arrival_rate * this
-
-    def __init__(self, sample_rate: int = 24_000, buffer_size: int = 2048, device: int | str | None = None):
+    def __init__(
+        self,
+        sample_rate: int = 24_000,
+        buffer_size: int = 2048,
+        device: int | str | None = None,
+        initial_buffer_ms: float | None = None,
+    ):
         self.sample_rate = sample_rate
         self.buffer_size = buffer_size
         self.device = device  # sounddevice output device index or name
@@ -108,10 +265,15 @@ class AdaptivePlayer:
         self._stream_finished = Event()  # set by sounddevice finished_callback
         self._generation_done = False
 
-        # EMA arrival rate tracking
-        self._window_sample_count = 0
-        self._window_start = time.perf_counter()
-        self._arrival_rate = float(sample_rate)  # assume realtime initially
+        # Adaptive pre-playback buffer (operator two-loop policy — see module
+        # docstring). Feedforward: sized once here from recent load signals
+        # (defaults to QUIET_BUFFER_MS if the caller has no signal yet).
+        # Feedback: _target_buffer_ms only ever grows during playback — see
+        # _callback() and grow_target_buffer_ms().
+        self.initial_buffer_ms = QUIET_BUFFER_MS if initial_buffer_ms is None else initial_buffer_ms
+        self._target_buffer_ms = self.initial_buffer_ms
+        self._starvation_count = 0
+        self._rebuffering = False  # True while holding output silent to rebuild the cushion
 
         # Metrics accumulators
         self._first_queue_time: float | None = None
@@ -130,6 +292,10 @@ class AdaptivePlayer:
         # Synchronization: set when mark_done() is called
         self._done_event = Event()
 
+    def _needed_samples(self) -> int:
+        """Sample-count threshold for the current (possibly grown) target buffer."""
+        return int(self.sample_rate * self._target_buffer_ms / 1000.0)
+
     # ------------------------------------------------------------------
     # Callback (runs in audio thread)
     # ------------------------------------------------------------------
@@ -139,18 +305,37 @@ class AdaptivePlayer:
         filled = 0
 
         with self._buffer_lock:
-            while filled < frames and self._buffer:
-                buf = self._buffer[0]
-                to_copy = min(frames - filled, len(buf))
-                outdata[filled : filled + to_copy, 0] = buf[:to_copy]
-                filled += to_copy
-
-                if to_copy == len(buf):
-                    self._buffer.popleft()
-                else:
-                    self._buffer[0] = buf[to_copy:]
-
             current_buffer = sum(map(len, self._buffer))
+
+            # Feedback loop, part 1: if we're rebuilding the cushion after a
+            # starvation event, hold off draining until it's back at target
+            # (or generation finished, so there's nothing left to wait for).
+            if self._rebuffering and (current_buffer >= self._needed_samples() or self._generation_done):
+                self._rebuffering = False
+
+            if not self._rebuffering:
+                while filled < frames and self._buffer:
+                    buf = self._buffer[0]
+                    to_copy = min(frames - filled, len(buf))
+                    outdata[filled : filled + to_copy, 0] = buf[:to_copy]
+                    filled += to_copy
+
+                    if to_copy == len(buf):
+                        self._buffer.popleft()
+                    else:
+                        self._buffer[0] = buf[to_copy:]
+
+                current_buffer = sum(map(len, self._buffer))
+
+            # Feedback loop, part 2: true starvation — buffer empty while the
+            # generator is still producing (not the expected end-of-stream
+            # drain). Grow the target (monotonic — never shrinks
+            # mid-utterance) and start rebuffering instead of continuing to
+            # trickle out chunks one small gap at a time.
+            if filled == 0 and self._playing and not self._generation_done and not self._rebuffering:
+                self._starvation_count += 1
+                self._target_buffer_ms = grow_target_buffer_ms(self._target_buffer_ms)
+                self._rebuffering = True
 
         # Progress tracking (lock-free; only written here in audio thread)
         self._samples_played += filled
@@ -194,15 +379,6 @@ class AdaptivePlayer:
                 self._buffer.append(silence)
                 self._total_queued_samples += len(silence)
 
-        # EMA arrival rate
-        self._window_sample_count += len(samples)
-        if now - self._window_start >= self.MEASURE_WINDOW:
-            elapsed = now - self._window_start
-            inst_rate = self._window_sample_count / elapsed
-            self._arrival_rate = self.EMA_ALPHA * inst_rate + (1 - self.EMA_ALPHA) * self._arrival_rate
-            self._window_sample_count = 0
-            self._window_start = now
-
         with self._buffer_lock:
             self._buffer.append(samples)
             self._total_queued_samples += len(samples)
@@ -218,10 +394,17 @@ class AdaptivePlayer:
             mem = chunk_meta.get("peak_memory_gb", 0.0)
             if mem > self._peak_memory_gb:
                 self._peak_memory_gb = mem
+            # Feed this chunk's synth-vs-realtime ratio into the process-wide
+            # deficit EMA — the primary feedforward signal for the *next*
+            # job's initial_buffer_ms (see compute_initial_buffer_ms).
+            gen_time_sec = chunk_meta.get("gen_time_sec")
+            if gen_time_sec is not None and len(samples):
+                record_chunk_deficit(gen_time_sec, len(samples) / self.sample_rate)
 
-        # Adaptive startup
-        needed = int(self._arrival_rate * self.MIN_BUFFER_SECONDS)
-        if not self._playing and current_buffer >= needed:
+        # Adaptive startup: buffer at least _target_buffer_ms of audio
+        # content before starting playback. The target was sized at
+        # construction (feedforward) and may have grown since (feedback).
+        if not self._playing and current_buffer >= self._needed_samples():
             self._startup_delay = now - self._first_queue_time
             self._start_stream()
 
@@ -348,4 +531,7 @@ class AdaptivePlayer:
             underrun_count=self._underruns,
             peak_memory_gb=self._peak_memory_gb,
             mode="streaming" if len(self._chunk_metrics) > 1 else "batch",
+            initial_buffer_ms=self.initial_buffer_ms,
+            final_buffer_ms=self._target_buffer_ms,
+            starvation_count=self._starvation_count,
         )

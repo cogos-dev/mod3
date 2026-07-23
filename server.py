@@ -601,7 +601,15 @@ def _encode_chunk_ogg(samples, sample_rate: int) -> bytes:
 # Job tracking (MCP only — local speaker playback)
 # ---------------------------------------------------------------------------
 
-MAX_JOBS = 20
+# Retention: finished jobs stay in _jobs for at least JOB_RETENTION_SECONDS
+# so GET /v1/jobs/{id} stays answerable well past playback (previously a
+# fixed MAX_JOBS=20 count-based cap could evict a job seconds after launch
+# under even light concurrent traffic). MAX_JOBS is now just a safety cap
+# against unbounded growth if something floods speak() faster than the
+# retention window drains — 500 comfortably covers 10 minutes of jobs at a
+# sustained rate well beyond normal dashboard/agent chat traffic.
+JOB_RETENTION_SECONDS = 600  # 10 minutes
+MAX_JOBS = 500
 _last_metrics: dict | None = None
 _output_device: int | str | None = None
 _jobs: OrderedDict[str, dict] = OrderedDict()
@@ -610,14 +618,29 @@ _current_player_lock = threading.Lock()
 
 
 def _prune_jobs():
-    """Keep only the last MAX_JOBS entries, but never evict an in-flight job.
+    """Evict finished jobs older than JOB_RETENTION_SECONDS; never touch an
+    in-flight job.
 
     Evicting a job whose `_run_speech_job` worker is still writing to it would
     raise KeyError on the post-completion `_jobs[job_id]["metrics"] = result`
     assignment, which then kills the SpeechQueue drain thread (it has no
     catch-all) and leaves later jobs stuck in queue with no processor.
+
+    Simple time-based prune: a finished job (done/error/cancelled) is kept
+    until `end_time` is more than JOB_RETENTION_SECONDS in the past. MAX_JOBS
+    is a hard safety net on top of that in case retention alone lets the
+    dict grow unbounded under a sustained flood.
     """
     in_flight = {"queued", "speaking"}
+    now = time.time()
+    for jid in list(_jobs):
+        job = _jobs[jid]
+        if job.get("status") in in_flight:
+            continue
+        finished_at = job.get("end_time") or job.get("submitted_time", now)
+        if now - finished_at > JOB_RETENTION_SECONDS:
+            del _jobs[jid]
+
     # Walk in insertion order; pop the oldest non-in-flight entry per iteration.
     while len(_jobs) > MAX_JOBS:
         for jid in list(_jobs):
@@ -810,10 +833,27 @@ def _run_speech_job(entry: dict) -> None:
         engine, resolved_voice = _resolve_voice_via_bus(voice)
         model = engine_module.get_model(engine)
         device, _resolved = _resolve_device_for_entry(entry)
-        player = AdaptivePlayer(sample_rate=model.sample_rate, device=device)
+
+        # Feedforward buffer sizing (operator two-loop policy): read mod3's
+        # own recent chunk-deficit telemetry, optionally corroborated by a
+        # ≤100ms-timeboxed probe of the LMS lane (GPU contention proxy —
+        # Metal is shared between local TTS and a local LLM; measured 1.26x
+        # wall-clock cost under one concurrent LMS call). See
+        # adaptive_player.compute_initial_buffer_ms for the pure policy math.
+        from adaptive_player import compute_initial_buffer_ms, get_deficit_ema, probe_lms_contention
+
+        deficit_ema = get_deficit_ema()
+        if os.environ.get("MOD3_ADAPTIVE_BUFFER_PROBE", "1") != "0":
+            probe_latency_ms, probe_timed_out = probe_lms_contention()
+        else:
+            probe_latency_ms, probe_timed_out = None, True
+        initial_buffer_ms = compute_initial_buffer_ms(deficit_ema, probe_latency_ms, probe_timed_out)
+
+        player = AdaptivePlayer(sample_rate=model.sample_rate, device=device, initial_buffer_ms=initial_buffer_ms)
     except Exception as e:
         _jobs[job_id]["status"] = "error"
         _jobs[job_id]["error"] = str(e)
+        _jobs[job_id]["end_time"] = time.time()
         _set_bus_voice_state(
             status=ModuleStatus.ERROR,
             active_job=None,
@@ -1035,6 +1075,7 @@ def _run_speech_job(entry: dict) -> None:
     if job is not None:
         job["metrics"] = result
         job["status"] = "error" if error else "done"
+        job["end_time"] = time.time()
     _set_bus_voice_state(
         status=ModuleStatus.ERROR if error else ModuleStatus.IDLE,
         active_job=None,
@@ -1162,6 +1203,7 @@ def _start_speech(
     """
     job_id = uuid.uuid4().hex[:8]
     _jobs[job_id] = {
+        "type": "speak",
         "status": "queued",
         "engine": None,
         "voice": voice,
@@ -1169,6 +1211,7 @@ def _start_speech(
         "full_text": text,
         "submitted_time": time.time(),
         "start_time": None,
+        "end_time": None,
         "metrics": None,
         "error": None,
         "player": None,
@@ -1486,6 +1529,7 @@ def stop(job_id: str = "") -> str:
         if _speech_queue.cancel(job_id):
             if job_id in _jobs:
                 _jobs[job_id]["status"] = "cancelled"
+                _jobs[job_id]["end_time"] = time.time()
             return json.dumps(
                 {
                     "status": "ok",
@@ -1526,6 +1570,7 @@ def stop(job_id: str = "") -> str:
     for jid, jdata in _jobs.items():
         if jdata["status"] in ("queued", "held"):
             jdata["status"] = "cancelled"
+            jdata["end_time"] = time.time()
 
     with _current_player_lock:
         player = _current_player
