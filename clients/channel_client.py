@@ -69,7 +69,44 @@ from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification
 
+# Sibling module; this file runs as a script, so clients/ is on sys.path.
+# Import failure degrades to "no sink" rather than killing the channel.
+try:
+    import theseus_sink
+except ImportError:  # pragma: no cover — packaging/layout drift
+    theseus_sink = None  # type: ignore[assignment]
+
 logger = logging.getLogger("mod3.channel_client")
+
+# Strong refs so in-flight sink tasks aren't garbage-collected mid-write.
+_SINK_TASKS: set = set()
+
+
+def _sink_fire_and_forget(text: str, thread: str, from_id: str) -> None:
+    """Best-effort THESEUS ledger sink for a conversational utterance.
+
+    Runs theseus_sink.sink_turn in a worker thread and drops the handle —
+    speech and dashboard posts never wait on a git push. Disabled cleanly
+    when the module is missing, the repo is absent, or MOD3_THESEUS_SINK=0.
+    """
+    if theseus_sink is None or not theseus_sink.enabled():
+        return
+
+    async def _run() -> None:
+        result = await asyncio.to_thread(
+            theseus_sink.sink_turn, text, thread, from_id
+        )
+        if not result.get("ok"):
+            logger.warning("theseus sink failed: %s", result.get("error"))
+        else:
+            logger.debug("theseus sink: %s", result)
+
+    try:
+        task = asyncio.get_running_loop().create_task(_run())
+        _SINK_TASKS.add(task)
+        task.add_done_callback(_SINK_TASKS.discard)
+    except RuntimeError:  # no running loop (sync caller in tests)
+        theseus_sink.sink_turn(text, thread, from_id)
 
 # ---------------------------------------------------------------------------
 # Config / constants
@@ -662,9 +699,19 @@ def build_mcp_server(client: ChannelClient) -> FastMCP:
                     # 404 = endpoint not yet implemented on server; degrade gracefully
                     if resp.status_code == 404:
                         logger.debug("/v1/dashboard-chat not found — falling back to /ws broadcast")
-                    return "ok"
-                resp.raise_for_status()
-                return "ok"
+                else:
+                    resp.raise_for_status()
+            # Durable half: the dashboard's message store is RAM-only, so the
+            # seat's own posts also land in the THESEUS ledger. Only the
+            # seat's voice ("assistant") is sunk — a relayed "user" turn is
+            # someone else's words and must never be stamped origin=seat.
+            if role == "assistant":
+                _sink_fire_and_forget(
+                    text,
+                    os.environ.get("MOD3_THESEUS_THREAD", "dashboard"),
+                    "seat-root-dashboard",
+                )
+            return "ok"
         except Exception as exc:  # noqa: BLE001
             return f"error: {exc}"
 
@@ -676,6 +723,7 @@ def build_mcp_server(client: ChannelClient) -> FastMCP:
         post_to_chat: bool = True,
         skip_playback: bool = False,
         format: str = "wav",
+        ledger_thread: str = "",
     ) -> dict:
         """Synthesize text to speech and play it through the Mod³ daemon.
 
@@ -709,6 +757,13 @@ def build_mcp_server(client: ChannelClient) -> FastMCP:
                 "ogg" produces OGG/Opus at ~24 kbps. Only meaningful when
                 skip_playback=True (playback always uses WAV internally).
                 Default: "wav".
+            ledger_thread: THESEUS conversation thread the spoken text is
+                sunk to (durable ledger in the book repo). Empty (default)
+                uses $MOD3_THESEUS_THREAD or "voice". Conversational speech
+                during a THESEUS thread conversation should name that thread
+                so the spoken and written halves land together. Sinking
+                follows post_to_chat: system sounds and non-conversational
+                speech (post_to_chat=False) are not sunk.
 
         Returns:
             skip_playback=False:
@@ -778,6 +833,17 @@ def build_mcp_server(client: ChannelClient) -> FastMCP:
 
                 resp = await http.post(speak_url, json=speak_body, headers=_auth_headers(client.token), timeout=30.0)
                 resp.raise_for_status()
+                # Durable half: sink the spoken text to the THESEUS ledger,
+                # gated on the same flag as the visible transcript — speech
+                # the operator is meant to reread is speech worth keeping.
+                # After raise_for_status: only accepted speech is recorded.
+                if post_to_chat:
+                    _sink_fire_and_forget(
+                        text,
+                        ledger_thread
+                        or os.environ.get("MOD3_THESEUS_THREAD", "voice"),
+                        "seat-root-voice",
+                    )
                 return resp.json()
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc)}
