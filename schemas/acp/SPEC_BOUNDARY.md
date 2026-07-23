@@ -57,7 +57,7 @@ mod3's own session registry.
 The `InitializeResult` is updated to advertise these capabilities:
 
 ```python
-sessionCapabilities={
+sessionCapabilities = {
     "list": True,
     "resume": True,
 }
