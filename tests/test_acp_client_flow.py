@@ -86,7 +86,7 @@ class TestSpawnProxy:
         kernel_response = {
             "process_id": "test-proc-abc123",
             "session_id": "sess-xyz",
-            "project": "-Users-slowbro",
+            "project": "-Users-yourname",
             "status": "spawned",
             "spawned_at": "2026-05-14T22:00:00Z",
         }
@@ -107,7 +107,7 @@ class TestSpawnProxy:
         with patch("httpx.AsyncClient", return_value=mock_client_instance):
             r = client.post(
                 "/v1/claude-code/spawn",
-                json={"project": "-Users-slowbro", "session_id": "sess-xyz"},
+                json={"project": "-Users-yourname", "session_id": "sess-xyz"},
             )
 
         assert r.status_code == 201
@@ -156,7 +156,7 @@ class TestSpawnProxyKernelDown:
         ):
             r = client.post(
                 "/v1/claude-code/spawn",
-                json={"project": "-Users-slowbro"},
+                json={"project": "-Users-yourname"},
             )
 
         assert r.status_code == 503

@@ -6,7 +6,7 @@
 | Author | @chazmaniandinkle |
 | Date | 2026-05-13 |
 | Commit | `5be113c` (schemas baseline) |
-| Relates | ADR-062 Recursive Node Architecture, RFC-0007 named-provider dispatch, RFC-0008 Inference Control Plane, Channel-Provider Interface design (`cog://mem/semantic/designs/channel-provider-interface.cog.md`) |
+| Relates | ADR-062 Recursive Node Architecture, RFC-0007 named-provider dispatch, RFC-0008 Inference Control Plane, Channel-Provider Interface design |
 
 ## Summary
 
@@ -170,11 +170,10 @@ The framing:
 Creating or modifying a modality is always a schema change first. The schema is
 the contract. Implementation follows schema.
 
-This framing is grounded in the Channel-Provider Interface design
-(`cog://mem/semantic/designs/channel-provider-interface.cog.md`), which defines
-channels as nodes in the Constellation, each advertising a set of modalities
-through its capability card. Mod3 is the first `audio`-kind provider in that
-design.
+This framing is grounded in the Channel-Provider Interface design (an internal
+design note), which defines channels as nodes in the Constellation, each
+advertising a set of modalities through its capability card. Mod3 is the
+first `audio`-kind provider in that design.
 
 ### 2.4 Sidecar Audio Plane
 
@@ -306,11 +305,11 @@ scope for this RFC.
 
 ## 5. References
 
-- **ADR-062** Recursive Node Architecture (`/Users/slowbro/workspaces/cog/.cog/adr/062-recursive-node-architecture.cog.md`): the node primitive, capability cards, and the one-level visibility rule that constrains mod3's position in the tree.
-- **RFC-034** Substrate Kernel Categorical Split (`cog://rfc/034`): Observer-as-Reconciler vocabulary referenced in RFC-0008; defines the Observer/Observatory distinction this RFC relies on for inference routing context.
+- **ADR-062** Recursive Node Architecture (internal architecture decision record): the node primitive, capability cards, and the one-level visibility rule that constrains mod3's position in the tree.
+- **RFC-034** Substrate Kernel Categorical Split (internal RFC): Observer-as-Reconciler vocabulary referenced in RFC-0008; defines the Observer/Observatory distinction this RFC relies on for inference routing context.
 - **RFC-0007** Named-Provider Dispatch (`cogos/docs/rfcs/0007-dispatch-provider-override.md`, PR #230, merged): the provider-name override mechanism that mod3 registers with as a Voice inference provider.
 - **RFC-0008** Inference Control Plane via Node-State Observatory (`cogos/docs/rfcs/0008-inference-control-plane.md`, PR #233, merged with Observer-as-Reconciler amendment): classification of mod3 as a `cog-native` InferenceChannel with `RuntimeKind: cog-native-mlx`.
-- **Channel-Provider Interface design** (`cog://mem/semantic/designs/channel-provider-interface.cog.md`): defines the `audio`-kind adapter contract that mod3 implements; mod3 is the first `audio`-kind provider in that design.
-- **`cogos/pkg/modality/`** (in-flight on branch `feat/issue-155-block-peers`, worktree at `/Users/slowbro/workspaces/myrgic/cogos/.claude/worktrees/agent-aba52699cdd75d76f/`): the Go implementation of the Module interface (`types.go`), wire protocol (`wire.go`), and voice wiring (`modality_voice.go`).
+- **Channel-Provider Interface design** (internal design note): defines the `audio`-kind adapter contract that mod3 implements; mod3 is the first `audio`-kind provider in that design.
+- **`cogos/pkg/modality/`** (in-flight on branch `feat/issue-155-block-peers` in the cogos repo): the Go implementation of the Module interface (`types.go`), wire protocol (`wire.go`), and voice wiring (`modality_voice.go`).
 - **`mod3/schemas/`** (commit `5be113c`): the Python mirror of the kernel's modality schemas. Canonical schemas for wire protocol (`wire.py`), operations (`operations.py`), primitives (`primitives.py`), modality types (`modality.py`), and channel descriptor (`channel.py`).
 - **`docs/architecture/audio-sidecar.md`** (branch `wave/2026-05-13-mod3/sidecar-doc`): operational mapping of the RTVI-shaped audio plane to the ACP control plane.

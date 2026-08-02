@@ -2,7 +2,7 @@
   "mcpServers": {
     "mod3": {
       "command": "python3",
-      "args": ["/Users/slowbro/workspaces/myrgic/mod3/clients/channel_client.py"],
+      "args": ["/path/to/mod3/clients/channel_client.py"],
       "_comment": "Claude Code channel client. Start with: claude --dangerously-load-development-channels server:mod3. channel_client.py reads the harness session_id from ~/.claude/sessions/<parent-pid>.json at startup so each Claude Code session registers a distinct seat (instead of all collapsing into 'main'). MOD3_SESSION_ID env var still wins if set explicitly (e.g. by the kernel's /v1/claude-code/spawn flow which passes --session directly).",
       "_keying_note": "This binds each seat to a harness session_id (one seat per Claude Code session). The substrate-canonical model (per channel-as-substrate-primitive + seat-as-synchronous-coordination-surface) is one seat per (channel, identity) with N harnesses attaching to it — keyed by identity, not by harness. That requires a SeatReconciler with output arbitration across attached harnesses. Tracked as Wave 6d / future ADR. Session-keying is the transitional form.",
       "_followup": "FIXME: promote the implicit harness↔seat relationship to a first-class HarnessBinding Reconcilable record per substrate-bindings-as-k8s-rbac, so the substrate has authoritative visibility into 'which Claude Code session_id maps to which seat'.",

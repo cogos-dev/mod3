@@ -130,17 +130,17 @@ PYTHONPATH=. pytest tests/test_acp_client_flow.py -v
 
 # Curl smoke tests (kernel must be running on port 6931)
 curl http://localhost:6931/v1/claude-code/projects
-curl http://localhost:6931/v1/claude-code/projects/-Users-slowbro/sessions
+curl http://localhost:6931/v1/claude-code/projects/-Users-yourname/sessions
 
 # Spawn a new session (kernel must be running)
 curl -X POST http://localhost:7860/v1/claude-code/spawn \
   -H 'Content-Type: application/json' \
-  -d '{"project": "-Users-slowbro"}'
+  -d '{"project": "-Users-yourname"}'
 
 # Resume a specific session
 curl -X POST http://localhost:7860/v1/claude-code/spawn \
   -H 'Content-Type: application/json' \
-  -d '{"project": "-Users-slowbro", "session_id": "<session_uuid>"}'
+  -d '{"project": "-Users-yourname", "session_id": "<session_uuid>"}'
 ```
 
 ---
