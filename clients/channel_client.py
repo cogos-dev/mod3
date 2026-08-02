@@ -707,9 +707,7 @@ def build_mcp_server(client: ChannelClient) -> FastMCP:
             if role == "assistant":
                 _sink_fire_and_forget(
                     text,
-                    os.environ.get(
-                        "MOD3_LEDGER_THREAD", os.environ.get("MOD3_THESEUS_THREAD", "dashboard")
-                    ),
+                    os.environ.get("MOD3_LEDGER_THREAD", os.environ.get("MOD3_THESEUS_THREAD", "dashboard")),
                     "seat-root-dashboard",
                 )
             return "ok"
@@ -842,9 +840,7 @@ def build_mcp_server(client: ChannelClient) -> FastMCP:
                     _sink_fire_and_forget(
                         text,
                         ledger_thread
-                        or os.environ.get(
-                            "MOD3_LEDGER_THREAD", os.environ.get("MOD3_THESEUS_THREAD", "voice")
-                        ),
+                        or os.environ.get("MOD3_LEDGER_THREAD", os.environ.get("MOD3_THESEUS_THREAD", "voice")),
                         "seat-root-voice",
                     )
                 return resp.json()

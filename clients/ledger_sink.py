@@ -127,9 +127,7 @@ def _repo_lock(repo: pathlib.Path):
 
 def _repo_path() -> pathlib.Path:
     root = os.environ.get("MYRGIC_REPOS_ROOT", os.path.expanduser("~/workspaces/myrgic"))
-    return pathlib.Path(
-        _env("MOD3_LEDGER_REPO", "MOD3_THESEUS_REPO", os.path.join(root, "ledger-repo"))
-    )
+    return pathlib.Path(_env("MOD3_LEDGER_REPO", "MOD3_THESEUS_REPO", os.path.join(root, "ledger-repo")))
 
 
 def enabled() -> bool:
