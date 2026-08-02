@@ -33,11 +33,16 @@ jobs:
       # (sounddevice) are excluded; conftest.py stubs them at session start so
       # tests that need the real libraries use importorskip/HAS_* guards and
       # skip cleanly.  python-multipart is needed for FastAPI file-upload routes.
+      # mcp is capped below 2.0.0: that release moved the high-level server
+      # helper out of mcp.server.fastmcp (jobs_registry.py and
+      # clients/channel_client.py import from there at module level), so an
+      # unpinned install breaks collection with
+      # "ModuleNotFoundError: No module named 'mcp.server.fastmcp'".
       - run: |
           pip install \
             fastapi uvicorn httpx pysbd numpy scipy pydantic \
             pytest pytest-asyncio python-multipart \
-            mcp mistral-common soundfile
+            "mcp>=1.20.0,<2.0.0" mistral-common soundfile
       - name: Run tests
         env:
           SKIP_TTS_TESTS: "1"
@@ -54,7 +59,7 @@ jobs:
       - run: |
           pip install \
             fastapi uvicorn httpx pysbd numpy scipy pydantic \
-            python-multipart mcp mistral-common soundfile
+            python-multipart "mcp>=1.20.0,<2.0.0" mistral-common soundfile
       - name: Test API endpoints resolve
         run: |
           python -c "
