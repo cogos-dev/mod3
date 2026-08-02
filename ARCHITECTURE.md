@@ -1,5 +1,25 @@
 # Mod³ Dashboard — Process Architecture
 
+> **Historical document, superseded.** Everything below this notice is a
+> frozen snapshot from 2026-05-11 describing an earlier single-process
+> browser-dashboard design (`agent_loop.py`, `modules/voice.py`, a single
+> WebSocket at `/ws/chat`). Mod3 has since moved to an HTTP daemon
+> (`http_api.py`) with separate `clients/channel_client.py` child processes
+> per Claude Code session, and most of the files this document discusses no
+> longer exist or no longer work the way it describes.
+>
+> For the current architecture, see:
+> - the [Architecture section in README.md](README.md#architecture) for the
+>   current module map
+> - [CHANNELS.md](CHANNELS.md) for the Claude Code Channel / dashboard
+>   system that replaced the design below
+> - [`docs/architecture/`](docs/architecture/) for current topic-specific
+>   design notes (ACP client pattern, audio sidecar)
+>
+> Kept here for historical reference to the process-architecture problems it
+> resolved (PRs #22 and #24); do not treat the diagrams or file table below
+> as current.
+
 ## Intended Flow
 
 ```

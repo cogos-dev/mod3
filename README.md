@@ -120,6 +120,29 @@ List audio output devices, or switch the active one mid-session.
 
 Show loaded engines, active jobs, output device, and last generation metrics.
 
+## Claude Code Channel & Dashboard
+
+Mod³ can also attach directly to a Claude Code session as a Channel (Anthropic's
+channel primitive), instead of running as a plain MCP server. Each Claude Code
+session spawns `clients/channel_client.py`, which registers a "seat" on the mod3
+daemon and forwards messages typed in the browser dashboard to Claude Code as
+`notifications/claude/channel`. Claude replies with the `mod3_dashboard_post` and
+`mod3_speak` tools, so a conversation can move between typed dashboard messages
+and spoken audio without leaving the session.
+
+```bash
+claude --dangerously-load-development-channels server:mod3
+```
+
+The dashboard itself is served at `http://localhost:7860/dashboard` once the
+daemon is running (`python server.py --http`).
+
+See [CHANNELS.md](CHANNELS.md) for the full protocol -- message flow, seat
+lifecycle, access control and pairing for remote clients, and the HTTP endpoints
+involved. Channels is currently an Anthropic research-preview feature and may
+need enabling for your organization before `--dangerously-load-development-channels`
+works.
+
 ## Architecture
 
 Key modules:
