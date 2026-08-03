@@ -21,7 +21,10 @@ mlx-audio==0.4.3
 # silently reports modalities.vad=false instead of failing loudly.
 torchaudio==2.10.0
 mlx-whisper>=0.4.0
-mcp>=1.20.0
+# Capped below 2.0.0: that release moved the high-level server helper out of
+# mcp.server.fastmcp (jobs_registry.py and clients/channel_client.py import
+# from there at module level), which breaks import at runtime.
+mcp>=1.20.0,<2.0.0
 sounddevice>=0.5.0
 numpy>=2.0.0
 soundfile>=0.12.1
