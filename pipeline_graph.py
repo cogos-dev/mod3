@@ -15,8 +15,8 @@ that switches between two compositions:
     mention_detect → emit
     Always-on mic, VAD-gated attention, continuous diarization. Cog listens
     without responding unless mentioned or "appropriate silence" is detected
-    (OQ-5, per Chaz's May 17 transcript). This is the multi-human-attendee
-    mode (e.g. Chaz + Erin with a hot mic).
+    (OQ-5, per an operator transcript). This is the multi-human-attendee
+    mode (e.g. Speaker A + Speaker B with a hot mic).
 
 Stage registration:
 
