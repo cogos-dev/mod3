@@ -27,12 +27,13 @@ CI runs all of the above on every PR (`.github/workflows/ci.yml`). Match the ver
 
 ## Project layout
 
-- `engine.py` — TTS engine dispatch (kokoro, piper, espeak-ng, system)
-- `vad.py` — voice-activity detection + hallucination filtering
-- `http_api.py` — FastAPI app exposing `/v1/jobs`, `/v1/voices`, `/v1/filter`
-- `server.py` — MCP server entry point
-- `tests/` — pytest suite
-- `integrations/openclaw/` — OpenClaw plugin manifest and extension
+- `engine.py` -- TTS engine dispatch (voxtral, kokoro, chatterbox, spark)
+- `vad.py` -- voice-activity detection + hallucination filtering
+- `http_api.py` -- FastAPI app exposing `/v1/jobs`, `/v1/voices`, `/v1/filter`, and the channel/session/dashboard endpoints
+- `server.py` -- MCP server entry point
+- `clients/channel_client.py` -- Claude Code Channel client (see [CHANNELS.md](CHANNELS.md))
+- `tests/` -- pytest suite
+- `integrations/openclaw/` -- OpenClaw plugin manifest and extension
 
 ## Submitting changes
 
