@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.8.0] - 2026-08-02
 
 ### Fixed — CI: unpinned `mcp` install broke test collection
 
@@ -28,9 +28,58 @@
 
 - **`requirements.txt` now pins `transformers`, `mlx-lm`, and `mlx-audio` to exact known-working versions, and declares `torchaudio` explicitly.** A deploy-worktree cutover attempt found that a fresh install from the previously-unpinned `requirements.txt` resolved `transformers` to a version that breaks `mlx_lm`'s module-level `AutoTokenizer.register("NewlineTokenizer", ...)` call (`AttributeError: 'str' object has no attribute '__module__'`), which took down the chatterbox-turbo model-load path entirely (HTTP 500 on `/v1/speak` and `/v1/synthesize` for that voice). Separately, `torchaudio` — required by `vad.py`'s silero-vad path — was never declared in `requirements.txt` at all, so a fresh install silently reported `modalities.vad: false` instead of failing loudly. Both are now pinned to the versions verified working in the long-running dev venv (`transformers==5.9.0`, `mlx-lm==0.31.3`, `mlx-audio==0.4.3`, `torchaudio==2.10.0`). Added `tests/test_dependency_sanity.py` as a cheap, network-free regression guard (bare-import checks) so a future unpinned-floor drift fails CI instead of surfacing as a live-service HTTP 500.
 
+### Added: per-packet VAD confidence endpoint
+
+- **`POST /v1/vad/confidence` adds a lightweight per-packet VAD check for barge-in loops (Discord voice, etc.) that don't need full utterance-level detection.** Accepts a raw 512-sample (16kHz) or 256-sample (8kHz) int16 PCM frame and returns `{confidence, available, latency_ms}` in under 5ms via the vendored ONNX Silero path (no torch dependency), versus `/v1/vad`'s full WAV-upload torch pipeline. `available=false` when onnxruntime isn't installed; listed in `GET /capabilities` as `vad_confidence`. A follow-up fix in the same window corrected a Silero output-shape bug (a `(1,1)` array where a scalar was expected) that had silently zeroed every confidence reading despite `available=true`. (#128)
+
 ### Fixed — Honest CI: unmasked test suite, pre-existing failures fixed or skipped
 
 - **The test suite no longer runs masked.** Several pre-existing failures were being hidden from CI signal; they're now fixed or explicitly skipped with a reason, so a green run means the suite actually passed. Covers: CSRF-guarded `TestClient` calls now override the `Host` header so the CSRF check sees the expected origin; the STT pool-isolation assertion uses a local executor instead of depending on ambient global state; the `mlx_lm` tokenizer regression guard is skipped when `mlx` is unavailable in the environment; a TTS-model-dependent test is skipped in the Import & Unit Tests job where the model isn't loaded; the disconnect-bot websocket path sends a close frame both before and after the RTVI handshake so shutdown doesn't hang mid-test.
+
+### Fixed: VAD mic idle-release and barge-in gate retry
+
+- **The mic no longer stays open indefinitely, and a single stale-signal check no longer holds voice output forever.** `InboundPipeline` previously acquired the capture device once at boot and never released it; a server observed at 3.9 days uptime had held the mic open the whole time. It now releases the device after `MOD3_MIC_IDLE_RELEASE_SECONDS` of no detected speech (default 300s; 0 restores the old always-open behavior) and re-acquires on demand. Separately, `speak()` and `/v1/speak` checked the barge-in signal file exactly once and returned a terminal "held" response with no retry, which held all voice output for an entire 12-hour flight on one VAD false positive. `check_bargein_gate()` now retries up to `MOD3_GATE_RETRY_ATTEMPTS` times (default 3, roughly a 10s budget) and surfaces an explicit escalation message once a session has been held twice in a row, without ever forcing playback over a real speaker. (#134)
+
+### Added: TTS model idle-unload
+
+- **`MOD3_TTS_IDLE_UNLOAD_SECONDS` opts a background watcher into evicting loaded TTS models from memory after a configurable idle period,** freeing RAM and Metal GPU cache. Disabled by default (env unset or `0`); the next synthesis call transparently reloads from disk through the existing lazy-singleton path. (#133)
+
+### Added: RTVI audio streaming from the speak/drain path
+
+- **`mod3_speak` and `/v1/speak` now deliver audio to `/ws/audio` subscribers as RTVI 1.3.0 frames (`bot-tts-started`, `bot-tts-audio`, `bot-tts-stopped`), not just to the local speaker.** The drain path emits per-chunk over the websocket alongside local `AdaptivePlayer` playback; the closing frame is guaranteed exactly once whether the job finishes normally, is barged in on, or throws mid-synthesis. No subscriber means no change in behavior. (#131)
+
+### Fixed: drain threads hardened against BaseException
+
+- **`SpeechQueue` and `ChannelQueue` drain loops previously caught only `Exception`, so a `SystemExit`, `KeyboardInterrupt`, or `MemoryError` could kill the drain thread while leaving its running/draining flags stuck true.** New jobs then queued forever with `active_jobs=0`, the traced cause of a stale `queue_depth` counter seen in production. Both loops now reset their state in a `finally` block on every exit path, normal or abnormal. (#129)
+
+### Added: seat fan-out events for streamed audio and barge-in
+
+- **Two new seat event types fan out during speech synthesis: `tts_chunk` (OGG/Opus-encoded, monotonically indexed, `is_final` on the last chunk) and `bargein` (fired whenever `pipeline_state.interrupt()` runs), letting session seats cancel pending deliveries.** Both are no-ops when no session_id is present or fan-out fails. (#127)
+
+### Added: speech-to-text endpoint
+
+- **`POST /v1/transcribe` accepts an audio upload (WAV directly, or OGG/MP3/M4A via ffmpeg) and returns a transcription from `mlx-community/whisper-large-v3-turbo`, lazy-loaded on first request and filtered through the existing hallucination check.** This is what lets Hermes route its STT pipeline through mod3 instead of running faster-whisper directly. (#126)
+
+### Added: OGG/Opus output format
+
+- **`/v1/synthesize` and the `mod3_speak` MCP tool (via `skip_playback=True`) can now return OGG/Opus-encoded audio instead of WAV/PCM,** RFC 7587/7845 compliant (resampled to 24kHz, `codecs=opus` on the content type so Telegram renders it as a voice bubble). `/v1/speak` stays WAV-only; the playback queue never honored a format parameter. (#125)
+
+### Added: kernel channel-session sync on seat register and revoke
+
+- **Seat registration and revoke now fire best-effort callbacks to the kernel's `/v1/channel-sessions/*` routes, carrying the existing session_id and iss/sub identity claims,** so the kernel's own session bookkeeping stays in sync with mod3's. An unreachable kernel never blocks the seat operation itself. (#118)
+
+### Fixed: inbound voice pipeline restored
+
+- **The mic-to-VAD-to-STT pipeline had silently stopped starting on every default deploy since an earlier PR removed the symbols it imported from `server.py`,** and the broad `except` around pipeline startup swallowed the resulting `ImportError` without logging (`/health` just read `vad: false`). Rewired onto `SeatRegistry.fan_out_all()`, the delivery path already used elsewhere, so voice input reaches Claude Code hosts again. (#123)
+
+### Fixed: seat and session lifecycle hardening
+
+- **SSE stream teardown now revokes the seat, not just the channel, closing a leak where zombie seats kept accumulating queued messages after their connection dropped** (the per-seat queue is also now bounded, drop-oldest past 1024). A double-failure path in the Ollama local-fallback provider (kernel error plus a non-2xx Ollama response) previously bubbled a raw HTTP error into a voice turn instead of a spoken one; it's now caught and returns gracefully. (#122)
+- **`SessionRegistry` gained a periodic reaper that prunes sessions idle past a TTL (default 600s) with no live SSE stream,** tied to actual connection liveness rather than the graceful-DELETE hook a crashed or killed client never runs. Dashboards had been accumulating 100+ stale sessions over days; `"main"` is never reaped. (#121)
+
+### Fixed: voice inference stays on the local floor when Eclipse is down
+
+- Hardened the local-fallback provider path so a downed remote node degrades voice inference to the local floor instead of failing the turn. (#120)
 
 ### Changed — `mod3_speak` mirrors to dashboard chat by default
 
@@ -65,6 +114,7 @@
 
 ### Security
 
+- **`_localhost_csrf_guard` middleware now rejects state-changing requests (POST/PUT/PATCH/DELETE) whose Host header isn't loopback, and checks Origin against an allowlist when the browser sends one,** closing a DNS-rebinding path to the localhost daemon. Default bind address moved from `0.0.0.0` to `127.0.0.1` (opt into LAN exposure explicitly with `--host 0.0.0.0`). Read-only methods and `/health` are deliberately not gated; configurable via `MOD3_ALLOWED_ORIGINS`. (#117)
 - **Pre-existing auth posture surfaced.** During review of #103, the security review flagged that `/v1/sessions/{id}/seats`, `/v1/sessions/broadcast-message`, and `/v1/claude-code/spawn` have no auth or CSRF protection. The findings predate this work (the localhost-only design assumed no untrusted browser context) but the dashboard wiring now exercises these endpoints from same-origin scripts. Phased mitigation tracked in #104.
 
 ## [0.7.0] - 2026-05-19
