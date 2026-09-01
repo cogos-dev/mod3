@@ -121,3 +121,15 @@ jobs:
           console.assert(pkg.openclaw.extensions.length > 0, 'No extension entry');
           console.log('Plugin manifest valid');
           "
+
+  public-release-gate:
+    # Enforces .cogpublic via the org-level executor. mod3 has leaked twice
+    # (#138/#142 personal names + absolute paths + private codename; #146 an
+    # operator home path inside a byte literal standing in for ps(1) output,
+    # a form no reviewer reads as "a path"). That second one is why this is a
+    # mechanical check and not a review checklist item.
+    #
+    # The executor is centralized in myrgic/.github so "the gate exists" and
+    # "the gate runs" cannot drift apart per repo; the POLICY stays here in
+    # .cogpublic because what counts as private is repo-specific.
+    uses: myrgic/.github/.github/workflows/public-release-gate.yml@main
