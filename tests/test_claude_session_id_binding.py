@@ -459,7 +459,7 @@ class TestChannelClientSessionResolution:
         spec.loader.exec_module(mod)
 
         def fake_check_output(cmd, **kwargs):
-            return b"/Users/slowbro/.local/bin/claude --resume my-sid\n"
+            return b"/home/example/.local/bin/claude --resume my-sid\n"
 
         monkeypatch.setattr(subprocess, "check_output", fake_check_output)
         assert mod._read_resume_arg_from_pid(12345) == "my-sid"
