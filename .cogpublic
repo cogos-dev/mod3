@@ -1,0 +1,68 @@
+# .cogpublic — Public release gate for myrgic/mod3
+# Defines what must never cross the boundary outward.
+#
+# ENFORCED BY: the org-level Public Release Gate workflow
+#   (myrgic/.github/.github/workflows/public-release-gate.yml), run in CI on
+#   every PR. Locally, from a checkout of myrgic/.github:
+#     python3 scripts/cogpublic-guard.py --root /path/to/mod3
+#
+# WHY THIS REPO HAS ONE: mod3 has leaked twice. PR #138/#142 scrubbed personal
+# names, absolute paths, and a private codename from public source. PR #146
+# then found a surviving `/Users/<operator>` inside a byte literal standing in
+# for ps(1) output — a form no reviewer reads as "a path in config," which is
+# exactly why a mechanical check is required and a careful reviewer is not
+# sufficient.
+#
+# Policy lives here; the executor is centralized. What counts as private is
+# repo-specific; the machinery that checks it should have one implementation.
+
+version: 1
+
+# Content patterns that block a push. Additive with the org baseline — keep
+# entries here when they are specific to this repo's own history.
+content_guards:
+  - pattern: "/Users/slowbro"
+    description: "Hardcoded operator home directory (macOS)"
+  - pattern: "/home/slowbro"
+    description: "Hardcoded operator home directory (Linux)"
+  - pattern: "-Users-slowbro-"
+    description: "Claude project path encoding"
+  - pattern: "192404964621025291"
+    description: "Personal Discord user snowflake"
+  - pattern: 'sk-[a-zA-Z0-9]{20,}'
+    description: "OpenAI API key pattern"
+  - pattern: 'ghp_[a-zA-Z0-9]{20,}'
+    description: "GitHub personal access token"
+  - pattern: 'xoxb-[a-zA-Z0-9]+'
+    description: "Slack bot token"
+  - pattern: '@gmail\.com|@yahoo\.com|@hotmail\.com'
+    description: "Personal email address (git author emails exempt)"
+
+# DELIBERATELY NOT GUARDED, verified 2026-09-01 — recorded so the next person
+# does not "helpfully" add them:
+#
+#   THESEUS  — #142 scrubbed it as a codename, but the surviving occurrences
+#     are the scrub's own audit trail (clients/theseus_sink.py's docstring
+#     explains the rename; CHANGELOG records it). Guarding it would flag the
+#     documentation of the fix as the defect.
+#
+#   cog://   — this is a PROTOCOL mod3 implements, not a private reference.
+#     voice_profile_schema.py defines cog://voices/<name> URIs that the
+#     runtime resolver maps to the registry. Guarding it would block the
+#     repo's own public API surface.
+#
+# Both were in a draft of this file and removed after checking what the hits
+# actually were. An over-broad guard that fires on legitimate content is worse
+# than no guard: it gets suppressed, and the suppression takes the real
+# findings with it.
+
+# Paths the scan skips. Vendored blobs and caches are not ours to sanitize,
+# and scanning them produces noise that trains people to ignore the gate.
+exclude:
+  - vendor/**
+  - node_modules/**
+  - .venv/**
+  - "*.onnx"
+  - "*.pt"
+  - "*.safetensors"
+  - uv.lock
